@@ -1,6 +1,7 @@
 import { deflateSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 import {
+  computeScrollbarGutter,
   hasMultiColumnLayout,
   renderAsciiTable,
   renderPageAscii,
@@ -391,5 +392,126 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     expect(/^[\x20-\x7e\n]+$/.test(ascii)).toBe(true)
     expect(ascii).toContain('Read the [e1: Troy Docs] and [e2: API Reference] to get started.')
     expect(ascii).not.toContain('INTERACTIVE REFS:')
+  })
+
+  it('renders an ASCII scrollbar gutter (# thumb on | track) on the right edge of the viewport frame', () => {
+    // 1. Direct unit checks on computeScrollbarGutter
+    const fits = computeScrollbarGutter(10, 8, 10, 0, { asciiOnly: true })
+    expect(fits.scrollable).toBe(false)
+    expect(fits.thumbStart).toBe(-1)
+    expect(fits.thumbSize).toBe(0)
+    expect(fits.percent).toBe(100)
+    expect(fits.chars.join('')).toBe('||||||||||')
+
+    const top = computeScrollbarGutter(10, 50, 10, 0, { asciiOnly: true })
+    expect(top.scrollable).toBe(true)
+    expect(top.thumbStart).toBe(0)
+    expect(top.thumbSize).toBe(2)
+    expect(top.percent).toBe(0)
+    expect(top.chars.join('')).toBe('##||||||||')
+
+    const mid = computeScrollbarGutter(10, 50, 10, 20, { asciiOnly: true })
+    expect(mid.thumbStart).toBe(4)
+    expect(mid.thumbSize).toBe(2)
+    expect(mid.percent).toBe(50)
+    expect(mid.chars.join('')).toBe('||||##||||')
+
+    const bot = computeScrollbarGutter(10, 50, 10, 40, { asciiOnly: true })
+    expect(bot.thumbStart).toBe(8)
+    expect(bot.thumbSize).toBe(2)
+    expect(bot.percent).toBe(100)
+    expect(bot.chars.join('')).toBe('||||||||##')
+
+    // Extreme overflow clamps thumbSize to >= 1
+    const huge = computeScrollbarGutter(10, 5000, 10, 0, { asciiOnly: true })
+    expect(huge.thumbSize).toBe(1)
+    expect(huge.chars.join('')).toBe('#|||||||||')
+
+    // Barely overflowing clamps thumbSize to trackHeight - 1 so track stays visible
+    const barely = computeScrollbarGutter(10, 11, 10, 0, { asciiOnly: true })
+    expect(barely.thumbSize).toBe(9)
+    expect(barely.chars.join('')).toBe('#########|')
+
+    // Unicode mode uses full-block thumb on box-drawing track
+    const uni = computeScrollbarGutter(6, 18, 6, 6, { asciiOnly: false, color: false })
+    expect(uni.chars.join('')).toBe('││██││')
+
+    // 2. Full renderPageAscii integration on a scrollable multi-screen page
+    const longSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://example.com/long-doc',
+      title: 'Long Document',
+      epoch: 1,
+      viewport: { width: 1000, height: 600, scrollX: 0, scrollY: 0, scrollHeight: 600 },
+      blocks: Array.from({ length: 40 }, (_, i) => ({
+        kind: 'paragraph' as const,
+        text: `Section line ${i + 1} with operational notes.`,
+      })),
+      elements: [],
+      text: 'Long Document',
+      capturedAt: Date.now(),
+    }
+
+    const extractViewportRightEdge = (rendered: string): string => {
+      const lines = rendered.split('\n')
+      // Chrome header is 4 lines (topBorder, tab, url, midBorder), footer is 3 lines (midBorder, status, botBorder)
+      const viewportLines = lines.slice(4, lines.length - 3)
+      return viewportLines.map((l) => l[l.length - 1] ?? '').join('')
+    }
+
+    const atTop = renderPageAscii(longSnap, { width: 80, height: 18, asciiOnly: true, scrollOffset: 0 })
+    expect(/^[\x20-\x7e\n]+$/.test(atTop)).toBe(true)
+    for (const line of atTop.split('\n')) expect(line.length).toBe(80)
+    expect(atTop).toContain('scroll:0%')
+    const topEdge = extractViewportRightEdge(atTop)
+    expect(topEdge.length).toBe(12) // height 18 - 6 chrome rows
+    expect(topEdge.startsWith('#')).toBe(true)
+    expect(topEdge.endsWith('|')).toBe(true)
+    expect(topEdge).toMatch(/^#+\|+$/)
+
+    const atMid = renderPageAscii(longSnap, { width: 80, height: 18, asciiOnly: true, scrollOffset: 35 })
+    const midEdge = extractViewportRightEdge(atMid)
+    expect(midEdge.startsWith('|')).toBe(true)
+    expect(midEdge.endsWith('|')).toBe(true)
+    expect(midEdge).toContain('#')
+
+    const atBottom = renderPageAscii(longSnap, { width: 80, height: 18, asciiOnly: true, scrollOffset: 999 })
+    expect(atBottom).toContain('scroll:100%')
+    const botEdge = extractViewportRightEdge(atBottom)
+    expect(botEdge.startsWith('|')).toBe(true)
+    expect(botEdge.endsWith('#')).toBe(true)
+    expect(botEdge).toMatch(/^\|+#+$/)
+
+    // Disabling scrollbar explicitly restores plain '|' frame border
+    const noScrollbar = renderPageAscii(longSnap, {
+      width: 80,
+      height: 18,
+      asciiOnly: true,
+      scrollOffset: 0,
+      showScrollbar: false,
+    })
+    expect(extractViewportRightEdge(noScrollbar)).toBe('|'.repeat(12))
+
+    // 3. Short page that fits completely shows plain '|' track (no thumb)
+    const shortSnap: PageSnapshot = {
+      ...longSnap,
+      blocks: [{ kind: 'paragraph', text: 'Fits in one screen.' }],
+    }
+    const shortOut = renderPageAscii(shortSnap, { width: 80, height: 18, asciiOnly: true })
+    expect(shortOut).toContain('scroll:100%')
+    expect(extractViewportRightEdge(shortOut)).toBe('|'.repeat(12))
+
+    // 4. Browser DOM overflow fallback (e.g. Chromium page scrolled to 50%)
+    const domScrollSnap: PageSnapshot = {
+      ...shortSnap,
+      viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 400, scrollHeight: 1600 },
+    }
+    const domOut = renderPageAscii(domScrollSnap, { width: 80, height: 18, asciiOnly: true })
+    expect(domOut).toContain('scroll:50%')
+    const domEdge = extractViewportRightEdge(domOut)
+    expect(domEdge).toContain('#')
+    expect(domEdge).toContain('|')
+    expect(domEdge.startsWith('|')).toBe(true)
+    expect(domEdge.endsWith('|')).toBe(true)
   })
 })

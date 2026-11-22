@@ -109,6 +109,7 @@ export interface AsciiRenderOptions {
   color?: boolean
   showRefs?: boolean
   showChrome?: boolean
+  showScrollbar?: boolean
   scrollOffset?: number
   layout?: AsciiLayoutMode
   tabs?: TabSummary[]

@@ -883,6 +883,61 @@ export function renderSpatialBlocks(
   return resultLines
 }
 
+export interface ScrollbarGutter {
+  scrollable: boolean
+  thumbStart: number
+  thumbSize: number
+  percent: number
+  chars: string[]
+}
+
+/**
+ * Computes a vertical ASCII/Unicode scrollbar gutter (`#` thumb on `|` track in 7-bit ASCII,
+ * or `█` thumb on `│` track in Unicode mode) for a viewport of `trackHeight` rows.
+ */
+export function computeScrollbarGutter(
+  trackHeight: number,
+  totalContent: number,
+  visibleContent: number,
+  scrollOffset: number,
+  options: { asciiOnly?: boolean; color?: boolean } = {},
+): ScrollbarGutter {
+  const asciiOnly = options.asciiOnly ?? true
+  const color = asciiOnly ? false : (options.color ?? false)
+  const trackChar = asciiOnly ? '|' : '│'
+  const thumbChar = asciiOnly ? '#' : color ? `${ANSI.cyan}█${ANSI.reset}` : '█'
+
+  if (trackHeight <= 0) {
+    return { scrollable: false, thumbStart: -1, thumbSize: 0, percent: 100, chars: [] }
+  }
+
+  if (visibleContent <= 0 || totalContent <= visibleContent) {
+    return {
+      scrollable: false,
+      thumbStart: -1,
+      thumbSize: 0,
+      percent: 100,
+      chars: Array.from({ length: trackHeight }, () => trackChar),
+    }
+  }
+
+  const maxScroll = totalContent - visibleContent
+  const clampedOffset = Math.max(0, Math.min(scrollOffset, maxScroll))
+  const ratio = clampedOffset / maxScroll
+  const percent = Math.min(100, Math.max(0, Math.round(ratio * 100)))
+  const rawThumb = Math.round((visibleContent / totalContent) * trackHeight)
+  const thumbSize = trackHeight === 1 ? 1 : Math.max(1, Math.min(trackHeight - 1, rawThumb))
+  const maxThumbStart = trackHeight - thumbSize
+  const thumbStart = Math.round(ratio * maxThumbStart)
+
+  const chars: string[] = []
+  for (let row = 0; row < trackHeight; row++) {
+    chars.push(row >= thumbStart && row < thumbStart + thumbSize ? thumbChar : trackChar)
+  }
+
+  return { scrollable: true, thumbStart, thumbSize, percent, chars }
+}
+
 export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
   const width = Math.max(40, Math.min(240, options.width ?? 100))
   const height = Math.max(14, Math.min(200, options.height ?? 36))
@@ -890,6 +945,7 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   const color = asciiOnly ? false : (options.color ?? false)
   const showRefs = options.showRefs ?? true
   const showChrome = options.showChrome ?? true
+  const showScrollbar = options.showScrollbar ?? showChrome
   const scrollOffset = Math.max(0, options.scrollOffset ?? 0)
   const requestedLayout: AsciiLayoutMode = options.layout ?? 'flow'
 
@@ -901,47 +957,10 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   const topBorder = `${box.tl}${box.h.repeat(width - 2)}${box.tr}`
   const midBorder = `${box.ml}${box.h.repeat(width - 2)}${box.mr}`
   const botBorder = `${box.bl}${box.h.repeat(width - 2)}${box.br}`
-  const frameLine = (content: string) => `${box.v} ${padLine(content, innerWidth, asciiOnly)} ${box.v}`
+  const frameLine = (content: string, rightEdge: string = box.v) =>
+    `${box.v} ${padLine(content, innerWidth, asciiOnly)} ${rightEdge}`
 
-  const output: string[] = []
-
-  if (showChrome) {
-    output.push(topBorder)
-    // Tab strip
-    const tabs = options.tabs ?? [
-      {
-        id: snapshot.tabId,
-        url: snapshot.url,
-        title: snapshot.title || snapshot.url || 'New Tab',
-        active: true,
-        loading: false,
-        engine: 'lite',
-      },
-    ]
-    const tabStr = tabs
-      .map((t) => {
-        const mark = t.id === (options.activeTabId ?? snapshot.tabId) || t.active ? '*' : ''
-        const label = truncateVisible(asciiOnly ? sanitizeAscii(t.title || t.url || 'tab') : t.title || t.url || 'tab', 18)
-        return `[${t.id}${mark} ${label}]`
-      })
-      .join(' ')
-    const headerLeft = `TROY-ADV ${tabStr}`
-    output.push(frameLine(headerLeft))
-
-    // URL + Title bar
-    const urlStr = truncateVisible(asciiOnly ? sanitizeAscii(snapshot.url || 'about:blank') : snapshot.url || 'about:blank', innerWidth - 16)
-    const pct =
-      snapshot.viewport.scrollHeight > snapshot.viewport.height
-        ? Math.min(100, Math.round((snapshot.viewport.scrollY / Math.max(1, snapshot.viewport.scrollHeight - snapshot.viewport.height)) * 100))
-        : 100
-    const urlLine = `URL: ${urlStr}`
-    const posTag = `scroll:${pct}%`
-    const spacer = Math.max(1, innerWidth - visibleLength(urlLine) - posTag.length)
-    output.push(frameLine(`${truncateVisible(urlLine, innerWidth - posTag.length - 1)}${' '.repeat(spacer)}${posTag}`))
-    output.push(midBorder)
-  }
-
-  // Render content blocks into lines
+  // Render content blocks into lines first so header scroll% and right-edge scrollbar stay in sync
   const bodyLines: string[] = []
   if (snapshot.title) {
     const t = asciiOnly ? sanitizeAscii(snapshot.title) : snapshot.title
@@ -990,9 +1009,64 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   const start = Math.min(scrollOffset, maxOffset)
   const visible = bodyLines.slice(start, start + viewportRows)
 
+  const bodyOverflows = bodyLines.length > viewportRows
+  const domOverflows = snapshot.viewport.scrollHeight > snapshot.viewport.height
+  const scrollbar = bodyOverflows
+    ? computeScrollbarGutter(viewportRows, bodyLines.length, viewportRows, start, { asciiOnly, color })
+    : domOverflows
+      ? computeScrollbarGutter(
+          viewportRows,
+          snapshot.viewport.scrollHeight,
+          Math.max(1, snapshot.viewport.height),
+          snapshot.viewport.scrollY,
+          { asciiOnly, color },
+        )
+      : computeScrollbarGutter(viewportRows, bodyLines.length, viewportRows, 0, { asciiOnly, color })
+
+  const output: string[] = []
+
+  if (showChrome) {
+    output.push(topBorder)
+    // Tab strip
+    const tabs = options.tabs ?? [
+      {
+        id: snapshot.tabId,
+        url: snapshot.url,
+        title: snapshot.title || snapshot.url || 'New Tab',
+        active: true,
+        loading: false,
+        engine: 'lite',
+      },
+    ]
+    const tabStr = tabs
+      .map((t) => {
+        const mark = t.id === (options.activeTabId ?? snapshot.tabId) || t.active ? '*' : ''
+        const label = truncateVisible(asciiOnly ? sanitizeAscii(t.title || t.url || 'tab') : t.title || t.url || 'tab', 18)
+        return `[${t.id}${mark} ${label}]`
+      })
+      .join(' ')
+    const headerLeft = `TROY-ADV ${tabStr}`
+    output.push(frameLine(headerLeft))
+
+    // URL + Title bar
+    const urlStr = truncateVisible(asciiOnly ? sanitizeAscii(snapshot.url || 'about:blank') : snapshot.url || 'about:blank', innerWidth - 16)
+    const urlLine = `URL: ${urlStr}`
+    const posTag = `scroll:${scrollbar.percent}%`
+    const spacer = Math.max(1, innerWidth - visibleLength(urlLine) - posTag.length)
+    output.push(frameLine(`${truncateVisible(urlLine, innerWidth - posTag.length - 1)}${' '.repeat(spacer)}${posTag}`))
+    output.push(midBorder)
+  }
+
   for (let i = 0; i < viewportRows; i++) {
     const line = visible[i] ?? ''
-    output.push(showChrome ? frameLine(line) : padLine(line, innerWidth, asciiOnly))
+    const gutterChar = showScrollbar ? (scrollbar.chars[i] ?? box.v) : box.v
+    if (showChrome) {
+      output.push(frameLine(line, gutterChar))
+    } else if (showScrollbar) {
+      output.push(`${padLine(line, innerWidth, asciiOnly)} ${gutterChar}`)
+    } else {
+      output.push(padLine(line, innerWidth, asciiOnly))
+    }
   }
 
   if (showChrome) {
@@ -1007,8 +1081,7 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
     output.push(botBorder)
   }
 
-  const result = output.join('\n')
-  return asciiOnly ? sanitizeAscii(result) : result
+  return asciiOnly ? output.map((line) => sanitizeAscii(line)).join('\n') : output.join('\n')
 }
 
 export function renderCompactRefsAscii(snapshot: PageSnapshot, limit = 60): string {

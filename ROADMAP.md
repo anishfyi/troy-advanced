@@ -6,7 +6,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M01: True 2D spatial layout mode in `src/ascii/layout.ts` using element `box` coordinates (`x, y, width, height`) to preserve multi-column sidebars, headers, and grids in ASCII
 - [x] M02: ASCII table auto-column width alignment with borders (`+---+---+`) and header separator rows
 - [x] M03: Inline link wrapping inside paragraphs so `[eN: link text]` stays inline rather than forcing a line break
-- [ ] M04: ASCII progress/scrollbar gutter on the right edge of the viewport frame (`#` thumb on `|` track)
+- [x] M04: ASCII progress/scrollbar gutter on the right edge of the viewport frame (`#` thumb on `|` track)
 - [ ] M05: Form container grouping boxes (`+-- Form: Login --+`) around related inputs and submit buttons
 - [ ] M06: Collapsible/compact `--density compact|normal|wide` ASCII layout profiles for small LLM token budgets
 - [ ] M07: ASCII diff renderer (`renderDeltaAscii`) that renders `--since` deltas with `+` added / `-` removed / `~` changed markers
