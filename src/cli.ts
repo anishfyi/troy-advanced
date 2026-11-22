@@ -31,7 +31,7 @@ Client Commands (talk to running daemon, or use --oneshot):
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
   ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto]
                                           Render tab as strict 7-bit ASCII viewport (or diff with --since)
-  visual [--mode ascii|braille|halfblock] [--annotate]   Render Chromium PNG screenshot as ASCII
+  visual [--mode ascii|edge|braille|halfblock] [--annotate]   Render Chromium PNG screenshot as ASCII
   read [--since] [--ascii] [--visual] [--json]  Read page structure or ASCII/JSON delta
   find <query>                            Find interactive elements as eN refs
   click <ref> [--allow-submit]            Click element ref

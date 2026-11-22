@@ -37,13 +37,14 @@ const MCP_TOOLS = [
   },
   {
     name: 'troy_screenshot_ascii',
-    description: 'Capture a Chromium screenshot and render it as ASCII or Braille art with optional [eN] overlays for text-only AIs.',
+    description: 'Capture a Chromium screenshot and render it as ASCII, Sobel edge wireframe, Braille, or halfblock art with optional [eN] overlays for text-only AIs.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'number' },
         width: { type: 'number' },
-        mode: { type: 'string', enum: ['ascii', 'braille', 'halfblock'] },
+        mode: { type: 'string', enum: ['ascii', 'edge', 'braille', 'halfblock'] },
+        edgeThreshold: { type: 'number', description: 'Sobel edge magnitude threshold (0..1, default 0.18) for mode=edge' },
         annotate: { type: 'boolean' },
       },
     },

@@ -125,8 +125,9 @@ export interface AsciiRenderOptions {
 export interface PixelAsciiOptions {
   width?: number
   height?: number
-  mode?: 'ascii' | 'braille' | 'halfblock'
+  mode?: 'ascii' | 'edge' | 'braille' | 'halfblock'
   invert?: boolean
+  edgeThreshold?: number
   overlays?: Array<{ ref: string; box: Rect }>
   viewport?: { width: number; height: number }
 }

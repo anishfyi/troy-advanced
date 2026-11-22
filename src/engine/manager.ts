@@ -333,6 +333,7 @@ export class BrowserManager {
             pixelAscii = renderPngToAscii(png, {
               width: typeof args.width === 'number' ? args.width : 80,
               mode: (args.pixelMode as PixelAsciiOptions['mode']) || 'ascii',
+              edgeThreshold: typeof args.edgeThreshold === 'number' ? args.edgeThreshold : undefined,
               overlays,
               viewport: snap.viewport,
             })
@@ -535,6 +536,7 @@ export class BrowserManager {
             width: typeof args.width === 'number' ? args.width : 80,
             height: typeof args.height === 'number' ? args.height : undefined,
             mode: (args.mode as PixelAsciiOptions['mode']) || 'ascii',
+            edgeThreshold: typeof args.edgeThreshold === 'number' ? args.edgeThreshold : undefined,
             overlays,
             viewport: snap.viewport,
           })

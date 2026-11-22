@@ -121,7 +121,14 @@ export async function runTerminalBrowser(manager: BrowserManager, opts: TuiOptio
       } else if (cmd === 'visual' || cmd === 'v') {
         const res = await manager.runTool(undefined, 'page_screenshot_ascii', {
           width: Math.max(40, Math.min(120, (process.stdout.columns || 80) - 4)),
-          mode: rest[0] === 'braille' ? 'braille' : rest[0] === 'halfblock' ? 'halfblock' : 'ascii',
+          mode:
+            rest[0] === 'braille'
+              ? 'braille'
+              : rest[0] === 'halfblock'
+                ? 'halfblock'
+                : rest[0] === 'edge'
+                  ? 'edge'
+                  : 'ascii',
           annotate: true,
         })
         if (res.ok && typeof res.ascii === 'string') {
@@ -131,7 +138,7 @@ export async function runTerminalBrowser(manager: BrowserManager, opts: TuiOptio
         }
         statusMessage = `Visual error: ${res.error}`
       } else if (cmd === 'help' || cmd === '?') {
-        statusMessage = 'open <url> | click eN [--submit] | fill eN <txt> | find <q> | j/k | ascii | visual [braille] | back | reload | tab N | quit'
+        statusMessage = 'open <url> | click eN [--submit] | fill eN <txt> | find <q> | j/k | ascii | visual [edge|braille] | back | reload | tab N | quit'
       } else if (/^e\d+$/.test(cmd)) {
         // Shorthand: typing `e3` clicks `e3`
         const res = await manager.runTool(undefined, 'page_click', { ref: cmd })

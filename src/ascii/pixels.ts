@@ -6,6 +6,7 @@ import type { PixelAsciiOptions } from '../types.js'
 import { decodePng, type DecodedPng } from './png-decoder.js'
 
 const LUMINANCE_RAMP = ' .:-=+*#%@'
+const DEFAULT_EDGE_THRESHOLD = 0.18
 
 function sampleRgba(img: DecodedPng, x: number, y: number): [number, number, number, number] {
   const cx = Math.max(0, Math.min(img.width - 1, Math.floor(x)))
@@ -21,6 +22,73 @@ function luma(r: number, g: number, b: number, a: number): number {
   const gg = g * alpha + 255 * (1 - alpha)
   const bb = b * alpha + 255 * (1 - alpha)
   return (0.299 * rr + 0.587 * gg + 0.114 * bb) / 255
+}
+
+/**
+ * Map a Sobel gradient vector (gx, gy) to a directional 7-bit ASCII edge glyph.
+ * The edge tangent is perpendicular to the gradient:
+ *   - horizontal gradient (0° / 180°) -> vertical edge '|'
+ *   - +45° gradient                   -> rising diagonal edge '/'
+ *   - vertical gradient (90°)         -> horizontal edge '-'
+ *   - +135° gradient                  -> falling diagonal edge '\'
+ */
+export function sobelEdgeChar(gx: number, gy: number, threshold = DEFAULT_EDGE_THRESHOLD): string {
+  const mag = Math.hypot(gx, gy) / 4
+  if (mag < threshold) return ' '
+  const deg = ((Math.atan2(gy, gx) * 180) / Math.PI + 180) % 180
+  if (deg < 22.5 || deg >= 157.5) return '|'
+  if (deg < 67.5) return '/'
+  if (deg < 112.5) return '-'
+  return '\\'
+}
+
+function buildLuminanceGrid(img: DecodedPng, cols: number, rows: number): Float32Array {
+  const lumGrid = new Float32Array(rows * cols)
+  for (let row = 0; row < rows; row++) {
+    const y0 = (row / rows) * img.height
+    const y1 = ((row + 1) / rows) * img.height
+    const stepsY = Math.min(4, Math.max(1, Math.ceil(y1 - y0)))
+    for (let col = 0; col < cols; col++) {
+      const x0 = (col / cols) * img.width
+      const x1 = ((col + 1) / cols) * img.width
+      const stepsX = Math.min(4, Math.max(1, Math.ceil(x1 - x0)))
+      let sum = 0
+      const count = stepsX * stepsY
+      for (let sy = 0; sy < stepsY; sy++) {
+        const py = y0 + ((sy + 0.5) / stepsY) * (y1 - y0)
+        for (let sx = 0; sx < stepsX; sx++) {
+          const px = x0 + ((sx + 0.5) / stepsX) * (x1 - x0)
+          const [r, g, b, a] = sampleRgba(img, px, py)
+          sum += luma(r, g, b, a)
+        }
+      }
+      lumGrid[row * cols + col] = sum / count
+    }
+  }
+  return lumGrid
+}
+
+function stampOverlays(grid: string[][], cols: number, rows: number, img: DecodedPng, options: PixelAsciiOptions): void {
+  if (!options.overlays || options.overlays.length === 0) return
+  const vpW = options.viewport?.width || img.width
+  const vpH = options.viewport?.height || img.height
+  for (const overlay of options.overlays) {
+    const cx = Math.floor((overlay.box.x / Math.max(1, vpW)) * cols)
+    const cy = Math.floor((overlay.box.y / Math.max(1, vpH)) * rows)
+    if (cy < 0 || cy >= rows) continue
+    const badge = `[${overlay.ref}]`
+    for (let i = 0; i < badge.length; i++) {
+      const px = cx + i
+      if (px >= 0 && px < cols) {
+        grid[cy]![px] = badge[i]!
+      }
+    }
+  }
+}
+
+function frameAsciiGrid(grid: string[][], cols: number): string {
+  const border = `+${'-'.repeat(cols)}+`
+  return [border, ...grid.map((row) => `|${row.join('')}|`), border].join('\n')
 }
 
 export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = {}): string {
@@ -77,6 +145,39 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
     return lines.join('\n')
   }
 
+  if (mode === 'edge') {
+    const threshold = options.edgeThreshold ?? DEFAULT_EDGE_THRESHOLD
+    const lumGrid = buildLuminanceGrid(img, cols, rows)
+    const sampleLum = (r: number, c: number): number => {
+      const cr = Math.max(0, Math.min(rows - 1, r))
+      const cc = Math.max(0, Math.min(cols - 1, c))
+      return lumGrid[cr * cols + cc] ?? 0
+    }
+
+    const grid: string[][] = []
+    for (let row = 0; row < rows; row++) {
+      const line: string[] = []
+      for (let col = 0; col < cols; col++) {
+        const tl = sampleLum(row - 1, col - 1)
+        const tc = sampleLum(row - 1, col)
+        const tr = sampleLum(row - 1, col + 1)
+        const ml = sampleLum(row, col - 1)
+        const mr = sampleLum(row, col + 1)
+        const bl = sampleLum(row + 1, col - 1)
+        const bc = sampleLum(row + 1, col)
+        const br = sampleLum(row + 1, col + 1)
+
+        const gx = -tl + tr - 2 * ml + 2 * mr - bl + br
+        const gy = -tl - 2 * tc - tr + bl + 2 * bc + br
+        line.push(sobelEdgeChar(gx, gy, threshold))
+      }
+      grid.push(line)
+    }
+
+    stampOverlays(grid, cols, rows, img, options)
+    return frameAsciiGrid(grid, cols)
+  }
+
   // Strict 7-bit ASCII luminance grid with optional Set-of-Marks [eN] overlays
   const grid: string[][] = []
   for (let row = 0; row < rows; row++) {
@@ -94,25 +195,8 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
   }
 
   // Stamp Set-of-Marks [eN] badges directly onto the ASCII grid
-  if (options.overlays && options.overlays.length > 0) {
-    const vpW = options.viewport?.width || img.width
-    const vpH = options.viewport?.height || img.height
-    for (const overlay of options.overlays) {
-      const cx = Math.floor((overlay.box.x / Math.max(1, vpW)) * cols)
-      const cy = Math.floor((overlay.box.y / Math.max(1, vpH)) * rows)
-      if (cy < 0 || cy >= rows) continue
-      const badge = `[${overlay.ref}]`
-      for (let i = 0; i < badge.length; i++) {
-        const px = cx + i
-        if (px >= 0 && px < cols) {
-          grid[cy]![px] = badge[i]!
-        }
-      }
-    }
-  }
-
-  const border = `+${'-'.repeat(cols)}+`
-  return [border, ...grid.map((row) => `|${row.join('')}|`), border].join('\n')
+  stampOverlays(grid, cols, rows, img, options)
+  return frameAsciiGrid(grid, cols)
 }
 
 export function renderPngToAscii(pngBuffer: Buffer, options: PixelAsciiOptions = {}): string {
