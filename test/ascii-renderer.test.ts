@@ -6,6 +6,7 @@ import {
   renderPageAscii,
   renderSpatialBlocks,
   sanitizeAscii,
+  wrapInlineParagraph,
 } from '../src/ascii/layout.js'
 import { decodePng } from '../src/ascii/png-decoder.js'
 import { renderPngToAscii } from '../src/ascii/pixels.js'
@@ -300,5 +301,95 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     expect(spatialAscii).toContain('| web-1 | 18% |')
     expect(spatialAscii).toContain('| web-2 | 42% |')
     expect(spatialAscii).toContain('[e1]')
+  })
+
+  it('wraps inline links inside paragraphs as [eN: link text] without forcing line breaks', () => {
+    const lines = wrapInlineParagraph(
+      'See the Troy Docs, or check the API Reference.',
+      [
+        { text: 'Troy Docs', ref: 'e1', href: 'https://example.com/docs' },
+        { text: 'API Reference', ref: 'e2', href: 'https://example.com/api' },
+      ],
+      80,
+      { asciiOnly: true, showRefs: true },
+    )
+    expect(lines).toEqual(['See the [e1: Troy Docs], or check the [e2: API Reference].'])
+
+    // Narrow width wraps cleanly without splitting [e2: API Reference]. across lines
+    const narrow = wrapInlineParagraph(
+      'See the Troy Docs, or check the API Reference.',
+      [
+        { text: 'Troy Docs', ref: 'e1' },
+        { text: 'API Reference', ref: 'e2' },
+      ],
+      36,
+      { asciiOnly: true, showRefs: true },
+    )
+    expect(narrow).toEqual([
+      'See the [e1: Troy Docs], or check',
+      'the [e2: API Reference].',
+    ])
+    for (const l of narrow) expect(l.length).toBeLessThanOrEqual(36)
+
+    // Duplicate link labels resolve sequentially to distinct refs
+    const dupes = wrapInlineParagraph(
+      'Click here for A or click here for B.',
+      [
+        { text: 'here', ref: 'e4' },
+        { text: 'here', ref: 'e5' },
+      ],
+      80,
+      { asciiOnly: true, showRefs: true },
+    )
+    expect(dupes).toEqual(['Click [e4: here] for A or click [e5: here] for B.'])
+
+    // showRefs: false omits eN prefix
+    const noRefs = wrapInlineParagraph(
+      'Visit Troy Docs now.',
+      [{ text: 'Troy Docs', ref: 'e1' }],
+      80,
+      { asciiOnly: true, showRefs: false },
+    )
+    expect(noRefs).toEqual(['Visit [Troy Docs] now.'])
+
+    // Oversized link wider than maxWidth wraps cleanly without overflowing maxWidth
+    const oversized = wrapInlineParagraph(
+      'Read this extremely verbose documentation link carefully.',
+      [{ text: 'this extremely verbose documentation link', ref: 'e9' }],
+      24,
+      { asciiOnly: true, showRefs: true },
+    )
+    expect(oversized.length).toBeGreaterThan(2)
+    for (const l of oversized) expect(l.length).toBeLessThanOrEqual(24)
+
+    // Full page render: inline links stay inline and are not duplicated under INTERACTIVE REFS
+    const snap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://example.com/article',
+      title: 'Inline Links',
+      epoch: 1,
+      viewport: { width: 1000, height: 600, scrollX: 0, scrollY: 0, scrollHeight: 600 },
+      blocks: [
+        {
+          kind: 'paragraph',
+          text: 'Read the Troy Docs and API Reference to get started.',
+          links: [
+            { text: 'Troy Docs', ref: 'e1', href: 'https://example.com/docs' },
+            { text: 'API Reference', ref: 'e2', href: 'https://example.com/api' },
+          ],
+        },
+      ],
+      elements: [
+        { ref: 'e1', selector: 'a#docs', tag: 'a', type: 'link', text: 'Troy Docs', href: 'https://example.com/docs' },
+        { ref: 'e2', selector: 'a#api', tag: 'a', type: 'link', text: 'API Reference', href: 'https://example.com/api' },
+      ],
+      text: 'Read the Troy Docs and API Reference to get started.',
+      capturedAt: Date.now(),
+    }
+
+    const ascii = renderPageAscii(snap, { width: 88, height: 20, asciiOnly: true })
+    expect(/^[\x20-\x7e\n]+$/.test(ascii)).toBe(true)
+    expect(ascii).toContain('Read the [e1: Troy Docs] and [e2: API Reference] to get started.')
+    expect(ascii).not.toContain('INTERACTIVE REFS:')
   })
 })

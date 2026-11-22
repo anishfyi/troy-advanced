@@ -5,7 +5,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 ## Track 1: ASCII Spatial Layout & Visual Engine (Milestones 1–15)
 - [x] M01: True 2D spatial layout mode in `src/ascii/layout.ts` using element `box` coordinates (`x, y, width, height`) to preserve multi-column sidebars, headers, and grids in ASCII
 - [x] M02: ASCII table auto-column width alignment with borders (`+---+---+`) and header separator rows
-- [ ] M03: Inline link wrapping inside paragraphs so `[eN: link text]` stays inline rather than forcing a line break
+- [x] M03: Inline link wrapping inside paragraphs so `[eN: link text]` stays inline rather than forcing a line break
 - [ ] M04: ASCII progress/scrollbar gutter on the right edge of the viewport frame (`#` thumb on `|` track)
 - [ ] M05: Form container grouping boxes (`+-- Form: Login --+`) around related inputs and submit buttons
 - [ ] M06: Collapsible/compact `--density compact|normal|wide` ASCII layout profiles for small LLM token budgets

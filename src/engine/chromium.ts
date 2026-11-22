@@ -136,6 +136,7 @@ const SNAPSHOT_SCRIPT = `(() => {
   }
 
   const blocks = [];
+  const consumedLinks = new Set();
   const blockSel = 'h1, h2, h3, h4, h5, h6, p, a[href], button, input:not([type="hidden"]), textarea, select, li, pre, tr, img, hr';
   const body = document.body || document.documentElement;
   if (body) {
@@ -152,8 +153,38 @@ const SNAPSHOT_SCRIPT = `(() => {
         if (txt) blocks.push({ kind: 'heading', level: Number(tag[1]), text: txt, tag, box });
       } else if (tag === 'p') {
         const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        if (txt) blocks.push({ kind: 'paragraph', text: txt, tag, box });
+        if (txt) {
+          const inlineLinks = [];
+          let cursor = 0;
+          for (const a of el.querySelectorAll('a[href]')) {
+            if (!isVisible(a)) continue;
+            const lText = (a.innerText || a.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+            if (!lText) continue;
+            consumedLinks.add(a);
+            const aTracked = elByNode.get(a);
+            const idx = txt.indexOf(lText, cursor);
+            const entry = {
+              text: lText,
+              href: a.href || undefined,
+              selector: aTracked?.selector,
+            };
+            if (idx !== -1) {
+              entry.start = idx;
+              entry.end = idx + lText.length;
+              cursor = entry.end;
+            }
+            inlineLinks.push(entry);
+          }
+          blocks.push({
+            kind: 'paragraph',
+            text: txt,
+            tag,
+            box,
+            ...(inlineLinks.length > 0 ? { links: inlineLinks } : {}),
+          });
+        }
       } else if (tag === 'a') {
+        if (consumedLinks.has(el)) continue;
         const txt = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
         if (txt) blocks.push({ kind: 'link', text: txt, href: el.href || undefined, tag, box, selector: tracked?.selector });
       } else if (tag === 'button' || (tag === 'input' && ['submit','button','reset'].includes(String(el.type).toLowerCase()))) {

@@ -210,21 +210,36 @@ export class BrowserManager {
 
     // Bind refs onto content blocks for seamless inline [eN] ASCII rendering
     const blocks = snap.blocks.map((b) => {
-      const maybeSel = (b as { selector?: string }).selector
+      let next = b
+      if (b.links && b.links.length > 0) {
+        const boundLinks = b.links.map((lnk) => {
+          if (lnk.ref) return lnk
+          if (lnk.selector && refBySelector.has(lnk.selector)) {
+            return { ...lnk, ref: refBySelector.get(lnk.selector) }
+          }
+          const match = registered.find(
+            (e) => e.tag === 'a' && e.text === lnk.text && (!lnk.href || e.href === lnk.href),
+          )
+          return match?.ref ? { ...lnk, ref: match.ref } : lnk
+        })
+        next = { ...next, links: boundLinks }
+      }
+
+      const maybeSel = (next as { selector?: string }).selector
       if (maybeSel && refBySelector.has(maybeSel)) {
-        return { ...b, ref: refBySelector.get(maybeSel) }
+        return { ...next, ref: refBySelector.get(maybeSel) }
       }
       // Fallback match by text+kind for Lite engine
-      if (b.kind === 'link' || b.kind === 'button' || b.kind === 'input' || b.kind === 'select') {
+      if (next.kind === 'link' || next.kind === 'button' || next.kind === 'input' || next.kind === 'select') {
         const match = registered.find((e) => {
-          if (b.kind === 'link') return e.tag === 'a' && e.text === b.text && (!b.href || e.href === b.href)
-          if (b.kind === 'button') return (e.tag === 'button' || e.role === 'button') && e.text === b.text
-          if (b.kind === 'select') return e.tag === 'select' && (e.label === b.text || e.text === b.text)
-          return (e.tag === 'input' || e.tag === 'textarea') && (e.label === b.text || e.text === b.text)
+          if (next.kind === 'link') return e.tag === 'a' && e.text === next.text && (!next.href || e.href === next.href)
+          if (next.kind === 'button') return (e.tag === 'button' || e.role === 'button') && e.text === next.text
+          if (next.kind === 'select') return e.tag === 'select' && (e.label === next.text || e.text === next.text)
+          return (e.tag === 'input' || e.tag === 'textarea') && (e.label === next.text || e.text === next.text)
         })
-        if (match?.ref) return { ...b, ref: match.ref }
+        if (match?.ref) return { ...next, ref: match.ref }
       }
-      return b
+      return next
     })
 
     const indexed: PageSnapshot = { ...snap, elements: registered, blocks }

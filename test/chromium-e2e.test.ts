@@ -17,13 +17,13 @@ describe.skipIf(!hasChrome)('Headless Chromium CDP E2E + PNG-to-ASCII screenshot
   beforeAll(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'troy-adv-chrome-'))
     server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'content-type': 'text/html' })
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       res.end(`<!doctype html>
       <html>
         <head><title>Chromium ASCII E2E</title></head>
         <body style="font-family:sans-serif; padding:24px; background:#fff; color:#111;">
           <h1 id="heading">Headless Chrome Ready</h1>
-          <p>Dynamic counter: <span id="count">0</span></p>
+          <p>Dynamic counter: <span id="count">0</span> — see <a id="docs" href="#docs">Chrome Docs</a> inline.</p>
           <input id="note" type="text" placeholder="Enter note" />
           <button id="inc" type="button" onclick="document.getElementById('count').textContent = String(Number(document.getElementById('count').textContent) + 1); console.log('clicked inc');">Increment</button>
         </body>
@@ -50,6 +50,7 @@ describe.skipIf(!hasChrome)('Headless Chromium CDP E2E + PNG-to-ASCII screenshot
     expect(read1.ok).toBe(true)
     expect(read1.engine).toBe('chromium')
     expect(String(read1.ascii)).toContain('HEADLESS CHROME READY')
+    expect(String(read1.ascii)).toMatch(/Dynamic counter: 0 - see \[e\d+: Chrome Docs\] inline\./)
 
     // Click dynamic JS button via ref
     const found = await manager.runTool(tabId, 'page_find', { query: 'Increment' })

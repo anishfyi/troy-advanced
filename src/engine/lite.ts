@@ -2,7 +2,7 @@
 // Runs anywhere Node.js runs — even tiny 512MB EC2 t4g.nano instances, Alpine containers,
 // or offline tests without Chromium installed.
 
-import type { ConsoleEntry, ContentBlock, ElementDescriptor, NetworkEntry, PageSnapshot } from '../types.js'
+import type { ConsoleEntry, ContentBlock, ElementDescriptor, InlineLink, NetworkEntry, PageSnapshot } from '../types.js'
 import { isTrackerHost } from '../agent/omnibox.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 
@@ -119,31 +119,67 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
     }
 
     if (m[6] !== undefined) {
-      // Paragraph <p>
+      // Paragraph <p>: capture inline <a> links in place so they render inline as [eN: link text]
       const inner = m[6]
-      // Also capture links inside paragraphs
-      const text = stripTags(inner)
-      if (text) blocks.push({ kind: 'paragraph', text, tag: 'p' })
+      const inlineLinks: InlineLink[] = []
       const innerLinkRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi
+      let textParts = ''
+      let lastIdx = 0
       let alm: RegExpExecArray | null
       while ((alm = innerLinkRe.exec(inner)) !== null) {
+        const beforeRaw = inner.slice(lastIdx, alm.index)
+        const beforeClean = stripTags(beforeRaw)
+        if (beforeClean) {
+          if (textParts && !/\s$/.test(textParts) && !/^[.,;:!?)}\]]/.test(beforeClean)) {
+            if (/^\s/.test(beforeRaw) || (lastIdx > 0 && /\s$/.test(inner.slice(0, lastIdx)))) {
+              textParts += ' '
+            }
+          }
+          textParts += beforeClean
+        }
+        const hadSpaceBeforeLink = /\s$/.test(beforeRaw)
         const attrs = parseAttrs(alm[1] ?? '')
         const lText = stripTags(alm[2] ?? '') || attrs['aria-label'] || attrs.href || ''
-        if (!lText) continue
-        const selector = attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`
-        const href = resolveHref(attrs.href, baseUrl)
-        const el: ElementDescriptor = {
-          selector,
-          tag: 'a',
-          type: 'link',
-          id: attrs.id,
-          role: attrs.role || 'link',
-          text: lText,
-          ariaLabel: attrs['aria-label'],
-          href,
+        if (lText) {
+          const selector = attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`
+          const href = resolveHref(attrs.href, baseUrl)
+          const el: ElementDescriptor = {
+            selector,
+            tag: 'a',
+            type: 'link',
+            id: attrs.id,
+            role: attrs.role || 'link',
+            text: lText,
+            ariaLabel: attrs['aria-label'],
+            href,
+          }
+          elements.push(el)
+          if (textParts && (hadSpaceBeforeLink || !/[(\[{'"\/-]$/.test(textParts))) {
+            textParts += ' '
+          }
+          const start = textParts.length
+          textParts += lText
+          const end = textParts.length
+          inlineLinks.push({ text: lText, href, selector, start, end })
         }
-        elements.push(el)
-        blocks.push({ kind: 'link', text: lText, href, tag: 'a' })
+        lastIdx = alm.index + alm[0].length
+      }
+      const tailRaw = inner.slice(lastIdx)
+      const tailClean = stripTags(tailRaw)
+      if (tailClean) {
+        if (textParts && (/^\s/.test(tailRaw) || (!/^[.,;:!?)}\]]/.test(tailClean) && !/\s$/.test(textParts)))) {
+          textParts += ' '
+        }
+        textParts += tailClean
+      }
+      const text = textParts.trim() || stripTags(inner)
+      if (text) {
+        blocks.push({
+          kind: 'paragraph',
+          text,
+          tag: 'p',
+          ...(inlineLinks.length > 0 ? { links: inlineLinks } : {}),
+        })
       }
       continue
     }

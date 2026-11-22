@@ -2,7 +2,7 @@
 // Designed so both AI agents (even in strict 7-bit ASCII mode) and humans over SSH/EC2
 // can inspect and drive any live web page directly inside a terminal.
 
-import type { AsciiLayoutMode, AsciiRenderOptions, ContentBlock, PageSnapshot, Rect } from '../types.js'
+import type { AsciiLayoutMode, AsciiRenderOptions, ContentBlock, InlineLink, PageSnapshot, Rect } from '../types.js'
 
 const ANSI = {
   reset: '\x1b[0m',
@@ -74,6 +74,182 @@ function wrapText(text: string, maxWidth: number): string[] {
     }
   }
   if (current) lines.push(current)
+  return lines
+}
+
+type InlineSegment =
+  | { type: 'text'; text: string }
+  | { type: 'link'; text: string; ref?: string }
+
+/**
+ * Wraps paragraph text with inline `[eN: link text]` (or `[link text]`) tokens
+ * so links flow inline inside the paragraph without forcing line breaks.
+ * Keeps each inline link token (and immediately trailing punctuation) together
+ * on a line whenever it fits within `maxWidth`.
+ */
+export function wrapInlineParagraph(
+  text: string,
+  links: InlineLink[] | undefined,
+  maxWidth: number,
+  options: { asciiOnly?: boolean; color?: boolean; showRefs?: boolean } = {},
+): string[] {
+  const asciiOnly = options.asciiOnly ?? true
+  const color = asciiOnly ? false : (options.color ?? false)
+  const showRefs = options.showRefs ?? true
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s)
+
+  if (!links || links.length === 0) {
+    return wrapText(clean(text), maxWidth)
+  }
+
+  const segments: InlineSegment[] = []
+  const unmatched: InlineLink[] = []
+  let cursor = 0
+
+  for (const link of links) {
+    const rawLabel = link.text || link.href || ''
+    if (!rawLabel) continue
+
+    let idx = -1
+    let endIdx = -1
+
+    if (
+      link.start !== undefined &&
+      link.end !== undefined &&
+      link.start >= cursor &&
+      link.end <= text.length &&
+      link.end > link.start
+    ) {
+      idx = link.start
+      endIdx = link.end
+    } else {
+      const exactIdx = text.indexOf(rawLabel, cursor)
+      if (exactIdx !== -1) {
+        idx = exactIdx
+        endIdx = exactIdx + rawLabel.length
+      } else {
+        const lowerIdx = text.toLowerCase().indexOf(rawLabel.toLowerCase(), cursor)
+        if (lowerIdx !== -1) {
+          idx = lowerIdx
+          endIdx = lowerIdx + rawLabel.length
+        }
+      }
+    }
+
+    if (idx !== -1 && endIdx > idx) {
+      if (idx > cursor) {
+        segments.push({ type: 'text', text: text.slice(cursor, idx) })
+      }
+      segments.push({ type: 'link', text: rawLabel, ref: link.ref })
+      cursor = endIdx
+    } else {
+      unmatched.push(link)
+    }
+  }
+
+  if (cursor < text.length) {
+    segments.push({ type: 'text', text: text.slice(cursor) })
+  }
+  for (const link of unmatched) {
+    const rawLabel = link.text || link.href || ''
+    if (!rawLabel) continue
+    if (segments.length > 0) segments.push({ type: 'text', text: ' ' })
+    segments.push({ type: 'link', text: rawLabel, ref: link.ref })
+  }
+
+  const tokens: Array<{ plain: string; rendered: string; isLink: boolean }> = []
+  let startNewToken = true
+
+  for (const seg of segments) {
+    if (seg.type === 'text') {
+      const normalized = clean(seg.text).replace(/\s+/g, ' ')
+      if (!normalized) continue
+      const parts = normalized.split(' ')
+      for (let p = 0; p < parts.length; p++) {
+        const word = parts[p]!
+        if (word.length > 0) {
+          if (startNewToken || tokens.length === 0) {
+            tokens.push({ plain: word, rendered: word, isLink: false })
+          } else {
+            const last = tokens[tokens.length - 1]!
+            last.plain += word
+            last.rendered += word
+          }
+          startNewToken = false
+        }
+        if (p < parts.length - 1) {
+          startNewToken = true
+        }
+      }
+    } else {
+      const label = clean(seg.text).replace(/\s+/g, ' ').trim()
+      if (!label) continue
+      const plainBadge = showRefs && seg.ref ? `[${seg.ref}: ${label}]` : `[${label}]`
+      const renderedBadge = color
+        ? showRefs && seg.ref
+          ? `${ANSI.cyan}[${ANSI.yellow}${seg.ref}${ANSI.cyan}: ${label}]${ANSI.reset}`
+          : `${ANSI.cyan}[${label}]${ANSI.reset}`
+        : plainBadge
+      if (startNewToken || tokens.length === 0) {
+        tokens.push({ plain: plainBadge, rendered: renderedBadge, isLink: true })
+      } else {
+        const last = tokens[tokens.length - 1]!
+        last.plain += plainBadge
+        last.rendered += renderedBadge
+        last.isLink = true
+      }
+      startNewToken = false
+    }
+  }
+
+  if (tokens.length === 0) return []
+  if (maxWidth <= 8) {
+    const joined = tokens.map((t) => t.plain).join(' ')
+    return [joined.slice(0, maxWidth)]
+  }
+
+  const lines: string[] = []
+  let currentPlainLen = 0
+  let currentRendered = ''
+
+  for (const token of tokens) {
+    const tokLen = token.plain.length
+    if (tokLen <= maxWidth) {
+      if (currentPlainLen === 0) {
+        currentPlainLen = tokLen
+        currentRendered = token.rendered
+      } else if (currentPlainLen + 1 + tokLen <= maxWidth) {
+        currentPlainLen += 1 + tokLen
+        currentRendered = `${currentRendered} ${token.rendered}`
+      } else {
+        lines.push(currentRendered)
+        currentPlainLen = tokLen
+        currentRendered = token.rendered
+      }
+    } else {
+      if (currentPlainLen > 0) {
+        lines.push(currentRendered)
+        currentPlainLen = 0
+        currentRendered = ''
+      }
+      const wrappedParts = wrapText(token.plain, maxWidth)
+      for (let i = 0; i < wrappedParts.length; i++) {
+        const part = wrappedParts[i]!
+        const styledPart = color && token.isLink ? `${ANSI.cyan}${part}${ANSI.reset}` : part
+        if (i < wrappedParts.length - 1) {
+          lines.push(styledPart)
+        } else {
+          currentPlainLen = part.length
+          currentRendered = styledPart
+        }
+      }
+    }
+  }
+
+  if (currentPlainLen > 0) {
+    lines.push(currentRendered)
+  }
+
   return lines
 }
 
@@ -324,7 +500,7 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
     }
 
     case 'paragraph': {
-      return wrapText(clean(block.text), innerWidth)
+      return wrapInlineParagraph(block.text, block.links, innerWidth, { asciiOnly, color, showRefs })
     }
 
     case 'link': {
@@ -373,7 +549,11 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
 
     case 'list-item': {
       const bullet = asciiOnly ? '* ' : '• '
-      const lines = wrapText(clean(block.text), Math.max(10, innerWidth - 2))
+      const lines = wrapInlineParagraph(block.text, block.links, Math.max(10, innerWidth - 2), {
+        asciiOnly,
+        color,
+        showRefs,
+      })
       return lines.map((l, idx) => `${idx === 0 ? bullet : '  '}${l}`)
     }
 
@@ -781,7 +961,15 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   }
 
   // Append interactive refs index if page had elements not already emitted in blocks
-  const emittedRefs = new Set(snapshot.blocks.map((b) => b.ref).filter(Boolean))
+  const emittedRefs = new Set<string>()
+  for (const b of snapshot.blocks) {
+    if (b.ref) emittedRefs.add(b.ref)
+    if (b.links) {
+      for (const lnk of b.links) {
+        if (lnk.ref) emittedRefs.add(lnk.ref)
+      }
+    }
+  }
   const orphanElements = snapshot.elements.filter((el) => el.ref && !emittedRefs.has(el.ref))
   if (showRefs && orphanElements.length > 0) {
     bodyLines.push((asciiOnly ? '-' : '─').repeat(innerWidth))

@@ -25,6 +25,14 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
         res.end(`<html><head><title>Results for ${q}</title></head><body><h1>Results: ${q}</h1><a href="/">Home</a></body></html>`)
         return
       }
+      if (url.pathname === '/article') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(`<html><head><title>Article</title></head><body>
+          <h1>Guide</h1>
+          <p>Read the <a id="docs-link" href="/search?q=docs">Troy Docs</a> and <a id="api-link" href="/search?q=api">API guide</a> before deploying.</p>
+        </body></html>`)
+        return
+      }
       if (url.pathname === '/table') {
         res.writeHead(200, { 'content-type': 'text/html' })
         res.end(`<html><head><title>EC2 Fleet</title></head><body>
@@ -170,5 +178,23 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
     expect(ascii).toContain('+=======+============+=======+')
     expect(ascii).toContain('| app-1 | us-east-1a | ok    |')
     expect(ascii).toContain('| app-2 | us-east-1b | warm  |')
+  })
+
+  it('keeps paragraph links inline as [eN: link text] in Lite engine and lets agents click them', async () => {
+    const opened = await api('/open', { url: `${baseUrl}/article`, activate: true })
+    expect(opened.data.ok).toBe(true)
+    const tabId = Number(opened.data.id)
+
+    const asciiRes = await api('/ascii', { tabId, width: 96, height: 22 })
+    expect(asciiRes.data.ok).toBe(true)
+    const ascii = String(asciiRes.data.ascii)
+    expect(ascii).toMatch(/Read the \[e\d+: Troy Docs\] and \[e\d+: API guide\] before deploying\./)
+    expect(ascii).not.toContain('INTERACTIVE REFS:')
+
+    const found = await api('/tool', { tabId, name: 'page_find', args: { query: 'API guide' } })
+    const ref = (found.data.matches as Array<{ ref: string }>)[0]!.ref
+    const clicked = await api('/tool', { tabId, name: 'page_click', args: { ref } })
+    expect(clicked.data.ok).toBe(true)
+    expect(String(clicked.data.url)).toContain('/search?q=api')
   })
 })

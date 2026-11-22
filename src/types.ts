@@ -44,6 +44,15 @@ export interface ElementDescriptor {
   signature?: string
 }
 
+export interface InlineLink {
+  text: string
+  ref?: string
+  href?: string
+  selector?: string
+  start?: number
+  end?: number
+}
+
 export interface ContentBlock {
   kind: 'heading' | 'paragraph' | 'link' | 'input' | 'button' | 'select' | 'list-item' | 'code' | 'table-row' | 'image' | 'hr'
   text: string
@@ -58,6 +67,7 @@ export interface ContentBlock {
   cells?: string[]
   isHeader?: boolean
   alt?: string
+  links?: InlineLink[]
 }
 
 export interface PageSnapshot {
