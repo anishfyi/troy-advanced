@@ -85,11 +85,20 @@ export async function createAgentSocket(
           scrollOffset: typeof body.scrollOffset === 'number' ? body.scrollOffset : 0,
           layout: layoutOpt,
           density: densityOpt,
+          since: Boolean(body.since),
         })
         return {
           status: 200,
           payload: res.ok
-            ? { ok: true, ascii: res.ascii, url: res.snapshot?.url, title: res.snapshot?.title, refs: res.snapshot?.elements.length }
+            ? {
+                ok: true,
+                mode: res.mode ?? 'full',
+                ascii: res.ascii,
+                url: res.snapshot?.url,
+                title: res.snapshot?.title,
+                refs: res.snapshot?.elements.length,
+                ...(res.delta ? { delta: res.delta } : {}),
+              }
             : { ok: false, error: res.error },
         }
       }

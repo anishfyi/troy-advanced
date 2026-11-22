@@ -9,7 +9,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M04: ASCII progress/scrollbar gutter on the right edge of the viewport frame (`#` thumb on `|` track)
 - [x] M05: Form container grouping boxes (`+-- Form: Login --+`) around related inputs and submit buttons
 - [x] M06: Collapsible/compact `--density compact|normal|wide` ASCII layout profiles for small LLM token budgets
-- [ ] M07: ASCII diff renderer (`renderDeltaAscii`) that renders `--since` deltas with `+` added / `-` removed / `~` changed markers
+- [x] M07: ASCII diff renderer (`renderDeltaAscii`) that renders `--since` deltas with `+` added / `-` removed / `~` changed markers
 - [ ] M08: PNG decoder support for 16-bit channels (downsampled to 8-bit), `tRNS` transparency chunks, and 1/2/4-bit sub-byte depths
 - [ ] M09: Sobel edge-detection ASCII mode (`mode: 'edge'`) in `src/ascii/pixels.ts` for crisp UI wireframe outlines (`/\-|`)
 - [ ] M10: Bounding-box wireframe drawing in `renderRgbaToAscii` so Set-of-Marks draws actual `+--[e3]--+` rectangles around clickable elements

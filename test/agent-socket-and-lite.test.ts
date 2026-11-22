@@ -153,11 +153,13 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
     expect(allowedSubmit.data.ok).toBe(true)
     expect(String(allowedSubmit.data.url)).toContain('/search?q=ec2-ascii')
 
-    // Delta read shows URL change
+    // Delta read shows URL change and renders ASCII diff
     const delta = await api('/tool', { tabId, name: 'page_read', args: { since: true } })
     expect(delta.data.ok).toBe(true)
     expect(delta.data.mode).toBe('delta')
     expect(delta.data.urlChanged).toBe(true)
+    expect(String(delta.data.ascii)).toContain('TROY-ADV DELTA [CHANGED]')
+    expect(String(delta.data.ascii)).toContain('/search?q=ec2-ascii')
 
     // Memory recall finds what we read
     const recalled = await api('/recall', { query: 'Portal' })
@@ -274,5 +276,42 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
     const parsed = JSON.parse(pipeJsonCompact.output) as { ok: boolean; ascii: string }
     expect(parsed.ok).toBe(true)
     expect(parsed.ascii).toContain('[compact]')
+  })
+
+  it('renders ASCII diffs via /ascii --since, MCP troy_read_ascii --since, and Pipe REPL ascii --since', async () => {
+    const opened = await api('/open', { url: `${baseUrl}/`, activate: true })
+    expect(opened.data.ok).toBe(true)
+    const tabId = Number(opened.data.id)
+
+    // Baseline read
+    const first = await api('/ascii', { tabId, width: 90 })
+    expect(first.data.ok).toBe(true)
+    expect(first.data.mode).toBe('full')
+
+    // Second /ascii with since: true on unchanged page shows NO CHANGES
+    const noChange = await api('/ascii', { tabId, width: 90, since: true })
+    expect(noChange.data.ok).toBe(true)
+    expect(noChange.data.mode).toBe('delta')
+    expect(String(noChange.data.ascii)).toContain('TROY-ADV DELTA [NO CHANGES]')
+    expect(String(noChange.data.ascii)).toContain('+0 -0 ~0 elems | +0 -0 lines')
+
+    // Navigate to /table so DOM changes dramatically
+    await api('/tool', { tabId, name: 'page_navigate', args: { url: `${baseUrl}/table` } })
+
+    // MCP troy_read_ascii with since: true returns the ASCII diff directly
+    const mcpDelta = await handleMcpRequest(manager, {
+      jsonrpc: '2.0',
+      id: 107,
+      method: 'tools/call',
+      params: { name: 'troy_read_ascii', arguments: { tabId, since: true, width: 92 } },
+    })
+    const mcpText = ((mcpDelta?.result as { content: Array<{ text: string }> }).content[0]?.text) ?? ''
+    expect(mcpText).toContain('TROY-ADV DELTA [CHANGED]')
+    expect(mcpText).toContain('/table')
+    expect(mcpText).toContain('TEXT (+')
+
+    // Pipe REPL `ascii --since` returns NO CHANGES right after the previous read
+    const pipeDelta = await executePipeCommand(manager, 'ascii --since compact')
+    expect(pipeDelta.output).toContain('[delta:NO CHANGES]')
   })
 })

@@ -1483,3 +1483,5 @@ export function renderCompactRefsAscii(snapshot: PageSnapshot, limit = 60): stri
   }
   return lines.join('\n')
 }
+
+export { renderDeltaAscii, type DeltaAsciiOptions } from './delta.js'

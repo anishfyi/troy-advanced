@@ -9,8 +9,8 @@ import { ElementRegistry } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
-import { computePageDelta } from '../agent/delta.js'
-import { parseAsciiDensity, renderCompactRefsAscii, renderPageAscii } from '../ascii/layout.js'
+import { computePageDelta, type PageDelta } from '../agent/delta.js'
+import { parseAsciiDensity, renderCompactRefsAscii, renderDeltaAscii, renderPageAscii } from '../ascii/layout.js'
 import { renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { LiteBrowserEngine } from './lite.js'
@@ -247,17 +247,32 @@ export class BrowserManager {
     return indexed
   }
 
-  async renderAscii(tabId?: number, opts: AsciiRenderOptions = {}): Promise<{ ok: boolean; ascii?: string; snapshot?: PageSnapshot; error?: string }> {
+  async renderAscii(
+    tabId?: number,
+    opts: AsciiRenderOptions & { since?: boolean } = {},
+  ): Promise<{ ok: boolean; ascii?: string; snapshot?: PageSnapshot; delta?: PageDelta; mode?: 'full' | 'delta'; error?: string }> {
     const session = this.resolveSession(tabId)
     if (!session) return { ok: false, error: 'no open tab' }
+    const prev = session.lastSnapshot
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
+    if (opts.since && prev) {
+      const delta = computePageDelta(prev, snap)
+      const ascii = renderDeltaAscii(delta, {
+        width: opts.width,
+        asciiOnly: opts.asciiOnly,
+        color: opts.color,
+        showChrome: opts.showChrome,
+        density: opts.density,
+      })
+      return { ok: true, mode: 'delta', ascii, snapshot: snap, delta }
+    }
     const ascii = renderPageAscii(snap, {
       ...opts,
       tabs: this.listTabs(),
       activeTabId: this.activeTabId ?? snap.tabId,
     })
-    return { ok: true, ascii, snapshot: snap }
+    return { ok: true, mode: 'full', ascii, snapshot: snap }
   }
 
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -276,7 +291,20 @@ export class BrowserManager {
 
         if (args.since && prev) {
           const delta = computePageDelta(prev, snap)
-          return capPayload({ ok: true, mode: 'delta', ...delta })
+          const ascii = renderDeltaAscii(delta, {
+            width: typeof args.width === 'number' ? args.width : undefined,
+            asciiOnly: args.asciiOnly !== false,
+            color: Boolean(args.color),
+            showChrome: typeof args.showChrome === 'boolean' ? args.showChrome : undefined,
+            density: parseAsciiDensity(args.density),
+          })
+          return capPayload({
+            ok: true,
+            mode: 'delta',
+            ...delta,
+            ascii,
+            ...(name === 'page_read_ascii' ? { content: ascii } : {}),
+          })
         }
 
         const layoutOpt =

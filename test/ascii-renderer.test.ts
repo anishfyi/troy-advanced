@@ -1,5 +1,6 @@
 import { deflateSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
+import { computePageDelta } from '../src/agent/delta.js'
 import {
   computeScrollbarGutter,
   hasMultiColumnLayout,
@@ -7,6 +8,7 @@ import {
   parseAsciiDensity,
   renderAsciiForm,
   renderAsciiTable,
+  renderDeltaAscii,
   renderPageAscii,
   renderSpatialBlocks,
   resolveDensityProfile,
@@ -728,5 +730,96 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     const wideAuto = renderPageAscii(multiColSnap, { density: 'wide', asciiOnly: true })
     expect(wideAuto).toContain('layout:2d')
     expect(wideAuto).toContain('density:wide')
+  })
+
+  it('renders --since page deltas with +, -, and ~ markers in strict ASCII, compact, wide, and color modes', () => {
+    const prevSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://ops.example.com/jobs',
+      title: 'Jobs — Queue',
+      epoch: 1,
+      viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+      blocks: [],
+      elements: [
+        { ref: 'e1', selector: '#status', tag: 'button', type: 'button', text: 'Idle', disabled: false },
+        { ref: 'e2', selector: '#filter', tag: 'input', type: 'text', text: 'Filter', value: 'pending' },
+        { ref: 'e3', selector: '#auto', tag: 'input', type: 'checkbox', text: 'Auto', checked: false },
+        { ref: 'e4', selector: 'a.old', tag: 'a', type: 'link', text: 'Deprecated Link' },
+      ],
+      text: 'Jobs Queue\n2 pending jobs\nOld notice',
+      capturedAt: 1000,
+    }
+
+    const nextSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://ops.example.com/jobs?active=1',
+      title: 'Jobs — Active',
+      epoch: 2,
+      viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+      blocks: [],
+      elements: [
+        { ref: 'e1', selector: '#status', tag: 'button', type: 'button', text: 'Running', disabled: true },
+        { ref: 'e2', selector: '#filter', tag: 'input', type: 'text', text: 'Filter', value: 'active' },
+        { ref: 'e3', selector: '#auto', tag: 'input', type: 'checkbox', text: 'Auto', checked: true },
+        { ref: 'e5', selector: 'button.cancel', tag: 'button', type: 'button', text: 'Cancel All 🚀' },
+      ],
+      text: 'Jobs Queue\n1 active job\nAll workers healthy',
+      capturedAt: 2000,
+    }
+
+    // 1. Unchanged delta
+    const unchangedDelta = computePageDelta(prevSnap, prevSnap)
+    const unchangedAscii = renderDeltaAscii(unchangedDelta, { width: 84, asciiOnly: true })
+    expect(/^[\x20-\x7e\n]+$/.test(unchangedAscii)).toBe(true)
+    expect(unchangedAscii).toContain('TROY-ADV DELTA [NO CHANGES]')
+    expect(unchangedAscii).toContain('(no changes since previous snapshot)')
+    expect(unchangedAscii).toContain('+0 -0 ~0 elems | +0 -0 lines')
+
+    // 2. Changed delta (normal framed mode)
+    const delta = computePageDelta(prevSnap, nextSnap)
+    expect(delta.changed).toBe(true)
+    expect(delta.previousTitle).toBe('Jobs — Queue')
+
+    const framed = renderDeltaAscii(delta, { width: 92, asciiOnly: true })
+    expect(/^[\x20-\x7e\n]+$/.test(framed)).toBe(true)
+    expect(framed).toContain('TROY-ADV DELTA [CHANGED]')
+    expect(framed).toContain('~ URL: https://ops.example.com/jobs -> https://ops.example.com/jobs?active=1')
+    expect(framed).toContain('~ TITLE: "Jobs - Queue" -> "Jobs - Active"')
+    expect(framed).toContain('ELEMENTS (+1 -1 ~3):')
+    expect(framed).toContain('+ [e5] <button> "Cancel All ??"')
+    expect(framed).toContain('~ [e1] <button> text:"Idle"->"Running", disabled:false->true')
+    expect(framed).toContain('~ [e2] <input> val:"pending"->"active"')
+    expect(framed).toContain('~ [e3] <input> checked:false->true')
+    expect(framed).toContain('- [e4] <a> "Deprecated Link"')
+    expect(framed).toContain('TEXT (+2 -2):')
+    expect(framed).toContain('+ 1 active job')
+    expect(framed).toContain('+ All workers healthy')
+    expect(framed).toContain('- 2 pending jobs')
+    expect(framed).toContain('- Old notice')
+    expect(framed).toContain('delta: +1 -1 ~3 elems | +2 -2 lines')
+
+    // Every framed row matches exact requested width
+    for (const line of framed.split('\n')) {
+      expect(line.length).toBe(92)
+    }
+
+    // 3. Compact density (unframed, token-efficient)
+    const compact = renderDeltaAscii(delta, { density: 'compact', asciiOnly: true })
+    expect(/^[\x20-\x7e\n]+$/.test(compact)).toBe(true)
+    expect(compact).toContain('[delta:CHANGED]')
+    expect(compact).not.toContain('TROY-ADV DELTA')
+    expect(compact.length).toBeLessThan(framed.length * 0.7)
+
+    // 4. Truncation caps for large deltas
+    const capped = renderDeltaAscii(delta, { width: 88, maxElements: 1, maxLines: 1, asciiOnly: true })
+    expect(capped).toContain('~ ... (+2 more changed elements)')
+    expect(capped).toContain('+ ... (+1 more added lines)')
+    expect(capped).toContain('- ... (+1 more removed lines)')
+
+    // 5. ANSI color mode (when asciiOnly: false)
+    const colored = renderDeltaAscii(delta, { width: 92, asciiOnly: false, color: true })
+    expect(colored).toContain('\x1b[32m') // green for +
+    expect(colored).toContain('\x1b[31m') // red for -
+    expect(colored).toContain('\x1b[33m') // yellow for ~
   })
 })

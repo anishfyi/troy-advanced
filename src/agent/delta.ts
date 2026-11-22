@@ -8,6 +8,7 @@ export interface PageDelta {
   urlChanged: boolean
   titleChanged: boolean
   previousUrl: string
+  previousTitle?: string
   url: string
   title: string
   addedElements: ElementDescriptor[]
@@ -96,6 +97,7 @@ export function computePageDelta(prev: PageSnapshot, next: PageSnapshot): PageDe
     urlChanged,
     titleChanged,
     previousUrl: prev.url,
+    previousTitle: prev.title,
     url: next.url,
     title: next.title,
     addedElements,

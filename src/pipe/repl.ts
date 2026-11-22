@@ -75,9 +75,12 @@ export async function executePipeCommand(
     case 'render': {
       let width: number | undefined
       let density: string | undefined
+      let since = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
-        if (tok === '--density' && rest[i + 1]) {
+        if (tok === '--since') {
+          since = true
+        } else if (tok === '--density' && rest[i + 1]) {
           density = rest[++i]
         } else if (tok.startsWith('--density=')) {
           density = tok.slice('--density='.length)
@@ -87,7 +90,7 @@ export async function executePipeCommand(
           width = Number(tok)
         }
       }
-      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, asciiOnly: true })
+      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, since, asciiOnly: true })
       return { output: format(res) }
     }
     case 'visual': {
