@@ -334,13 +334,16 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
     if (m[21] !== undefined) {
       // <tr>
       const cells: string[] = []
-      const cellRe = /<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi
+      let thCount = 0
+      const cellRe = /<(t[hd])\b[^>]*>([\s\S]*?)<\/\1>/gi
       let cm: RegExpExecArray | null
       while ((cm = cellRe.exec(m[21])) !== null) {
-        cells.push(stripTags(cm[1] ?? ''))
+        if ((cm[1] ?? '').toLowerCase() === 'th') thCount++
+        cells.push(stripTags(cm[2] ?? ''))
       }
       if (cells.length > 0) {
-        blocks.push({ kind: 'table-row', text: cells.join(' | '), cells, tag: 'tr' })
+        const isHeader = thCount > 0 && thCount === cells.length
+        blocks.push({ kind: 'table-row', text: cells.join(' | '), cells, tag: 'tr', isHeader: isHeader || undefined })
       }
       continue
     }

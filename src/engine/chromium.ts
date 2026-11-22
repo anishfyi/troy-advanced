@@ -188,9 +188,15 @@ const SNAPSHOT_SCRIPT = `(() => {
         const txt = (el.innerText || '').trim();
         if (txt) blocks.push({ kind: 'code', text: txt.slice(0, 2000), tag, box });
       } else if (tag === 'tr') {
-        const cells = Array.from(el.querySelectorAll('th,td')).map((c) => (c.innerText || '').replace(/\\s+/g, ' ').trim());
+        const directCells = Array.from(el.children).filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
+        const cellEls = directCells.length > 0 ? directCells : Array.from(el.querySelectorAll('th,td'));
+        const cells = cellEls.map((c) => (c.innerText || '').replace(/\\s+/g, ' ').trim());
+        const isHeader = cellEls.length > 0 && (
+          cellEls.every((c) => c.tagName === 'TH') ||
+          Boolean(el.closest('thead'))
+        );
         if (cells.length > 0 && cells.some(Boolean)) {
-          blocks.push({ kind: 'table-row', text: cells.join(' | '), cells, tag, box });
+          blocks.push({ kind: 'table-row', text: cells.join(' | '), cells, tag, box, isHeader: isHeader || undefined });
         }
       } else if (tag === 'img') {
         const alt = el.getAttribute('alt') || el.getAttribute('title') || '';

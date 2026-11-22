@@ -77,6 +77,216 @@ function wrapText(text: string, maxWidth: number): string[] {
   return lines
 }
 
+function wrapCellText(text: string, width: number, maxLines = 3): string[] {
+  if (width <= 0) return ['']
+  const clean = text.replace(/\s+/g, ' ').trim()
+  if (!clean) return ['']
+  if (clean.length <= width) return [clean]
+
+  const words = clean.split(' ')
+  const lines: string[] = []
+  let current = ''
+
+  for (const word of words) {
+    if (!current) {
+      if (word.length <= width) {
+        current = word
+      } else {
+        for (let i = 0; i < word.length; i += width) {
+          const slice = word.slice(i, i + width)
+          if (slice.length === width && i + width < word.length) {
+            lines.push(slice)
+          } else {
+            current = slice
+          }
+        }
+      }
+    } else if (current.length + 1 + word.length <= width) {
+      current = `${current} ${word}`
+    } else {
+      lines.push(current)
+      current = ''
+      if (word.length <= width) {
+        current = word
+      } else {
+        for (let i = 0; i < word.length; i += width) {
+          const slice = word.slice(i, i + width)
+          if (slice.length === width && i + width < word.length) {
+            lines.push(slice)
+          } else {
+            current = slice
+          }
+        }
+      }
+    }
+  }
+  if (current) lines.push(current)
+
+  if (lines.length <= maxLines) return lines
+  const kept = lines.slice(0, maxLines)
+  const overflow = lines.slice(maxLines - 1).join(' ')
+  kept[maxLines - 1] = truncateVisible(overflow, width)
+  return kept
+}
+
+/**
+ * Renders a sequence of `table-row` blocks as an auto-aligned ASCII (or Unicode)
+ * table with `+---+---+` borders and `+===+===+` header separator rows.
+ */
+export function renderAsciiTable(
+  rows: ContentBlock[],
+  maxWidth: number,
+  options: { asciiOnly?: boolean; color?: boolean } = {},
+): string[] {
+  if (rows.length === 0 || maxWidth <= 0) return []
+  const asciiOnly = options.asciiOnly ?? true
+  const color = asciiOnly ? false : (options.color ?? false)
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s).replace(/\s+/g, ' ').trim()
+
+  const normalized = rows.map((row) => ({
+    cells: (row.cells && row.cells.length > 0 ? row.cells : [row.text]).map(clean),
+    isHeader: Boolean(row.isHeader),
+  }))
+
+  const colCount = Math.max(0, ...normalized.map((r) => r.cells.length))
+  if (colCount === 0) return []
+
+  for (const r of normalized) {
+    while (r.cells.length < colCount) r.cells.push('')
+  }
+
+  // Border overhead: "| " + " | " * (colCount - 1) + " |" = 3 * colCount + 1
+  const borderOverhead = 3 * colCount + 1
+  const available = maxWidth - borderOverhead
+
+  if (available < colCount) {
+    const sep = asciiOnly ? ' | ' : ' │ '
+    return normalized.map((r) => truncateVisible(r.cells.join(sep), maxWidth))
+  }
+
+  const naturalWidths = new Array<number>(colCount).fill(1)
+  for (const r of normalized) {
+    for (let c = 0; c < colCount; c++) {
+      naturalWidths[c] = Math.max(naturalWidths[c]!, r.cells[c]!.length)
+    }
+  }
+
+  const widths = [...naturalWidths]
+  let total = widths.reduce((sum, w) => sum + w, 0)
+  while (total > available) {
+    // Shrink widest column first so narrow columns (IDs, status, numbers) stay intact
+    let widestIdx = -1
+    let widestVal = 1
+    for (let c = 0; c < colCount; c++) {
+      if (widths[c]! > widestVal) {
+        widestVal = widths[c]!
+        widestIdx = c
+      }
+    }
+    if (widestIdx === -1) break
+    widths[widestIdx] = widths[widestIdx]! - 1
+    total--
+  }
+
+  const chars = asciiOnly
+    ? {
+        tl: '+',
+        tm: '+',
+        tr: '+',
+        hl: '+',
+        hm: '+',
+        hr: '+',
+        bl: '+',
+        bm: '+',
+        br: '+',
+        h: '-',
+        hh: '=',
+        v: '|',
+      }
+    : {
+        tl: '┌',
+        tm: '┬',
+        tr: '┐',
+        hl: '╞',
+        hm: '╪',
+        hr: '╡',
+        bl: '└',
+        bm: '┴',
+        br: '┘',
+        h: '─',
+        hh: '═',
+        v: '│',
+      }
+
+  const makeRule = (left: string, mid: string, right: string, fill: string) =>
+    `${left}${widths.map((w) => fill.repeat(w + 2)).join(mid)}${right}`
+
+  const topRule = makeRule(chars.tl, chars.tm, chars.tr, chars.h)
+  const headerRule = makeRule(chars.hl, chars.hm, chars.hr, chars.hh)
+  const bottomRule = makeRule(chars.bl, chars.bm, chars.br, chars.h)
+
+  const lines: string[] = [topRule]
+
+  for (let rowIdx = 0; rowIdx < normalized.length; rowIdx++) {
+    const row = normalized[rowIdx]!
+    const wrappedCells = row.cells.map((cell, c) => wrapCellText(cell, widths[c]!, 3))
+    const rowHeight = Math.max(1, ...wrappedCells.map((wc) => wc.length))
+
+    for (let lineIdx = 0; lineIdx < rowHeight; lineIdx++) {
+      const renderedCells = widths.map((w, c) => {
+        const chunk = (wrappedCells[c]![lineIdx] ?? '').padEnd(w, ' ')
+        return row.isHeader && color ? `${ANSI.bold}${chunk}${ANSI.reset}` : chunk
+      })
+      lines.push(`${chars.v} ${renderedCells.join(` ${chars.v} `)} ${chars.v}`)
+    }
+
+    const nextRow = normalized[rowIdx + 1]
+    if (row.isHeader && nextRow && !nextRow.isHeader) {
+      lines.push(headerRule)
+    }
+  }
+
+  lines.push(bottomRule)
+  return lines
+}
+
+function renderFlowBlocks(
+  blocks: ContentBlock[],
+  innerWidth: number,
+  asciiOnly: boolean,
+  color: boolean,
+  showRefs: boolean,
+  addSpacing: boolean,
+): string[] {
+  const lines: string[] = []
+  let i = 0
+  while (i < blocks.length) {
+    const block = blocks[i]!
+    if (block.kind === 'table-row') {
+      const tableRows: ContentBlock[] = []
+      while (i < blocks.length && blocks[i]!.kind === 'table-row') {
+        tableRows.push(blocks[i]!)
+        i++
+      }
+      const rendered = renderAsciiTable(tableRows, innerWidth, { asciiOnly, color })
+      if (rendered.length > 0) {
+        lines.push(...rendered)
+        if (addSpacing) lines.push('')
+      }
+      continue
+    }
+    const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
+    if (rendered.length > 0) {
+      lines.push(...rendered)
+      if (addSpacing && (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code')) {
+        lines.push('')
+      }
+    }
+    i++
+  }
+  return lines
+}
+
 function padLine(line: string, width: number, asciiOnly: boolean): string {
   const cleaned = asciiOnly ? sanitizeAscii(stripAnsi(line)) : line
   const vLen = visibleLength(cleaned)
@@ -195,6 +405,7 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
 
 interface PositionedBlock {
   block: ContentBlock
+  tableRows?: ContentBlock[]
   box: Rect
   order: number
 }
@@ -303,7 +514,40 @@ export function renderSpatialBlocks(
   const pxPerRow = 20
 
   // Sort top-to-bottom, left-to-right, preserving DOM order on exact ties
-  const sorted = [...positioned].sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x || a.order - b.order)
+  const sortedRaw = [...positioned].sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x || a.order - b.order)
+
+  // Group table-row blocks that share horizontal extent and are vertically adjacent into unified tables
+  const sorted: PositionedBlock[] = []
+  for (const item of sortedRaw) {
+    if (item.block.kind === 'table-row') {
+      let matched: PositionedBlock | undefined
+      for (let k = sorted.length - 1; k >= 0; k--) {
+        const candidate = sorted[k]!
+        if (candidate.block.kind !== 'table-row') continue
+        const xOverlap =
+          Math.min(candidate.box.x + candidate.box.width, item.box.x + item.box.width) -
+          Math.max(candidate.box.x, item.box.x)
+        const yGap = item.box.y - (candidate.box.y + candidate.box.height)
+        if (xOverlap > 0 && yGap >= -4 && yGap <= 40) {
+          matched = candidate
+          break
+        }
+      }
+      if (matched) {
+        if (!matched.tableRows) matched.tableRows = [matched.block]
+        matched.tableRows.push(item.block)
+        const minBoxX = Math.min(matched.box.x, item.box.x)
+        const minBoxY = Math.min(matched.box.y, item.box.y)
+        const maxBoxR = Math.max(matched.box.x + matched.box.width, item.box.x + item.box.width)
+        const maxBoxB = Math.max(matched.box.y + matched.box.height, item.box.y + item.box.height)
+        matched.box = { x: minBoxX, y: minBoxY, width: maxBoxR - minBoxX, height: maxBoxB - minBoxY }
+        continue
+      }
+      sorted.push({ ...item, tableRows: [item.block] })
+    } else {
+      sorted.push(item)
+    }
+  }
 
   const projected = sorted.map((item) => {
     const colStart = Math.max(0, Math.min(innerWidth - 1, Math.round(((item.box.x - originX) / spanX) * innerWidth)))
@@ -374,7 +618,10 @@ export function renderSpatialBlocks(
     const drawWidth = isCompactInline ? availableSpan : Math.min(availableSpan, Math.max(boxSpan, Math.min(availableSpan, 8)))
 
     // Format without ANSI codes so character positions align 1:1 with grid columns
-    const formatted = formatBlock(item.block, drawWidth, asciiOnly, false, showRefs)
+    const rawFormatted = item.tableRows
+      ? renderAsciiTable(item.tableRows, drawWidth, { asciiOnly, color: false })
+      : formatBlock(item.block, drawWidth, asciiOnly, false, showRefs)
+    const formatted = rawFormatted
       .map((l) => {
         const plain = asciiOnly ? sanitizeAscii(stripAnsi(l)) : stripAnsi(l)
         return plain.length > drawWidth ? truncateVisible(plain, drawWidth) : plain
@@ -450,12 +697,7 @@ export function renderSpatialBlocks(
   // Append any unpositioned blocks below the spatial canvas
   if (unpositioned.length > 0) {
     if (resultLines.length > 0) resultLines.push('')
-    for (const block of unpositioned) {
-      const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
-      if (rendered.length > 0) {
-        resultLines.push(...rendered)
-      }
-    }
+    resultLines.push(...renderFlowBlocks(unpositioned, innerWidth, asciiOnly, color, showRefs, false))
   }
 
   return resultLines
@@ -535,15 +777,7 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   if (spatialLines) {
     bodyLines.push(...spatialLines)
   } else {
-    for (const block of snapshot.blocks) {
-      const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
-      if (rendered.length > 0) {
-        bodyLines.push(...rendered)
-        if (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code') {
-          bodyLines.push('')
-        }
-      }
-    }
+    bodyLines.push(...renderFlowBlocks(snapshot.blocks, innerWidth, asciiOnly, color, showRefs, true))
   }
 
   // Append interactive refs index if page had elements not already emitted in blocks

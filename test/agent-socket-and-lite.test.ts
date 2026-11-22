@@ -25,6 +25,20 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
         res.end(`<html><head><title>Results for ${q}</title></head><body><h1>Results: ${q}</h1><a href="/">Home</a></body></html>`)
         return
       }
+      if (url.pathname === '/table') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(`<html><head><title>EC2 Fleet</title></head><body>
+          <h1>EC2 Fleet</h1>
+          <table>
+            <thead><tr><th>Host</th><th>Zone</th><th>State</th></tr></thead>
+            <tbody>
+              <tr><td>app-1</td><td>us-east-1a</td><td>ok</td></tr>
+              <tr><td>app-2</td><td>us-east-1b</td><td>warm</td></tr>
+            </tbody>
+          </table>
+        </body></html>`)
+        return
+      }
       res.writeHead(200, { 'content-type': 'text/html' })
       res.end(`<!doctype html>
       <html>
@@ -141,5 +155,20 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
     expect(pipeOut.output).toContain('TROY-ADV')
     const jsonPipeOut = await executePipeCommand(manager, '{"cmd":"tabs"}')
     expect(JSON.parse(jsonPipeOut.output).ok).toBe(true)
+  })
+
+  it('parses HTML tables in Lite engine and renders aligned ASCII borders with header separator', async () => {
+    const opened = await api('/open', { url: `${baseUrl}/table`, activate: true })
+    expect(opened.data.ok).toBe(true)
+    const tabId = Number(opened.data.id)
+
+    const asciiRes = await api('/ascii', { tabId, width: 80, height: 24 })
+    expect(asciiRes.data.ok).toBe(true)
+    const ascii = String(asciiRes.data.ascii)
+    expect(ascii).toContain('+-------+------------+-------+')
+    expect(ascii).toContain('| Host  | Zone       | State |')
+    expect(ascii).toContain('+=======+============+=======+')
+    expect(ascii).toContain('| app-1 | us-east-1a | ok    |')
+    expect(ascii).toContain('| app-2 | us-east-1b | warm  |')
   })
 })

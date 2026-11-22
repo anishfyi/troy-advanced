@@ -56,6 +56,7 @@ export interface ContentBlock {
   tag?: string
   box?: Rect
   cells?: string[]
+  isHeader?: boolean
   alt?: string
 }
 

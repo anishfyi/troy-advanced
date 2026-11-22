@@ -1,6 +1,12 @@
 import { deflateSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
-import { hasMultiColumnLayout, renderPageAscii, renderSpatialBlocks, sanitizeAscii } from '../src/ascii/layout.js'
+import {
+  hasMultiColumnLayout,
+  renderAsciiTable,
+  renderPageAscii,
+  renderSpatialBlocks,
+  sanitizeAscii,
+} from '../src/ascii/layout.js'
 import { decodePng } from '../src/ascii/png-decoder.js'
 import { renderPngToAscii } from '../src/ascii/pixels.js'
 import type { PageSnapshot } from '../src/types.js'
@@ -213,5 +219,86 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     const fallbackOut = renderPageAscii(noBoxSnap, { width: 80, height: 20, asciiOnly: true, layout: 'spatial' })
     expect(fallbackOut).toContain('Plain flow text')
     expect(fallbackOut).not.toContain('layout:2d')
+  })
+
+  it('renders ASCII tables with auto-column width alignment, borders (+---+), and header separator rows', () => {
+    const rows = [
+      { kind: 'table-row' as const, text: 'Instance | Region | Status', cells: ['Instance', 'Region', 'Status'], isHeader: true },
+      { kind: 'table-row' as const, text: 'i-01a | us-east-1 | running', cells: ['i-01a', 'us-east-1', 'running'] },
+      { kind: 'table-row' as const, text: 'i-02b | eu-west-1 | stopped', cells: ['i-02b', 'eu-west-1', 'stopped'] },
+      // Ragged row with only 2 cells should be padded cleanly to 3 columns
+      { kind: 'table-row' as const, text: 'i-03c | ap-south-1', cells: ['i-03c', 'ap-south-1'] },
+    ]
+
+    const lines = renderAsciiTable(rows, 80, { asciiOnly: true })
+    expect(lines).toEqual([
+      '+----------+------------+---------+',
+      '| Instance | Region     | Status  |',
+      '+==========+============+=========+',
+      '| i-01a    | us-east-1  | running |',
+      '| i-02b    | eu-west-1  | stopped |',
+      '| i-03c    | ap-south-1 |         |',
+      '+----------+------------+---------+',
+    ])
+
+    // Every line must be identical width and strict 7-bit ASCII
+    const widths = new Set(lines.map((l) => l.length))
+    expect(widths.size).toBe(1)
+    expect(/^[\x20-\x7e\n]+$/.test(lines.join('\n'))).toBe(true)
+
+    // Wide table shrinks widest column to fit maxWidth while wrapping cleanly
+    const wideRows = [
+      { kind: 'table-row' as const, text: 'ID | Description', cells: ['ID', 'Description'], isHeader: true },
+      {
+        kind: 'table-row' as const,
+        text: '1 | Very long server description that must wrap cleanly inside narrow viewport',
+        cells: ['1', 'Very long server description that must wrap cleanly inside narrow viewport'],
+      },
+    ]
+    const narrowLines = renderAsciiTable(wideRows, 36, { asciiOnly: true })
+    for (const line of narrowLines) {
+      expect(line.length).toBeLessThanOrEqual(36)
+    }
+    expect(narrowLines[0]).toMatch(/^\+-+\+-+\+$/)
+    expect(narrowLines[2]).toMatch(/^\+=+\+=+\+$/)
+    // ID column stays intact (width 2) while Description wraps across multiple lines
+    expect(narrowLines.some((l) => l.startsWith('| 1  |'))).toBe(true)
+    expect(narrowLines.length).toBeGreaterThan(5)
+
+    // Unicode box-drawing mode (asciiOnly: false)
+    const uniLines = renderAsciiTable(rows.slice(0, 2), 60, { asciiOnly: false, color: false })
+    expect(uniLines[0]).toMatch(/^┌─+┬─+┬─+┐$/)
+    expect(uniLines[2]).toMatch(/^╞═+╪═+╪═+╡$/)
+    expect(uniLines[uniLines.length - 1]).toMatch(/^└─+┴─+┴─+┘$/)
+
+    // Flow page integration + Spatial 2D sidebar + table integration
+    const spatialTableSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://example.com/fleet',
+      title: 'Fleet Status',
+      epoch: 1,
+      viewport: { width: 1000, height: 600, scrollX: 0, scrollY: 0, scrollHeight: 600 },
+      blocks: [
+        { kind: 'link', text: 'Overview', ref: 'e1', box: { x: 10, y: 40, width: 180, height: 28 } },
+        { kind: 'link', text: 'Nodes', ref: 'e2', box: { x: 10, y: 80, width: 180, height: 28 } },
+        { kind: 'table-row', text: 'Node | CPU', cells: ['Node', 'CPU'], isHeader: true, box: { x: 260, y: 40, width: 680, height: 28 } },
+        { kind: 'table-row', text: 'web-1 | 18%', cells: ['web-1', '18%'], box: { x: 260, y: 70, width: 680, height: 28 } },
+        { kind: 'table-row', text: 'web-2 | 42%', cells: ['web-2', '42%'], box: { x: 260, y: 100, width: 680, height: 28 } },
+      ],
+      elements: [
+        { ref: 'e1', selector: '#a1', tag: 'a', type: 'link', text: 'Overview' },
+        { ref: 'e2', selector: '#a2', tag: 'a', type: 'link', text: 'Nodes' },
+      ],
+      text: 'Fleet Status',
+      capturedAt: Date.now(),
+    }
+
+    const spatialAscii = renderPageAscii(spatialTableSnap, { width: 92, height: 24, asciiOnly: true, layout: 'spatial' })
+    expect(spatialAscii).toContain('+-------+-----+')
+    expect(spatialAscii).toContain('| Node  | CPU |')
+    expect(spatialAscii).toContain('+=======+=====+')
+    expect(spatialAscii).toContain('| web-1 | 18% |')
+    expect(spatialAscii).toContain('| web-2 | 42% |')
+    expect(spatialAscii).toContain('[e1]')
   })
 })
