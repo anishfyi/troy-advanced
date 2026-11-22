@@ -29,6 +29,7 @@ const MCP_TOOLS = [
         tabId: { type: 'number' },
         width: { type: 'number', description: 'Viewport character width (default 100)' },
         height: { type: 'number', description: 'Viewport row height (default 36)' },
+        layout: { type: 'string', enum: ['flow', 'spatial', 'auto'], description: 'Layout mode: flow (linear), spatial (2D box coordinates), or auto' },
         since: { type: 'boolean', description: 'Return only structural delta since previous read' },
       },
     },
@@ -150,6 +151,7 @@ export async function handleMcpRequest(
         result = await manager.runTool(tabId, 'page_read_ascii', {
           width: args.width,
           height: args.height,
+          layout: args.layout,
           since: args.since,
           asciiOnly: true,
         })

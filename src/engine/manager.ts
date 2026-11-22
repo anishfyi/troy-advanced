@@ -264,12 +264,15 @@ export class BrowserManager {
           return capPayload({ ok: true, mode: 'delta', ...delta })
         }
 
+        const layoutOpt =
+          args.layout === 'spatial' || args.layout === 'auto' || args.layout === 'flow' ? args.layout : undefined
         const ascii = renderPageAscii(snap, {
           width: typeof args.width === 'number' ? args.width : 100,
           height: typeof args.height === 'number' ? args.height : 36,
           asciiOnly: args.asciiOnly !== false,
           color: Boolean(args.color),
           showChrome: args.showChrome !== false,
+          layout: layoutOpt,
           tabs: this.listTabs(),
           activeTabId: this.activeTabId ?? snap.tabId,
         })

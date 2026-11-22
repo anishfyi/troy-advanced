@@ -89,6 +89,8 @@ export interface NetworkEntry {
   error?: string
 }
 
+export type AsciiLayoutMode = 'flow' | 'spatial' | 'auto'
+
 export interface AsciiRenderOptions {
   width?: number
   height?: number
@@ -97,6 +99,7 @@ export interface AsciiRenderOptions {
   showRefs?: boolean
   showChrome?: boolean
   scrollOffset?: number
+  layout?: AsciiLayoutMode
   tabs?: TabSummary[]
   activeTabId?: number
   statusMessage?: string

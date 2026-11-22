@@ -2,7 +2,7 @@
 // Designed so both AI agents (even in strict 7-bit ASCII mode) and humans over SSH/EC2
 // can inspect and drive any live web page directly inside a terminal.
 
-import type { AsciiRenderOptions, ContentBlock, PageSnapshot } from '../types.js'
+import type { AsciiLayoutMode, AsciiRenderOptions, ContentBlock, PageSnapshot, Rect } from '../types.js'
 
 const ANSI = {
   reset: '\x1b[0m',
@@ -145,7 +145,7 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
         const box = block.tag === 'radio' ? `(${mark})` : `[${mark}]`
         return [`${badge}${box} ${label}`]
       }
-      const fieldWidth = Math.max(12, Math.min(36, innerWidth - label.length - 14))
+      const fieldWidth = Math.max(4, Math.min(36, innerWidth - label.length - 10))
       const displayVal = val ? truncateVisible(val, fieldWidth) : '_'.repeat(Math.min(16, fieldWidth))
       const field = color
         ? `${ANSI.magenta}[${displayVal.padEnd(Math.min(16, fieldWidth), ' ')}]${ANSI.reset}`
@@ -193,6 +193,274 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
   }
 }
 
+interface PositionedBlock {
+  block: ContentBlock
+  box: Rect
+  order: number
+}
+
+function isValidBox(box?: Rect): box is Rect {
+  return Boolean(
+    box &&
+      Number.isFinite(box.x) &&
+      Number.isFinite(box.y) &&
+      Number.isFinite(box.width) &&
+      Number.isFinite(box.height) &&
+      box.width > 0 &&
+      box.height > 0,
+  )
+}
+
+function resolvePositionedBlocks(snapshot: PageSnapshot): {
+  positioned: PositionedBlock[]
+  unpositioned: ContentBlock[]
+} {
+  const boxByRef = new Map<string, Rect>()
+  for (const el of snapshot.elements) {
+    if (el.ref && isValidBox(el.box)) {
+      boxByRef.set(el.ref, el.box)
+    }
+  }
+
+  const positioned: PositionedBlock[] = []
+  const unpositioned: ContentBlock[] = []
+
+  for (let i = 0; i < snapshot.blocks.length; i++) {
+    const block = snapshot.blocks[i]!
+    const box = isValidBox(block.box) ? block.box : block.ref ? boxByRef.get(block.ref) : undefined
+    if (box) {
+      positioned.push({ block, box, order: i })
+    } else {
+      unpositioned.push(block)
+    }
+  }
+
+  return { positioned, unpositioned }
+}
+
+/**
+ * Returns true if the snapshot contains at least two positioned blocks
+ * occupying overlapping vertical bands in separate horizontal columns
+ * (e.g. sidebar + main content, horizontal nav bar, or multi-column card grid).
+ */
+export function hasMultiColumnLayout(snapshot: PageSnapshot): boolean {
+  const { positioned } = resolvePositionedBlocks(snapshot)
+  if (positioned.length < 2) return false
+
+  for (let i = 0; i < positioned.length; i++) {
+    const a = positioned[i]!.box
+    const aRight = a.x + a.width
+    const aBottom = a.y + a.height
+    for (let j = i + 1; j < positioned.length; j++) {
+      const b = positioned[j]!.box
+      const bRight = b.x + b.width
+      const bBottom = b.y + b.height
+      const yOverlap = Math.min(aBottom, bBottom) - Math.max(a.y, b.y)
+      if (yOverlap > 2 && (aRight <= b.x + 4 || bRight <= a.x + 4)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function blockAnsiStyle(block: ContentBlock): string | null {
+  switch (block.kind) {
+    case 'heading':
+      return (block.level ?? 1) === 1 ? ANSI.bold + ANSI.cyan : ANSI.bold
+    case 'link':
+      return ANSI.cyan
+    case 'button':
+      return ANSI.green
+    case 'input':
+      return ANSI.magenta
+    default:
+      return null
+  }
+}
+
+/**
+ * Renders snapshot blocks onto a true 2D spatial ASCII character canvas using
+ * element `box` coordinates (`x, y, width, height`), preserving multi-column
+ * sidebars, headers, nav bars, and card grids without overlapping text.
+ * Returns null if no blocks have usable bounding boxes.
+ */
+export function renderSpatialBlocks(
+  snapshot: PageSnapshot,
+  innerWidth: number,
+  asciiOnly: boolean,
+  color: boolean,
+  showRefs: boolean,
+): string[] | null {
+  const { positioned, unpositioned } = resolvePositionedBlocks(snapshot)
+  if (positioned.length === 0) return null
+
+  const minX = Math.min(...positioned.map((p) => p.box.x))
+  const originX = minX < 0 ? minX : 0
+  const maxRight = Math.max(snapshot.viewport.width || 1280, ...positioned.map((p) => p.box.x + p.box.width))
+  const spanX = Math.max(1, maxRight - originX)
+  const minY = Math.min(...positioned.map((p) => p.box.y))
+  const pxPerRow = 20
+
+  // Sort top-to-bottom, left-to-right, preserving DOM order on exact ties
+  const sorted = [...positioned].sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x || a.order - b.order)
+
+  const projected = sorted.map((item) => {
+    const colStart = Math.max(0, Math.min(innerWidth - 1, Math.round(((item.box.x - originX) / spanX) * innerWidth)))
+    const colEnd = Math.max(
+      colStart + 1,
+      Math.min(innerWidth, Math.round(((item.box.x + item.box.width - originX) / spanX) * innerWidth)),
+    )
+    return { ...item, colStart, colEnd }
+  })
+
+  const grid: string[][] = []
+  const styleGrid: (string | null)[][] | null = color && !asciiOnly ? [] : null
+
+  const ensureRows = (count: number) => {
+    while (grid.length < count) {
+      grid.push(new Array<string>(innerWidth).fill(' '))
+      if (styleGrid) styleGrid.push(new Array<string | null>(innerWidth).fill(null))
+    }
+  }
+
+  const canPlace = (startRow: number, colStart: number, lines: string[]): boolean => {
+    for (let dy = 0; dy < lines.length; dy++) {
+      const r = startRow + dy
+      if (r >= grid.length) continue
+      const row = grid[r]!
+      const line = lines[dy]!
+      for (let dx = 0; dx < line.length; dx++) {
+        const c = colStart + dx
+        if (c >= innerWidth) break
+        if (line[dx] !== ' ' && row[c] !== ' ') {
+          return false
+        }
+      }
+    }
+    return true
+  }
+
+  let yShift = 0
+  let maxOccupiedRow = -1
+
+  for (let i = 0; i < projected.length; i++) {
+    const item = projected[i]!
+    const aBottom = item.box.y + item.box.height
+    const aRight = item.box.x + item.box.width
+
+    // Find closest right-hand neighbor on an overlapping vertical band to reserve a 1-char gutter
+    let maxRightCol = innerWidth
+    for (let j = 0; j < projected.length; j++) {
+      if (i === j) continue
+      const other = projected[j]!
+      if (other.colStart <= item.colStart) continue
+      if (other.box.x < aRight - 4) continue
+      const yOverlap = Math.min(aBottom, other.box.y + other.box.height) - Math.max(item.box.y, other.box.y)
+      if (yOverlap > 2) {
+        maxRightCol = Math.min(maxRightCol, Math.max(item.colStart + 1, other.colStart - 1))
+      }
+    }
+
+    const availableSpan = Math.max(1, maxRightCol - item.colStart)
+    const boxSpan = Math.max(1, Math.min(item.colEnd, maxRightCol) - item.colStart)
+    const isCompactInline =
+      item.block.kind === 'link' ||
+      item.block.kind === 'button' ||
+      item.block.kind === 'input' ||
+      item.block.kind === 'select' ||
+      item.block.kind === 'image'
+
+    const drawWidth = isCompactInline ? availableSpan : Math.min(availableSpan, Math.max(boxSpan, Math.min(availableSpan, 8)))
+
+    // Format without ANSI codes so character positions align 1:1 with grid columns
+    const formatted = formatBlock(item.block, drawWidth, asciiOnly, false, showRefs)
+      .map((l) => {
+        const plain = asciiOnly ? sanitizeAscii(stripAnsi(l)) : stripAnsi(l)
+        return plain.length > drawWidth ? truncateVisible(plain, drawWidth) : plain
+      })
+      .filter((l) => l.length > 0)
+
+    if (formatted.length === 0) continue
+
+    const rawRow = Math.max(0, Math.round((item.box.y - minY) / pxPerRow))
+    let targetRow = Math.max(0, rawRow - yShift)
+
+    // Compress full-width blank gaps larger than 1 empty line
+    if (maxOccupiedRow >= 0 && targetRow > maxOccupiedRow + 2) {
+      yShift += targetRow - (maxOccupiedRow + 2)
+      targetRow = maxOccupiedRow + 2
+    }
+
+    // Resolve any vertical collision inside these columns
+    let row = targetRow
+    while (!canPlace(row, item.colStart, formatted)) {
+      row++
+    }
+
+    ensureRows(row + formatted.length)
+    const style = styleGrid ? blockAnsiStyle(item.block) : null
+
+    for (let dy = 0; dy < formatted.length; dy++) {
+      const line = formatted[dy]!
+      const gridRow = grid[row + dy]!
+      const sRow = styleGrid ? styleGrid[row + dy]! : null
+      for (let dx = 0; dx < line.length; dx++) {
+        const c = item.colStart + dx
+        if (c >= innerWidth) break
+        gridRow[c] = line[dx]!
+        if (sRow && style) sRow[c] = style
+      }
+    }
+
+    maxOccupiedRow = Math.max(maxOccupiedRow, row + formatted.length - 1)
+  }
+
+  // Trim trailing all-space rows
+  let lastNonEmpty = grid.length - 1
+  while (lastNonEmpty >= 0 && grid[lastNonEmpty]!.every((ch) => ch === ' ')) {
+    lastNonEmpty--
+  }
+
+  const resultLines: string[] = []
+  for (let r = 0; r <= lastNonEmpty; r++) {
+    const chars = grid[r]!
+    if (!styleGrid) {
+      resultLines.push(chars.join('').replace(/\s+$/, ''))
+    } else {
+      const styles = styleGrid[r]!
+      let line = ''
+      let activeStyle: string | null = null
+      let endCol = chars.length - 1
+      while (endCol >= 0 && chars[endCol] === ' ') endCol--
+      for (let c = 0; c <= endCol; c++) {
+        const st = styles[c]!
+        if (st !== activeStyle) {
+          if (activeStyle) line += ANSI.reset
+          if (st) line += st
+          activeStyle = st
+        }
+        line += chars[c]!
+      }
+      if (activeStyle) line += ANSI.reset
+      resultLines.push(line)
+    }
+  }
+
+  // Append any unpositioned blocks below the spatial canvas
+  if (unpositioned.length > 0) {
+    if (resultLines.length > 0) resultLines.push('')
+    for (const block of unpositioned) {
+      const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
+      if (rendered.length > 0) {
+        resultLines.push(...rendered)
+      }
+    }
+  }
+
+  return resultLines
+}
+
 export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
   const width = Math.max(40, Math.min(240, options.width ?? 100))
   const height = Math.max(14, Math.min(200, options.height ?? 36))
@@ -201,6 +469,7 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   const showRefs = options.showRefs ?? true
   const showChrome = options.showChrome ?? true
   const scrollOffset = Math.max(0, options.scrollOffset ?? 0)
+  const requestedLayout: AsciiLayoutMode = options.layout ?? 'flow'
 
   const box = asciiOnly
     ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', ml: '+', mr: '+' }
@@ -258,12 +527,21 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
     bodyLines.push((asciiOnly ? '-' : '─').repeat(Math.min(innerWidth, Math.max(12, t.length + 7))))
   }
 
-  for (const block of snapshot.blocks) {
-    const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
-    if (rendered.length > 0) {
-      bodyLines.push(...rendered)
-      if (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code') {
-        bodyLines.push('')
+  const useSpatial =
+    requestedLayout === 'spatial' || (requestedLayout === 'auto' && hasMultiColumnLayout(snapshot))
+  const spatialLines = useSpatial ? renderSpatialBlocks(snapshot, innerWidth, asciiOnly, color, showRefs) : null
+  const activeLayout: 'spatial' | 'flow' = spatialLines ? 'spatial' : 'flow'
+
+  if (spatialLines) {
+    bodyLines.push(...spatialLines)
+  } else {
+    for (const block of snapshot.blocks) {
+      const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
+      if (rendered.length > 0) {
+        bodyLines.push(...rendered)
+        if (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code') {
+          bodyLines.push('')
+        }
       }
     }
   }
@@ -299,9 +577,10 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
     output.push(midBorder)
     const refCount = snapshot.elements.filter((e) => e.ref).length
     const lineRange = `lines ${start + 1}-${Math.min(bodyLines.length, start + viewportRows)}/${bodyLines.length}`
+    const layoutTag = activeLayout === 'spatial' ? ' | layout:2d' : ''
     const status = options.statusMessage
-      ? `${options.statusMessage} | refs:${refCount} | ${lineRange}`
-      : `refs:${refCount} | epoch:${snapshot.epoch} | ${lineRange} | cmds: open click fill find scroll`
+      ? `${options.statusMessage} | refs:${refCount}${layoutTag} | ${lineRange}`
+      : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag} | ${lineRange} | cmds: open click fill find scroll`
     output.push(frameLine(status))
     output.push(botBorder)
   }

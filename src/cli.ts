@@ -244,6 +244,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const res = await manager.runTool(opened.id, toolName, {
         width: flags.width ? Number(flags.width) : cmd === 'visual' ? 80 : 100,
         height: flags.height ? Number(flags.height) : 36,
+        layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
         annotate: Boolean(flags.annotate),
       })
@@ -290,6 +291,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           tabId: res.id,
           width: flags.width ? Number(flags.width) : 100,
           height: flags.height ? Number(flags.height) : 36,
+          layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         })
       }
       break
@@ -307,6 +309,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         tabId,
         width: flags.width ? Number(flags.width) : 100,
         height: flags.height ? Number(flags.height) : 36,
+        layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         asciiOnly: true,
       })
       break
@@ -325,7 +328,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       res = await callDaemon(live.endpoint, '/tool', {
         tabId,
         name: flags.visual ? 'page_read_visual' : flags.ascii ? 'page_read_ascii' : 'page_read',
-        args: { since: Boolean(flags.since), width: flags.width ? Number(flags.width) : 100 },
+        args: {
+          since: Boolean(flags.since),
+          width: flags.width ? Number(flags.width) : 100,
+          layout: typeof flags.layout === 'string' ? flags.layout : undefined,
+        },
       })
       break
     case 'find':

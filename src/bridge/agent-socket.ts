@@ -72,12 +72,15 @@ export async function createAgentSocket(
       }
       case '/ascii': {
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const layoutOpt =
+          body.layout === 'spatial' || body.layout === 'auto' || body.layout === 'flow' ? body.layout : undefined
         const res = await manager.renderAscii(tabId, {
           width: typeof body.width === 'number' ? body.width : 100,
           height: typeof body.height === 'number' ? body.height : 36,
           asciiOnly: body.asciiOnly !== false,
           color: Boolean(body.color),
           scrollOffset: typeof body.scrollOffset === 'number' ? body.scrollOffset : 0,
+          layout: layoutOpt,
         })
         return {
           status: 200,
