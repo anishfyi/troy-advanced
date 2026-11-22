@@ -14,10 +14,14 @@ import type {
   NetworkEntry,
   PageSnapshot,
   TrackerBlockingOptions,
+  WaitConditionOptions,
+  WaitResult,
+  WaitState,
 } from '../types.js'
 import { CdpClient } from './cdp-client.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
 import type { BrowserEngine, TabDriver } from './types.js'
+import { describeWaitCondition, matchesText, matchesUrlPattern, pollUntil } from './wait.js'
 
 const SNAPSHOT_SCRIPT = `(() => {
   const roots = [document];
@@ -767,6 +771,102 @@ class ChromiumTab implements TabDriver {
         else if (dir === 'right') window.scrollBy(amt, 0);
         return { scrollX: Math.round(window.scrollX), scrollY: Math.round(window.scrollY) };
       })()`,
+    )
+  }
+
+  async waitFor(options: WaitConditionOptions): Promise<WaitResult> {
+    const hasCondition = Boolean(options.text || options.selector || options.url)
+    if (!hasCondition) {
+      const ms = Math.max(0, Math.min(30000, Number(options.ms ?? 300)))
+      await new Promise((r) => setTimeout(r, ms))
+      return { ok: true, waitedMs: ms }
+    }
+
+    const state: WaitState = options.state ?? 'visible'
+    const timeoutMs = options.timeout !== undefined ? Number(options.timeout) : 5000
+    const pollIntervalMs = options.pollIntervalMs !== undefined ? Number(options.pollIntervalMs) : 50
+    const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
+
+    return pollUntil(
+      async () => {
+        let probe: {
+          url: string
+          title: string
+          bodyText?: string
+          selectorMatched?: boolean
+          selectorError?: string
+        }
+        try {
+          probe = await this.evalJson(
+            `(() => {
+              const out = { url: String(location.href || ''), title: String(document.title || '') };
+              const needText = ${JSON.stringify(Boolean(options.text))};
+              if (needText) {
+                const raw = (document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '') ||
+                  (document.documentElement && document.documentElement.textContent) || '';
+                out.bodyText = raw + '\\n' + out.title;
+              }
+              const selector = ${JSON.stringify(options.selector ?? '')};
+              const targetState = ${JSON.stringify(state)};
+              if (selector) {
+                let els;
+                try {
+                  els = Array.from(document.querySelectorAll(selector));
+                } catch (err) {
+                  out.selectorError = String((err && err.message) || err);
+                  return out;
+                }
+                const isVisible = (el) => {
+                  if (!el || !el.isConnected) return false;
+                  if (el.hasAttribute('hidden')) return false;
+                  if (el.tagName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'hidden') return false;
+                  const st = window.getComputedStyle(el);
+                  if (!st) return false;
+                  if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse') return false;
+                  if (Number(st.opacity) === 0) return false;
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 || r.height > 0 || el.getClientRects().length > 0;
+                };
+                if (targetState === 'attached') {
+                  out.selectorMatched = els.length > 0;
+                } else if (targetState === 'visible') {
+                  out.selectorMatched = els.some(isVisible);
+                } else {
+                  out.selectorMatched = els.length === 0 || els.every((el) => !isVisible(el));
+                }
+              }
+              return out;
+            })()`,
+          )
+        } catch {
+          // Transient navigation / context-destroyed error: keep polling until timeout.
+          return { satisfied: false }
+        }
+
+        if (probe.selectorError) {
+          return { satisfied: false, fatalError: `invalid selector "${options.selector}": ${probe.selectorError}` }
+        }
+
+        if (probe.url && probe.url !== this.url) {
+          this.url = probe.url
+          this.title = probe.title || this.title
+          this.epoch += 1
+        }
+
+        const urlOk = options.url ? matchesUrlPattern(probe.url || this.url, options.url) : true
+        const textOk = options.text ? matchesText(probe.bodyText ?? '', options.text) : true
+        const selectorOk = options.selector ? Boolean(probe.selectorMatched) : true
+
+        return {
+          satisfied: urlOk && textOk && selectorOk,
+          matched: {
+            ...(options.text ? { text: textOk } : {}),
+            ...(options.selector ? { selector: selectorOk, state } : {}),
+            ...(options.url ? { url: urlOk, currentUrl: probe.url || this.url } : {}),
+          },
+        }
+      },
+      { timeoutMs, pollIntervalMs, description },
     )
   }
 

@@ -1,4 +1,4 @@
-import type { BlockedTrackerStats, ConsoleEntry, NetworkEntry, PageSnapshot } from '../types.js'
+import type { BlockedTrackerStats, ConsoleEntry, NetworkEntry, PageSnapshot, WaitConditionOptions, WaitResult } from '../types.js'
 
 export interface TabDriver {
   readonly id: number
@@ -16,6 +16,7 @@ export interface TabDriver {
   press(key: string, selector?: string): Promise<{ ok: boolean }>
   hover(selector: string): Promise<{ ok: boolean }>
   scroll(direction: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom', amount?: number): Promise<{ scrollX: number; scrollY: number }>
+  waitFor(options: WaitConditionOptions): Promise<WaitResult>
   evaluate(expression: string): Promise<unknown>
   screenshot(opts?: { fullPage?: boolean }): Promise<Buffer | null>
   getConsole(opts?: { clear?: boolean; level?: string; limit?: number }): ConsoleEntry[]

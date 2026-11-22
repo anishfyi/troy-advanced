@@ -199,6 +199,32 @@ export type PolicyDecision =
   | { allowed: true }
   | { allowed: false; status: 'blocked' | 'boundary'; code: string; reason: string; origin?: string }
 
+export type WaitState = 'visible' | 'hidden' | 'attached'
+
+export interface WaitConditionOptions {
+  ms?: number
+  text?: string
+  selector?: string
+  url?: string
+  state?: WaitState
+  timeout?: number
+  pollIntervalMs?: number
+}
+
+export interface WaitResult {
+  ok: boolean
+  waitedMs: number
+  timedOut?: boolean
+  matched?: {
+    text?: boolean
+    selector?: boolean
+    url?: boolean
+    state?: WaitState
+    currentUrl?: string
+  }
+  error?: string
+}
+
 export interface ActStep {
   op: 'click' | 'fill' | 'select' | 'press' | 'hover' | 'scroll' | 'wait' | 'text' | 'read' | 'read_ascii'
   ref?: string
@@ -209,6 +235,10 @@ export interface ActStep {
   direction?: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom'
   amount?: number
   ms?: number
+  selector?: string
+  url?: string
+  state?: WaitState
+  timeout?: number
   allowSubmit?: boolean
 }
 

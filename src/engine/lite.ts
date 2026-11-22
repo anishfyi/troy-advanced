@@ -2,10 +2,28 @@
 // Runs anywhere Node.js runs — even tiny 512MB EC2 t4g.nano instances, Alpine containers,
 // or offline tests without Chromium installed.
 
-import type { ConsoleEntry, ContentBlock, ElementDescriptor, InlineLink, NetworkEntry, PageSnapshot } from '../types.js'
+import type {
+  ConsoleEntry,
+  ContentBlock,
+  ElementDescriptor,
+  InlineLink,
+  NetworkEntry,
+  PageSnapshot,
+  WaitConditionOptions,
+  WaitResult,
+  WaitState,
+} from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
 import type { BrowserEngine, TabDriver } from './types.js'
+import {
+  checkLiteSelectorState,
+  describeWaitCondition,
+  extractLitePageText,
+  matchesText,
+  matchesUrlPattern,
+  pollUntil,
+} from './wait.js'
 
 function decodeEntities(text: string): string {
   return text
@@ -481,6 +499,7 @@ class LiteTab implements TabDriver {
   private loading = false
   private epoch = 0
   private scrollY = 0
+  private rawHtml = ''
   private doc: ParsedDoc = { title: 'New Tab', blocks: [], elements: [], text: '', forms: new Map() }
   private historyStack: string[] = []
   private historyIndex = -1
@@ -573,6 +592,7 @@ class LiteTab implements TabDriver {
       })
 
       const contentType = res.headers.get('content-type') ?? ''
+      this.rawHtml = body
       if (contentType.includes('application/json') || contentType.includes('text/plain')) {
         const title = new URL(finalUrl).pathname || finalUrl
         this.doc = {
@@ -757,6 +777,45 @@ class LiteTab implements TabDriver {
     else if (direction === 'up') this.scrollY = Math.max(0, this.scrollY - amount)
     else if (direction === 'down') this.scrollY = Math.min(maxScroll, this.scrollY + amount)
     return { scrollX: 0, scrollY: this.scrollY }
+  }
+
+  async waitFor(options: WaitConditionOptions): Promise<WaitResult> {
+    const hasCondition = Boolean(options.text || options.selector || options.url)
+    if (!hasCondition) {
+      const ms = Math.max(0, Math.min(30000, Number(options.ms ?? 300)))
+      await new Promise((r) => setTimeout(r, ms))
+      return { ok: true, waitedMs: ms }
+    }
+
+    const state: WaitState = options.state ?? 'visible'
+    const timeoutMs = options.timeout !== undefined ? Number(options.timeout) : 5000
+    const pollIntervalMs = options.pollIntervalMs !== undefined ? Number(options.pollIntervalMs) : 50
+    const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
+
+    return pollUntil(
+      () => {
+        const urlOk = options.url ? matchesUrlPattern(this.url, options.url) : true
+        const pageText = `${this.doc.text}\n${this.title}\n${extractLitePageText(this.rawHtml)}`
+        const textOk = options.text ? matchesText(pageText, options.text) : true
+        let selectorOk = true
+        if (options.selector) {
+          const selRes = checkLiteSelectorState(this.rawHtml, this.doc.elements, options.selector, state)
+          if (selRes.error) {
+            return { satisfied: false, fatalError: selRes.error }
+          }
+          selectorOk = selRes.matched
+        }
+        return {
+          satisfied: urlOk && textOk && selectorOk,
+          matched: {
+            ...(options.text ? { text: textOk } : {}),
+            ...(options.selector ? { selector: selectorOk, state } : {}),
+            ...(options.url ? { url: urlOk, currentUrl: this.url } : {}),
+          },
+        }
+      },
+      { timeoutMs, pollIntervalMs, description },
+    )
   }
 
   async evaluate(_expression: string): Promise<unknown> {

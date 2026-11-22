@@ -6,6 +6,39 @@
 import readline from 'node:readline'
 import type { BrowserManager } from '../engine/manager.js'
 
+function tokenizePipeArgs(input: string): string[] {
+  const tokens: string[] = []
+  let cur = ''
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]!
+    if (quote) {
+      if (ch === '\\' && i + 1 < input.length) {
+        cur += input[++i]!
+      } else if (ch === quote) {
+        quote = null
+      } else {
+        cur += ch
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (cur.length > 0) {
+        tokens.push(cur)
+        cur = ''
+      }
+      continue
+    }
+    cur += ch
+  }
+  if (cur.length > 0) tokens.push(cur)
+  return tokens
+}
+
 export async function executePipeCommand(
   manager: BrowserManager,
   rawLine: string,
@@ -58,6 +91,7 @@ export async function executePipeCommand(
         output: [
           'COMMANDS: open <url> | ascii [width] | markdown [--frontmatter] | visual [width] | read | find <q>',
           '          click <ref> [--submit] | fill <ref> <text> | select <ref> <val> | press <key> | scroll <dir>',
+          '          wait [ms] [--text <str>] [--selector <css>] [--url <pat>] [--state visible|hidden|attached] [--timeout <ms>]',
           '          tabs | tab <id> | back | forward | reload | grant <origin> | recall <q> | quit',
         ].join('\n'),
       }
@@ -204,6 +238,28 @@ export async function executePipeCommand(
         direction: rest[0] || 'down',
         amount: rest[1] ? Number(rest[1]) : 450,
       })
+      return { output: format(res) }
+    }
+    case 'wait': {
+      const tokens = tokenizePipeArgs(argStr)
+      const waitArgs: Record<string, unknown> = {}
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok === '--text' && tokens[i + 1] !== undefined) waitArgs.text = tokens[++i]
+        else if (tok.startsWith('--text=')) waitArgs.text = tok.slice('--text='.length)
+        else if (tok === '--selector' && tokens[i + 1] !== undefined) waitArgs.selector = tokens[++i]
+        else if (tok.startsWith('--selector=')) waitArgs.selector = tok.slice('--selector='.length)
+        else if (tok === '--url' && tokens[i + 1] !== undefined) waitArgs.url = tokens[++i]
+        else if (tok.startsWith('--url=')) waitArgs.url = tok.slice('--url='.length)
+        else if (tok === '--state' && tokens[i + 1] !== undefined) waitArgs.state = tokens[++i]
+        else if (tok.startsWith('--state=')) waitArgs.state = tok.slice('--state='.length)
+        else if (tok === '--timeout' && tokens[i + 1] !== undefined) waitArgs.timeout = Number(tokens[++i])
+        else if (tok.startsWith('--timeout=')) waitArgs.timeout = Number(tok.slice('--timeout='.length))
+        else if (tok === '--ms' && tokens[i + 1] !== undefined) waitArgs.ms = Number(tokens[++i])
+        else if (tok.startsWith('--ms=')) waitArgs.ms = Number(tok.slice('--ms='.length))
+        else if (/^\d+$/.test(tok) && waitArgs.ms === undefined) waitArgs.ms = Number(tok)
+      }
+      const res = await manager.runTool(undefined, 'page_wait', waitArgs)
       return { output: format(res) }
     }
     case 'back':

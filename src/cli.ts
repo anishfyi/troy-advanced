@@ -43,6 +43,8 @@ Client Commands (talk to running daemon, or use --oneshot):
   select <ref> <value>                    Select dropdown option
   press <key> [--ref eN]                  Press key
   scroll [up|down|top|bottom] [amount]    Scroll page
+  wait [ms] [--text <str>] [--selector <css>] [--url <pattern>] [--state visible|hidden|attached] [--timeout <ms>]
+                                          Wait for page condition or fixed delay
   back | forward | reload                 History navigation
   console | network | eval <expr>         Inspect tab diagnostics or evaluate JS
   act <json-steps> [--allow-submit]       Run batched action list
@@ -74,6 +76,11 @@ const VALUE_FLAGS = new Set([
   '--level',
   '--origin',
   '--tracker-mode',
+  '--text',
+  '--selector',
+  '--state',
+  '--timeout',
+  '--ms',
 ])
 
 function parseArgv(argv: string[]) {
@@ -440,6 +447,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         tabId,
         name: 'page_scroll',
         args: { direction: args[0] || 'down', amount: args[1] ? Number(args[1]) : 450 },
+      })
+      break
+    case 'wait':
+      res = await callDaemon(live.endpoint, '/tool', {
+        tabId,
+        name: 'page_wait',
+        args: {
+          ...(args[0] && /^\d+$/.test(args[0]) ? { ms: Number(args[0]) } : {}),
+          ...(flags.ms !== undefined ? { ms: Number(flags.ms) } : {}),
+          ...(typeof flags.text === 'string' ? { text: flags.text } : {}),
+          ...(typeof flags.selector === 'string' ? { selector: flags.selector } : {}),
+          ...(typeof flags.url === 'string' ? { url: flags.url } : {}),
+          ...(typeof flags.state === 'string' ? { state: flags.state } : {}),
+          ...(flags.timeout !== undefined ? { timeout: Number(flags.timeout) } : {}),
+        },
       })
       break
     case 'back':

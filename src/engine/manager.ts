@@ -34,6 +34,7 @@ import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { LiteBrowserEngine } from './lite.js'
 import type { BrowserEngine, TabDriver } from './types.js'
+import { parseWaitState } from './wait.js'
 
 const MAX_TOOL_CHARS = 20000
 
@@ -666,9 +667,48 @@ export class BrowserManager {
       }
 
       case 'page_wait': {
-        const ms = Math.max(0, Math.min(30000, Number(args.ms ?? 300)))
-        await new Promise((r) => setTimeout(r, ms))
-        return { ok: true, waitedMs: ms }
+        const stateParsed = parseWaitState(args.state)
+        if (stateParsed && typeof stateParsed === 'object' && 'error' in stateParsed) {
+          return { ok: false, error: stateParsed.error }
+        }
+        const text = typeof args.text === 'string' && args.text.length > 0 ? args.text : undefined
+        const selector = typeof args.selector === 'string' && args.selector.length > 0 ? args.selector : undefined
+        const url = typeof args.url === 'string' && args.url.length > 0 ? args.url : undefined
+        const state = stateParsed
+
+        if (state && !selector) {
+          return { ok: false, error: 'wait state requires a selector' }
+        }
+
+        const hasCondition = Boolean(text || selector || url)
+        if (!hasCondition) {
+          const ms = Math.max(0, Math.min(30000, Number(args.ms ?? 300)))
+          await new Promise((r) => setTimeout(r, ms))
+          return { ok: true, waitedMs: ms }
+        }
+
+        const timeout =
+          args.timeout !== undefined && Number.isFinite(Number(args.timeout))
+            ? Math.max(0, Math.min(60000, Number(args.timeout)))
+            : 5000
+        const pollIntervalMs =
+          args.pollIntervalMs !== undefined && Number.isFinite(Number(args.pollIntervalMs))
+            ? Math.max(10, Math.min(1000, Number(args.pollIntervalMs)))
+            : 50
+
+        const prevUrl = session.driver.getUrl()
+        const result = await session.driver.waitFor({
+          text,
+          selector,
+          url,
+          state: state ?? (selector ? 'visible' : undefined),
+          timeout,
+          pollIntervalMs,
+        })
+        if (session.driver.getUrl() !== prevUrl) {
+          session.elements.invalidate()
+        }
+        return { ...result }
       }
 
       case 'page_history': {

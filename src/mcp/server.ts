@@ -101,6 +101,22 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: 'troy_wait',
+    description: 'Wait for a page condition (text, CSS selector with state visible|hidden|attached, or URL pattern) or a fixed delay in milliseconds.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        ms: { type: 'number', description: 'Fixed delay in milliseconds when no condition is specified (default 300)' },
+        text: { type: 'string', description: 'Wait until page contains this text' },
+        selector: { type: 'string', description: 'Wait until CSS selector matches the target state' },
+        url: { type: 'string', description: 'Wait until tab URL matches this substring, glob (*), or /regex/' },
+        state: { type: 'string', enum: ['visible', 'hidden', 'attached'], description: 'Target state for selector (default visible)' },
+        timeout: { type: 'number', description: 'Maximum wait time in milliseconds (default 5000)' },
+      },
+    },
+  },
+  {
     name: 'troy_act',
     description: 'Execute a batch of actions (click/fill/select/press/scroll/wait/read_ascii).',
     inputSchema: {
@@ -217,6 +233,16 @@ export async function handleMcpRequest(
         break
       case 'troy_fill':
         result = await manager.runTool(tabId, 'page_fill', { ref: args.ref, text: args.text, clear: args.clear })
+        break
+      case 'troy_wait':
+        result = await manager.runTool(tabId, 'page_wait', {
+          ms: args.ms,
+          text: args.text,
+          selector: args.selector,
+          url: args.url,
+          state: args.state,
+          timeout: args.timeout,
+        })
         break
       case 'troy_act':
         result = await manager.runTool(tabId, 'page_act', { steps: args.steps, allowSubmit: args.allowSubmit })
