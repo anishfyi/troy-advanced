@@ -1,0 +1,56 @@
+{
+  "name": "@anishfyi/troy-advanced",
+  "version": "0.1.0",
+  "description": "Terminal-native, EC2-ready, ASCII-rendered agent browser with full Troy Agent Socket compatibility, headless Chromium CDP + zero-Chrome lite engine, MCP server, and streaming AI pipe.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "troy-advanced": "./bin/troy-advanced.mjs",
+    "troya": "./bin/troy-advanced.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "deploy",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "doctor": "node ./bin/troy-advanced.mjs doctor",
+    "daemon": "node ./bin/troy-advanced.mjs daemon start",
+    "browse": "node ./bin/troy-advanced.mjs browse",
+    "mcp": "node ./bin/troy-advanced.mjs mcp",
+    "pipe": "node ./bin/troy-advanced.mjs pipe"
+  },
+  "keywords": [
+    "browser",
+    "ai-agent",
+    "ascii",
+    "terminal",
+    "ec2",
+    "headless",
+    "cdp",
+    "mcp",
+    "troy",
+    "automation"
+  ],
+  "author": "Anish Kumar <anishfyi@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anishfyi/troy-advanced.git"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.4"
+  }
+}

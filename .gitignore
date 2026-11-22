@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.troy-cron/state.json
+.troy-cron/state.json.tmp
+.troy-cron/run.lock/
+.troy-cron/cron.log
+.troy-cron/runs/
+.troy-cron/PAUSE
+.dexter/vortex/state.json
+.dexter/vortex/run.lock/
+.dexter/vortex/cron.log
+.dexter/vortex/runs/
+.dexter/vortex/PAUSE

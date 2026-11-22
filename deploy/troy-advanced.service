@@ -1,0 +1,17 @@
+[Unit]
+Description=Troy Advanced — Terminal/EC2 Headless Agent Browser Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/troy-advanced
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env node /home/ec2-user/troy-advanced/bin/troy-advanced.mjs daemon run --engine auto --compat-troy
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
