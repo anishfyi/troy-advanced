@@ -31,6 +31,8 @@ Client Commands (talk to running daemon, or use --oneshot):
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
   ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--crop x,y,w,h] [--ref eN]
                                           Render tab as strict 7-bit ASCII viewport (or diff with --since)
+  markdown [--frontmatter] [--no-refs] [--no-urls] [--media] [--ascii] [--crop x,y,w,h] [--ref eN]
+                                          Export tab as CommonMark/GFM Markdown preserving inline [eN] refs
   visual [--mode ascii|edge|braille|halfblock] [--annotate] [--crop x,y,w,h] [--ref eN]
                                           Render Chromium PNG screenshot (or cropped region) as ASCII
   read [--since] [--ascii] [--visual] [--crop x,y,w,h] [--ref eN] [--json]
@@ -237,14 +239,29 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return
   }
 
-  // One-shot ASCII fetch without needing a running daemon: `troy-advanced ascii https://...`
-  if ((cmd === 'ascii' || cmd === 'visual') && positional[1] && !readLiveEndpoint(endpointFlag)) {
+  // One-shot ASCII / Markdown / Visual fetch without needing a running daemon
+  if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md') && positional[1] && !readLiveEndpoint(endpointFlag)) {
     const manager = await BrowserManager.create({ engine })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })
       if (!opened.ok) {
         console.error(JSON.stringify(opened, null, 2))
         process.exit(1)
+      }
+      if (cmd === 'markdown' || cmd === 'md') {
+        const res = await manager.runTool(opened.id, 'page_read_markdown', {
+          includeFrontmatter: Boolean(flags.frontmatter),
+          includeMediaSummary: Boolean(flags.media),
+          asciiOnly: Boolean(flags.ascii),
+          showRefs: !flags['no-refs'],
+          includeUrls: !flags['no-urls'],
+          crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+          ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+        })
+        if (flags.json) console.log(JSON.stringify(res, null, 2))
+        else if (typeof res.markdown === 'string') console.log(res.markdown)
+        else console.log(JSON.stringify(res, null, 2))
+        return
       }
       const toolName = cmd === 'visual' ? 'page_screenshot_ascii' : 'page_read_ascii'
       const res = await manager.runTool(opened.id, toolName, {
@@ -327,6 +344,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         showMediaSummary: Boolean(flags.media),
         since: Boolean(flags.since),
         asciiOnly: true,
+      })
+      break
+    case 'markdown':
+    case 'md':
+      res = await callDaemon(live.endpoint, '/markdown', {
+        tabId,
+        includeFrontmatter: Boolean(flags.frontmatter),
+        includeMediaSummary: Boolean(flags.media),
+        asciiOnly: Boolean(flags.ascii),
+        showRefs: !flags['no-refs'],
+        includeUrls: !flags['no-urls'],
+        crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+        ref: typeof flags.ref === 'string' ? flags.ref : undefined,
       })
       break
     case 'visual':
@@ -442,6 +472,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   if (!flags.json && (cmd === 'ascii' || cmd === 'visual' || flags.ascii) && typeof res.ascii === 'string') {
     console.log(res.ascii)
+  } else if (!flags.json && (cmd === 'markdown' || cmd === 'md') && typeof res.markdown === 'string') {
+    console.log(res.markdown)
   } else {
     console.log(JSON.stringify(res, null, 2))
   }

@@ -4,7 +4,7 @@
 
 import path from 'node:path'
 import os from 'node:os'
-import type { ActStep, AsciiRenderOptions, EngineKind, PageSnapshot, PixelAsciiOptions, Rect, TabSummary } from '../types.js'
+import type { ActStep, AsciiRenderOptions, EngineKind, MarkdownRenderOptions, PageSnapshot, PixelAsciiOptions, Rect, TabSummary } from '../types.js'
 import { ElementRegistry } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
@@ -19,6 +19,7 @@ import {
   renderMediaSummaryAscii,
   renderPageAscii,
 } from '../ascii/layout.js'
+import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { LiteBrowserEngine } from './lite.js'
@@ -337,6 +338,38 @@ export class BrowserManager {
     }
   }
 
+  async renderMarkdown(
+    tabId?: number,
+    opts: Omit<MarkdownRenderOptions, 'crop'> & { crop?: Rect | string; ref?: string } = {},
+  ): Promise<{
+    ok: boolean
+    markdown?: string
+    snapshot?: PageSnapshot
+    crop?: Rect
+    cropRef?: string
+    error?: string
+  }> {
+    const session = this.resolveSession(tabId)
+    if (!session) return { ok: false, error: 'no open tab' }
+    const cropRes = this.resolveCropArgs(session, { crop: opts.crop, ref: opts.ref })
+    if ('error' in cropRes) return { ok: false, error: cropRes.error }
+    const snap = await this.takeIndexedSnapshot(session)
+    session.lastSnapshot = snap
+    const { crop: _rawCrop, ref: _rawRef, ...renderOpts } = opts
+    const markdown = renderPageMarkdown(snap, {
+      ...renderOpts,
+      crop: cropRes.crop,
+      cropLabel: cropRes.cropRef ?? opts.cropLabel,
+    })
+    return {
+      ok: true,
+      markdown,
+      snapshot: snap,
+      ...(cropRes.crop ? { crop: cropRes.crop } : {}),
+      ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
+    }
+  }
+
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const session = this.resolveSession(tabId)
     if (!session) return { ok: false, error: 'no such tab', code: 'no-tab' }
@@ -430,6 +463,46 @@ export class BrowserManager {
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
           ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
           content: name === 'page_read_ascii' ? ascii : snap.text,
+        })
+      }
+
+      case 'page_read_markdown': {
+        const cropRes = this.resolveCropArgs(session, { crop: args.crop, ref: args.ref })
+        if ('error' in cropRes) return { ok: false, error: cropRes.error }
+        const snap = await this.takeIndexedSnapshot(session)
+        session.lastSnapshot = snap
+        const markdown = renderPageMarkdown(snap, {
+          showRefs: args.showRefs !== false,
+          includeUrls: args.includeUrls !== false,
+          asciiOnly: Boolean(args.asciiOnly),
+          includeFrontmatter: Boolean(args.includeFrontmatter),
+          includeHeader: typeof args.includeHeader === 'boolean' ? args.includeHeader : undefined,
+          includeForms: typeof args.includeForms === 'boolean' ? args.includeForms : undefined,
+          includeCanvasPreview: typeof args.includeCanvasPreview === 'boolean' ? args.includeCanvasPreview : undefined,
+          includeMediaSummary: Boolean(args.includeMediaSummary),
+          includeRefsIndex:
+            args.includeRefsIndex === 'always'
+              ? 'always'
+              : typeof args.includeRefsIndex === 'boolean'
+                ? args.includeRefsIndex
+                : undefined,
+          canvasPreviewWidth: typeof args.canvasPreviewWidth === 'number' ? args.canvasPreviewWidth : undefined,
+          canvasPreviewHeight: typeof args.canvasPreviewHeight === 'number' ? args.canvasPreviewHeight : undefined,
+          crop: cropRes.crop,
+          cropLabel: cropRes.cropRef,
+        })
+        return capPayload({
+          ok: true,
+          tabId: snap.tabId,
+          url: snap.url,
+          title: snap.title,
+          epoch: snap.epoch,
+          engine: session.driver.engine,
+          elementCount: snap.elements.length,
+          markdown,
+          content: markdown,
+          ...(cropRes.crop ? { crop: cropRes.crop } : {}),
+          ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
         })
       }
 

@@ -145,6 +145,22 @@ export interface AsciiRenderOptions {
   statusMessage?: string
 }
 
+export interface MarkdownRenderOptions {
+  showRefs?: boolean
+  includeUrls?: boolean
+  asciiOnly?: boolean
+  includeFrontmatter?: boolean
+  includeHeader?: boolean
+  includeForms?: boolean
+  includeCanvasPreview?: boolean
+  includeMediaSummary?: boolean
+  includeRefsIndex?: boolean | 'always'
+  canvasPreviewWidth?: number
+  canvasPreviewHeight?: number
+  crop?: Rect
+  cropLabel?: string
+}
+
 export interface PixelAsciiOptions {
   width?: number
   height?: number

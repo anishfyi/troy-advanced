@@ -47,6 +47,7 @@ export async function executePipeCommand(
   const format = (res: Record<string, unknown>) => {
     if (opts.jsonMode) return JSON.stringify(res)
     if (typeof res.ascii === 'string') return res.ascii
+    if (typeof res.markdown === 'string') return res.markdown
     if (res.ok === false) return `ERR: ${res.error ?? 'failed'}`
     return JSON.stringify(res)
   }
@@ -55,9 +56,9 @@ export async function executePipeCommand(
     case 'help':
       return {
         output: [
-          'COMMANDS: open <url> | ascii [width] | visual [width] | read | find <q> | click <ref> [--submit]',
-          '          fill <ref> <text> | select <ref> <val> | press <key> | scroll <dir> | tabs | tab <id>',
-          '          back | forward | reload | grant <origin> | recall <q> | quit',
+          'COMMANDS: open <url> | ascii [width] | markdown [--frontmatter] | visual [width] | read | find <q>',
+          '          click <ref> [--submit] | fill <ref> <text> | select <ref> <val> | press <key> | scroll <dir>',
+          '          tabs | tab <id> | back | forward | reload | grant <origin> | recall <q> | quit',
         ].join('\n'),
       }
     case 'open':
@@ -104,6 +105,38 @@ export async function executePipeCommand(
         }
       }
       const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, crop, ref, since, showMediaSummary, asciiOnly: true })
+      return { output: format(res) }
+    }
+    case 'markdown':
+    case 'md': {
+      let includeFrontmatter = false
+      let includeMediaSummary = false
+      let asciiOnly = false
+      let showRefs = true
+      let includeUrls = true
+      let crop: string | undefined
+      let ref: string | undefined
+      for (let i = 0; i < rest.length; i++) {
+        const tok = rest[i]!
+        if (tok === '--frontmatter') includeFrontmatter = true
+        else if (tok === '--media') includeMediaSummary = true
+        else if (tok === '--ascii') asciiOnly = true
+        else if (tok === '--no-refs') showRefs = false
+        else if (tok === '--no-urls') includeUrls = false
+        else if (tok === '--crop' && rest[i + 1]) crop = rest[++i]
+        else if (tok.startsWith('--crop=')) crop = tok.slice('--crop='.length)
+        else if (tok === '--ref' && rest[i + 1]) ref = rest[++i]
+        else if (tok.startsWith('--ref=')) ref = tok.slice('--ref='.length)
+      }
+      const res = await manager.runTool(undefined, 'page_read_markdown', {
+        includeFrontmatter,
+        includeMediaSummary,
+        asciiOnly,
+        showRefs,
+        includeUrls,
+        crop,
+        ref,
+      })
       return { output: format(res) }
     }
     case 'visual': {

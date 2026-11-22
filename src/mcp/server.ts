@@ -39,6 +39,23 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: 'troy_read_markdown',
+    description: 'Export the active or target tab as clean CommonMark/GFM Markdown while preserving inline [eN] interactive element refs for hybrid AI workflows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        showRefs: { type: 'boolean', description: 'Include inline [eN] interactive refs (default true)' },
+        includeUrls: { type: 'boolean', description: 'Include link and image URLs (default true)' },
+        includeFrontmatter: { type: 'boolean', description: 'Prepend YAML frontmatter with title, url, tabId, epoch, and ref count' },
+        includeMediaSummary: { type: 'boolean', description: 'Append Image/Canvas summary with dimensions and <canvas> ASCII previews' },
+        asciiOnly: { type: 'boolean', description: 'Sanitize output to strict 7-bit ASCII (default false)' },
+        crop: { type: 'string', description: 'Region crop in viewport pixels: "x,y,w,h"' },
+        ref: { type: 'string', description: 'Element ref (e.g. "e5") whose bounding box to zoom into' },
+      },
+    },
+  },
+  {
     name: 'troy_screenshot_ascii',
     description: 'Capture a Chromium screenshot and render it as ASCII, Sobel edge wireframe, Braille, or halfblock art with optional [eN] overlays and region crop for text-only AIs.',
     inputSchema: {
@@ -169,6 +186,17 @@ export async function handleMcpRequest(
           asciiOnly: true,
         })
         break
+      case 'troy_read_markdown':
+        result = await manager.runTool(tabId, 'page_read_markdown', {
+          showRefs: args.showRefs,
+          includeUrls: args.includeUrls,
+          includeFrontmatter: args.includeFrontmatter,
+          includeMediaSummary: args.includeMediaSummary,
+          asciiOnly: args.asciiOnly,
+          crop: args.crop,
+          ref: args.ref,
+        })
+        break
       case 'troy_screenshot_ascii':
         result = await manager.runTool(tabId, 'page_screenshot_ascii', {
           width: args.width,
@@ -218,7 +246,9 @@ export async function handleMcpRequest(
     const text =
       (name === 'troy_read_ascii' || name === 'troy_screenshot_ascii') && typeof result.ascii === 'string'
         ? result.ascii
-        : JSON.stringify(result, null, 2)
+        : name === 'troy_read_markdown' && typeof result.markdown === 'string'
+          ? result.markdown
+          : JSON.stringify(result, null, 2)
 
     return {
       jsonrpc: '2.0',

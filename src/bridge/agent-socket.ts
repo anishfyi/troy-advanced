@@ -107,6 +107,41 @@ export async function createAgentSocket(
             : { ok: false, error: res.error },
         }
       }
+      case '/markdown': {
+        const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const res = await manager.renderMarkdown(tabId, {
+          showRefs: body.showRefs !== false,
+          includeUrls: body.includeUrls !== false,
+          asciiOnly: Boolean(body.asciiOnly),
+          includeFrontmatter: Boolean(body.includeFrontmatter),
+          includeHeader: typeof body.includeHeader === 'boolean' ? body.includeHeader : undefined,
+          includeForms: typeof body.includeForms === 'boolean' ? body.includeForms : undefined,
+          includeCanvasPreview: typeof body.includeCanvasPreview === 'boolean' ? body.includeCanvasPreview : undefined,
+          includeMediaSummary: Boolean(body.includeMediaSummary),
+          includeRefsIndex:
+            body.includeRefsIndex === 'always'
+              ? 'always'
+              : typeof body.includeRefsIndex === 'boolean'
+                ? body.includeRefsIndex
+                : undefined,
+          crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
+          ref: typeof body.ref === 'string' ? body.ref : undefined,
+        })
+        return {
+          status: 200,
+          payload: res.ok
+            ? {
+                ok: true,
+                markdown: res.markdown,
+                url: res.snapshot?.url,
+                title: res.snapshot?.title,
+                refs: res.snapshot?.elements.length,
+                ...(res.crop ? { crop: res.crop } : {}),
+                ...(res.cropRef ? { cropRef: res.cropRef } : {}),
+              }
+            : { ok: false, error: res.error },
+        }
+      }
       case '/tool': {
         const name = String(body.name ?? '')
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
