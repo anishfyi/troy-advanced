@@ -129,6 +129,7 @@ export interface PixelAsciiOptions {
   invert?: boolean
   edgeThreshold?: number
   overlays?: Array<{ ref: string; box: Rect }>
+  overlayStyle?: 'box' | 'badge'
   viewport?: { width: number; height: number }
 }
 

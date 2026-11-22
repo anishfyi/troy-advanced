@@ -335,6 +335,8 @@ export class BrowserManager {
               mode: (args.pixelMode as PixelAsciiOptions['mode']) || 'ascii',
               edgeThreshold: typeof args.edgeThreshold === 'number' ? args.edgeThreshold : undefined,
               overlays,
+              overlayStyle:
+                args.overlayStyle === 'badge' || args.overlayStyle === 'box' ? args.overlayStyle : undefined,
               viewport: snap.viewport,
             })
           }
@@ -538,6 +540,8 @@ export class BrowserManager {
             mode: (args.mode as PixelAsciiOptions['mode']) || 'ascii',
             edgeThreshold: typeof args.edgeThreshold === 'number' ? args.edgeThreshold : undefined,
             overlays,
+            overlayStyle:
+              args.overlayStyle === 'badge' || args.overlayStyle === 'box' ? args.overlayStyle : undefined,
             viewport: snap.viewport,
           })
           return { ok: true, ascii, bytes: png.length }

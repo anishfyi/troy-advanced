@@ -68,20 +68,139 @@ function buildLuminanceGrid(img: DecodedPng, cols: number, rows: number): Float3
   return lumGrid
 }
 
+interface MappedOverlay {
+  badge: string
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+  topVisible: boolean
+  botVisible: boolean
+  leftVisible: boolean
+  rightVisible: boolean
+  area: number
+  isPoint: boolean
+}
+
+function stampBadge(grid: string[][], cols: number, row: number, startCol: number, badge: string): void {
+  if (row < 0 || row >= grid.length) return
+  const clampedStart =
+    cols >= badge.length ? Math.max(0, Math.min(cols - badge.length, startCol)) : Math.max(0, startCol)
+  for (let i = 0; i < badge.length; i++) {
+    const px = clampedStart + i
+    if (px >= 0 && px < cols) {
+      grid[row]![px] = badge[i]!
+    }
+  }
+}
+
 function stampOverlays(grid: string[][], cols: number, rows: number, img: DecodedPng, options: PixelAsciiOptions): void {
   if (!options.overlays || options.overlays.length === 0) return
-  const vpW = options.viewport?.width || img.width
-  const vpH = options.viewport?.height || img.height
-  for (const overlay of options.overlays) {
-    const cx = Math.floor((overlay.box.x / Math.max(1, vpW)) * cols)
-    const cy = Math.floor((overlay.box.y / Math.max(1, vpH)) * rows)
-    if (cy < 0 || cy >= rows) continue
-    const badge = `[${overlay.ref}]`
-    for (let i = 0; i < badge.length; i++) {
-      const px = cx + i
-      if (px >= 0 && px < cols) {
-        grid[cy]![px] = badge[i]!
+  const vpW = Math.max(1, options.viewport?.width || img.width)
+  const vpH = Math.max(1, options.viewport?.height || img.height)
+  const style = options.overlayStyle ?? 'box'
+
+  if (style === 'badge') {
+    for (const overlay of options.overlays) {
+      const cx = Math.floor((overlay.box.x / vpW) * cols)
+      const cy = Math.floor((overlay.box.y / vpH) * rows)
+      if (cy < 0 || cy >= rows) continue
+      const badge = `[${overlay.ref.replace(/[^\x20-\x7e]/g, '')}]`
+      for (let i = 0; i < badge.length; i++) {
+        const px = cx + i
+        if (px >= 0 && px < cols) {
+          grid[cy]![px] = badge[i]!
+        }
       }
+    }
+    return
+  }
+
+  const mapped: MappedOverlay[] = []
+  for (const overlay of options.overlays) {
+    const { x, y, width, height } = overlay.box
+    const safeW = Math.max(0, width)
+    const safeH = Math.max(0, height)
+    const rawX0 = Math.floor((x / vpW) * cols)
+    const rawY0 = Math.floor((y / vpH) * rows)
+    const isPoint = safeW === 0 || safeH === 0
+    const rawX1 = isPoint ? rawX0 : Math.max(rawX0, Math.ceil(((x + safeW) / vpW) * cols) - 1)
+    const rawY1 = isPoint ? rawY0 : Math.max(rawY0, Math.ceil(((y + safeH) / vpH) * rows) - 1)
+
+    if (rawX1 < 0 || rawX0 >= cols || rawY1 < 0 || rawY0 >= rows) continue
+
+    const x0 = Math.max(0, rawX0)
+    const x1 = Math.min(cols - 1, rawX1)
+    const y0 = Math.max(0, rawY0)
+    const y1 = Math.min(rows - 1, rawY1)
+
+    mapped.push({
+      badge: `[${overlay.ref.replace(/[^\x20-\x7e]/g, '')}]`,
+      x0,
+      y0,
+      x1,
+      y1,
+      topVisible: rawY0 >= 0 && rawY0 < rows,
+      botVisible: rawY1 >= 0 && rawY1 < rows,
+      leftVisible: rawX0 >= 0 && rawX0 < cols,
+      rightVisible: rawX1 >= 0 && rawX1 < cols,
+      area: (x1 - x0 + 1) * (y1 - y0 + 1),
+      isPoint,
+    })
+  }
+
+  // Larger containers draw first so nested interactive elements sit cleanly on top
+  mapped.sort((a, b) => b.area - a.area)
+
+  // Pass 1: Draw wireframe bounding boxes (+, -, |) while preserving box interiors
+  for (const m of mapped) {
+    if (m.isPoint) continue
+    const boxW = m.x1 - m.x0 + 1
+    const boxH = m.y1 - m.y0 + 1
+    if (boxW < 3) continue
+
+    const hStart = m.leftVisible ? m.x0 + 1 : m.x0
+    const hEnd = m.rightVisible ? m.x1 - 1 : m.x1
+
+    if (boxH === 1) {
+      if (boxW >= m.badge.length + 2) {
+        for (let x = hStart; x <= hEnd; x++) grid[m.y0]![x] = '-'
+        if (m.leftVisible) grid[m.y0]![m.x0] = '+'
+        if (m.rightVisible) grid[m.y0]![m.x1] = '+'
+      }
+      continue
+    }
+
+    const vStart = m.topVisible ? m.y0 + 1 : m.y0
+    const vEnd = m.botVisible ? m.y1 - 1 : m.y1
+
+    if (m.topVisible) {
+      for (let x = hStart; x <= hEnd; x++) grid[m.y0]![x] = '-'
+      if (m.leftVisible) grid[m.y0]![m.x0] = '+'
+      if (m.rightVisible) grid[m.y0]![m.x1] = '+'
+    }
+    if (m.botVisible) {
+      for (let x = hStart; x <= hEnd; x++) grid[m.y1]![x] = '-'
+      if (m.leftVisible) grid[m.y1]![m.x0] = '+'
+      if (m.rightVisible) grid[m.y1]![m.x1] = '+'
+    }
+    if (m.leftVisible) {
+      for (let y = vStart; y <= vEnd; y++) grid[y]![m.x0] = '|'
+    }
+    if (m.rightVisible) {
+      for (let y = vStart; y <= vEnd; y++) grid[y]![m.x1] = '|'
+    }
+  }
+
+  // Pass 2: Stamp [eN] badges on top of wireframes so borders never corrupt ref labels
+  for (const m of mapped) {
+    const boxW = m.x1 - m.x0 + 1
+    const innerW = boxW - 2
+    if (!m.isPoint && innerW >= m.badge.length) {
+      const padLeft = Math.floor((innerW - m.badge.length) / 2)
+      stampBadge(grid, cols, m.y0, m.x0 + 1 + padLeft, m.badge)
+    } else {
+      stampBadge(grid, cols, m.y0, m.x0, m.badge)
     }
   }
 }
