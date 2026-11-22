@@ -7,7 +7,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M02: ASCII table auto-column width alignment with borders (`+---+---+`) and header separator rows
 - [x] M03: Inline link wrapping inside paragraphs so `[eN: link text]` stays inline rather than forcing a line break
 - [x] M04: ASCII progress/scrollbar gutter on the right edge of the viewport frame (`#` thumb on `|` track)
-- [ ] M05: Form container grouping boxes (`+-- Form: Login --+`) around related inputs and submit buttons
+- [x] M05: Form container grouping boxes (`+-- Form: Login --+`) around related inputs and submit buttons
 - [ ] M06: Collapsible/compact `--density compact|normal|wide` ASCII layout profiles for small LLM token budgets
 - [ ] M07: ASCII diff renderer (`renderDeltaAscii`) that renders `--since` deltas with `+` added / `-` removed / `~` changed markers
 - [ ] M08: PNG decoder support for 16-bit channels (downsampled to 8-bit), `tRNS` transparency chunks, and 1/2/4-bit sub-byte depths

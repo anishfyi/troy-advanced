@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import {
   computeScrollbarGutter,
   hasMultiColumnLayout,
+  humanizeFormName,
+  renderAsciiForm,
   renderAsciiTable,
   renderPageAscii,
   renderSpatialBlocks,
@@ -513,5 +515,107 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     expect(domEdge).toContain('|')
     expect(domEdge.startsWith('|')).toBe(true)
     expect(domEdge.endsWith('|')).toBe(true)
+  })
+
+  it('renders form container grouping boxes (+-- Form: Login --+) in flow, spatial, and Unicode modes', () => {
+    expect(humanizeFormName('login-form')).toBe('Login')
+    expect(humanizeFormName('userSignupForm')).toBe('User Signup')
+    expect(humanizeFormName('form-1')).toBeUndefined()
+
+    // 1. Direct renderAsciiForm with explicit title
+    const loginBlocks: PageSnapshot['blocks'] = [
+      { kind: 'input', text: 'Email', value: 'ops@example.com', ref: 'e1', formId: 'form-1', formTitle: 'Login' },
+      { kind: 'input', text: 'Password', value: '********', ref: 'e2', formId: 'form-1', formTitle: 'Login' },
+      { kind: 'input', text: 'Remember me', tag: 'checkbox', checked: true, ref: 'e3', formId: 'form-1', formTitle: 'Login' },
+      { kind: 'button', text: 'Sign In', ref: 'e4', formId: 'form-1', formTitle: 'Login' },
+    ]
+    const boxLines = renderAsciiForm(loginBlocks, 64, { asciiOnly: true })
+    expect(boxLines.length).toBe(6) // top + 4 controls + bottom
+    expect(boxLines[0]).toMatch(/^\+-- Form: Login -+\+$/)
+    expect(boxLines[boxLines.length - 1]).toMatch(/^\+-+\+$/)
+    const boxWidth = boxLines[0]!.length
+    for (const line of boxLines) {
+      expect(line.length).toBe(boxWidth)
+      expect(/^[\x20-\x7e]+$/.test(line)).toBe(true)
+    }
+    expect(boxLines.join('\n')).toContain('[e1] Email:')
+    expect(boxLines.join('\n')).toContain('[e2] Password:')
+    expect(boxLines.join('\n')).toContain('[e3] [x] Remember me')
+    expect(boxLines.join('\n')).toContain('[e4] < Sign In >')
+
+    // 2. Title inference from submit button and untitled fallback
+    const inferredLines = renderAsciiForm(
+      [
+        { kind: 'input', text: 'Query', ref: 'e1' },
+        { kind: 'button', text: 'Search', ref: 'e2' },
+      ],
+      60,
+      { asciiOnly: true },
+    )
+    expect(inferredLines[0]).toMatch(/^\+-- Form: Search -+\+$/)
+
+    const untitledLines = renderAsciiForm(
+      [
+        { kind: 'input', text: 'First Name', ref: 'e1' },
+        { kind: 'input', text: 'Last Name', ref: 'e2' },
+      ],
+      60,
+      { asciiOnly: true },
+    )
+    expect(untitledLines[0]).toMatch(/^\+-- Form -+\+$/)
+
+    // 3. Unicode mode
+    const unicodeBox = renderAsciiForm(loginBlocks, 64, { asciiOnly: false, color: false })
+    expect(unicodeBox[0]).toMatch(/^┌── Form: Login ─+┐$/)
+    expect(unicodeBox[unicodeBox.length - 1]).toMatch(/^└─+┘$/)
+
+    // 4. Flow page with two separate forms + standalone button (which must NOT be boxed)
+    const flowSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://example.com/auth',
+      title: 'Auth',
+      epoch: 1,
+      viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+      blocks: [
+        { kind: 'heading', level: 1, text: 'Account Access' },
+        ...loginBlocks,
+        { kind: 'input', text: 'Invite Code', ref: 'e5', formId: 'form-2', formTitle: 'Redeem' },
+        { kind: 'button', text: 'Apply', ref: 'e6', formId: 'form-2', formTitle: 'Redeem' },
+        { kind: 'button', text: 'Help', ref: 'e7' },
+      ],
+      elements: [],
+      text: 'Account Access',
+      capturedAt: Date.now(),
+    }
+    const flowAscii = renderPageAscii(flowSnap, { width: 84, height: 32, asciiOnly: true })
+    expect(/^[\x20-\x7e\n]+$/.test(flowAscii)).toBe(true)
+    expect(flowAscii).toContain('+-- Form: Login -')
+    expect(flowAscii).toContain('+-- Form: Redeem -')
+    expect(flowAscii).toContain('[e7] < Help >')
+    expect(flowAscii).not.toContain('Form: Help')
+
+    // 5. 2D spatial layout with hero column on left and Login form box on right
+    const spatialSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://example.com/login',
+      title: 'Portal Login',
+      epoch: 1,
+      viewport: { width: 1200, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+      blocks: [
+        { kind: 'heading', level: 2, text: 'Welcome Back', box: { x: 20, y: 40, width: 420, height: 32 } },
+        { kind: 'paragraph', text: 'Sign in to manage EC2 nodes.', box: { x: 20, y: 80, width: 420, height: 40 } },
+        { kind: 'input', text: 'User', ref: 'e1', formId: 'form-1', formTitle: 'Login', box: { x: 540, y: 40, width: 520, height: 32 } },
+        { kind: 'button', text: 'Login', ref: 'e2', formId: 'form-1', formTitle: 'Login', box: { x: 540, y: 80, width: 160, height: 32 } },
+      ],
+      elements: [],
+      text: 'Portal Login',
+      capturedAt: Date.now(),
+    }
+    const spatialAscii = renderPageAscii(spatialSnap, { width: 100, height: 24, asciiOnly: true, layout: 'spatial' })
+    expect(/^[\x20-\x7e\n]+$/.test(spatialAscii)).toBe(true)
+    expect(spatialAscii).toContain('layout:2d')
+    const heroAndFormRow = spatialAscii.split('\n').find((l) => l.includes('Welcome Back') && l.includes('+-- Form: Login'))
+    expect(heroAndFormRow).toBeDefined()
+    expect(heroAndFormRow!.indexOf('Welcome Back')).toBeLessThan(heroAndFormRow!.indexOf('+-- Form: Login'))
   })
 })

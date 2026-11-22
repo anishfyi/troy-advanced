@@ -3,6 +3,7 @@
 // or offline tests without Chromium installed.
 
 import type { ConsoleEntry, ContentBlock, ElementDescriptor, InlineLink, NetworkEntry, PageSnapshot } from '../types.js'
+import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 
@@ -77,19 +78,26 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
 
   const blocks: ContentBlock[] = []
   const elements: ElementDescriptor[] = []
-  const forms = new Map<string, { action: string; method: string; fieldSelectors: string[] }>()
+  const forms = new Map<string, { action: string; method: string; fieldSelectors: string[]; title?: string }>()
   let elIndex = 0
   let currentFormId = ''
 
-  // Track form open/close and interactive + semantic elements in document order
-  const tokenRe =
-    /<(h[1-6]|p|a|button|input|textarea|select|li|pre|code|tr|img|hr|form|\/form)\b([^>]*)>(?:([\s\S]*?)<\/\1>)?/gi
+  const pushBlock = (block: ContentBlock) => {
+    if (currentFormId) {
+      const formMeta = forms.get(currentFormId)
+      blocks.push({
+        ...block,
+        formId: currentFormId,
+        ...(formMeta?.title ? { formTitle: formMeta.title } : {}),
+      })
+    } else {
+      blocks.push(block)
+    }
+  }
 
   // Better linear scan: handle paired and void tags cleanly
   const linearRe =
-    /<form\b([^>]*)>|<\/form>|<(h[1-6])\b([^>]*)>([\s\S]*?)<\/\2>|<p\b([^>]*)>([\s\S]*?)<\/p>|<a\b([^>]*)>([\s\S]*?)<\/a>|<button\b([^>]*)>([\s\S]*?)<\/button>|<input\b([^>]*)\/?>|<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<select\b([^>]*)>([\s\S]*?)<\/select>|<li\b([^>]*)>([\s\S]*?)<\/li>|<pre\b([^>]*)>([\s\S]*?)<\/pre>|<tr\b([^>]*)>([\s\S]*?)<\/tr>|<img\b([^>]*)\/?>|<hr\b[^>]*\/?>/gi
-
-  void tokenRe
+    /<form\b([^>]*)>|<\/form>|<(h[1-6])\b([^>]*)>([\s\S]*?)<\/\2>|<p\b([^>]*)>([\s\S]*?)<\/p>|<a\b([^>]*)>([\s\S]*?)<\/a>|<button\b([^>]*)>([\s\S]*?)<\/button>|<input\b([^>]*)\/?>|<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<select\b([^>]*)>([\s\S]*?)<\/select>|<li\b([^>]*)>([\s\S]*?)<\/li>|<pre\b([^>]*)>([\s\S]*?)<\/pre>|<tr\b([^>]*)>([\s\S]*?)<\/tr>|<img\b([^>]*)\/?>|<hr\b[^>]*\/?>|<legend\b[^>]*>([\s\S]*?)<\/legend>/gi
 
   let m: RegExpExecArray | null
   while ((m = linearRe.exec(bodyHtml)) !== null) {
@@ -98,10 +106,15 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
     if (/^<form\b/i.test(full)) {
       const attrs = parseAttrs(m[1] ?? '')
       currentFormId = `form-${forms.size + 1}`
+      const formTitle =
+        attrs['aria-label']?.trim() ||
+        attrs.title?.trim() ||
+        humanizeFormName(attrs.name || attrs.id)
       forms.set(currentFormId, {
         action: resolveHref(attrs.action, baseUrl) ?? baseUrl,
         method: (attrs.method ?? 'GET').toUpperCase(),
         fieldSelectors: [],
+        title: formTitle,
       })
       continue
     }
@@ -110,11 +123,23 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
       continue
     }
 
+    if (m[23] !== undefined) {
+      // <legend> inside a form sets the form container title if not already explicitly labeled
+      const legendText = stripTags(m[23])
+      if (currentFormId && legendText) {
+        const formMeta = forms.get(currentFormId)
+        if (formMeta && !formMeta.title) {
+          formMeta.title = legendText
+        }
+      }
+      continue
+    }
+
     if (m[2]) {
       // Heading h1..h6
       const level = Number(m[2].slice(1))
       const text = stripTags(m[4] ?? '')
-      if (text) blocks.push({ kind: 'heading', level, text, tag: m[2].toLowerCase() })
+      if (text) pushBlock({ kind: 'heading', level, text, tag: m[2].toLowerCase() })
       continue
     }
 
@@ -174,7 +199,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
       }
       const text = textParts.trim() || stripTags(inner)
       if (text) {
-        blocks.push({
+        pushBlock({
           kind: 'paragraph',
           text,
           tag: 'p',
@@ -201,7 +226,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
         ariaLabel: attrs['aria-label'],
         href,
       })
-      blocks.push({ kind: 'link', text, href, tag: 'a' })
+      pushBlock({ kind: 'link', text, href, tag: 'a' })
       continue
     }
 
@@ -225,7 +250,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
         defaultSubmit: type === 'submit' && Boolean(currentFormId),
         formAction,
       })
-      blocks.push({ kind: 'button', text, tag: 'button' })
+      pushBlock({ kind: 'button', text, tag: 'button' })
       if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
       continue
     }
@@ -267,9 +292,9 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
         formAction,
       })
       if (isBtn) {
-        blocks.push({ kind: 'button', text: attrs.value || label, tag: 'input' })
+        pushBlock({ kind: 'button', text: attrs.value || label, tag: 'input' })
       } else {
-        blocks.push({
+        pushBlock({
           kind: 'input',
           text: label,
           placeholder: attrs.placeholder,
@@ -308,7 +333,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
         readOnly: 'readonly' in attrs,
         editable: true,
       })
-      blocks.push({ kind: 'input', text: label, placeholder: attrs.placeholder, value, tag: 'textarea' })
+      pushBlock({ kind: 'input', text: label, placeholder: attrs.placeholder, value, tag: 'textarea' })
       if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
       continue
     }
@@ -348,7 +373,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
         value: selected?.label ?? selected?.value ?? '',
         options,
       })
-      blocks.push({ kind: 'select', text: label, value: selected?.label ?? selected?.value ?? '', tag: 'select' })
+      pushBlock({ kind: 'select', text: label, value: selected?.label ?? selected?.value ?? '', tag: 'select' })
       if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
       continue
     }
@@ -356,14 +381,14 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
     if (m[17] !== undefined) {
       // <li>
       const text = stripTags(m[17])
-      if (text) blocks.push({ kind: 'list-item', text, tag: 'li' })
+      if (text) pushBlock({ kind: 'list-item', text, tag: 'li' })
       continue
     }
 
     if (m[19] !== undefined) {
       // <pre>
       const text = decodeEntities(m[19].replace(/<[^>]+>/g, '')).trim()
-      if (text) blocks.push({ kind: 'code', text, tag: 'pre' })
+      if (text) pushBlock({ kind: 'code', text, tag: 'pre' })
       continue
     }
 
@@ -379,7 +404,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
       }
       if (cells.length > 0) {
         const isHeader = thCount > 0 && thCount === cells.length
-        blocks.push({ kind: 'table-row', text: cells.join(' | '), cells, tag: 'tr', isHeader: isHeader || undefined })
+        pushBlock({ kind: 'table-row', text: cells.join(' | '), cells, tag: 'tr', isHeader: isHeader || undefined })
       }
       continue
     }
@@ -388,12 +413,20 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
       // <img>
       const attrs = parseAttrs(m[22])
       const alt = attrs.alt || attrs.title || attrs.src || 'image'
-      blocks.push({ kind: 'image', text: alt, alt, tag: 'img' })
+      pushBlock({ kind: 'image', text: alt, alt, tag: 'img' })
       continue
     }
 
     if (/^<hr\b/i.test(full)) {
-      blocks.push({ kind: 'hr', text: '---', tag: 'hr' })
+      pushBlock({ kind: 'hr', text: '---', tag: 'hr' })
+    }
+  }
+
+  // Back-fill formTitle on any blocks whose form discovered its title via <legend> after opening
+  for (const b of blocks) {
+    if (b.formId && !b.formTitle) {
+      const titleFromForm = forms.get(b.formId)?.title
+      if (titleFromForm) b.formTitle = titleFromForm
     }
   }
 

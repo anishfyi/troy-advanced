@@ -426,6 +426,120 @@ export function renderAsciiTable(
   return lines
 }
 
+export function humanizeFormName(raw?: string): string | undefined {
+  if (!raw) return undefined
+  const trimmed = raw.trim()
+  if (!trimmed) return undefined
+  if (/^(?:form[-_\s]?\d+|f\d+)$/i.test(trimmed)) return undefined
+  const stripped = trimmed.replace(/(?:[-_\s]?form)$/i, '').trim() || trimmed
+  const spaced = stripped
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!spaced) return undefined
+  const titled = spaced
+    .split(' ')
+    .map((w) => (w.length > 0 ? w[0]!.toUpperCase() + w.slice(1) : ''))
+    .join(' ')
+  return truncateVisible(titled, 36)
+}
+
+function inferFormTitle(blocks: ContentBlock[]): string | undefined {
+  for (const b of blocks) {
+    if (b.formTitle && b.formTitle.trim()) {
+      return truncateVisible(b.formTitle.trim(), 36)
+    }
+  }
+  const heading = blocks.find((b) => b.kind === 'heading' && b.text.trim())
+  if (heading) return truncateVisible(heading.text.trim(), 36)
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]!
+    if (b.kind === 'button' && b.text.trim()) {
+      return truncateVisible(b.text.trim(), 36)
+    }
+  }
+  for (const b of blocks) {
+    const humanized = humanizeFormName(b.formId)
+    if (humanized) return humanized
+  }
+  return undefined
+}
+
+function isFormControl(block: ContentBlock): boolean {
+  return block.kind === 'input' || block.kind === 'select' || block.kind === 'button'
+}
+
+/**
+ * Renders a group of related form blocks (inputs, selects, submit buttons, etc.)
+ * inside a bordered ASCII (or Unicode) container box (`+-- Form: Login --+`).
+ */
+export function renderAsciiForm(
+  blocks: ContentBlock[],
+  maxWidth: number,
+  options: { title?: string; asciiOnly?: boolean; color?: boolean; showRefs?: boolean } = {},
+): string[] {
+  if (blocks.length === 0 || maxWidth <= 0) return []
+  const asciiOnly = options.asciiOnly ?? true
+  const color = asciiOnly ? false : (options.color ?? false)
+  const showRefs = options.showRefs ?? true
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s).replace(/\s+/g, ' ').trim()
+
+  if (maxWidth < 12) {
+    const fallback: string[] = []
+    for (const b of blocks) {
+      fallback.push(...formatBlock(b, maxWidth, asciiOnly, color, showRefs))
+    }
+    return fallback
+  }
+
+  const innerMax = Math.max(4, maxWidth - 4)
+  const contentLines: string[] = []
+  let i = 0
+  while (i < blocks.length) {
+    const b = blocks[i]!
+    if (b.kind === 'table-row') {
+      const tableRows: ContentBlock[] = []
+      while (i < blocks.length && blocks[i]!.kind === 'table-row') {
+        tableRows.push(blocks[i]!)
+        i++
+      }
+      contentLines.push(...renderAsciiTable(tableRows, innerMax, { asciiOnly, color }))
+      continue
+    }
+    contentLines.push(...formatBlock(b, innerMax, asciiOnly, color, showRefs))
+    i++
+  }
+
+  if (contentLines.length === 0) return []
+
+  const rawTitle = options.title ?? inferFormTitle(blocks)
+  const cleanTitle = rawTitle ? clean(rawTitle) : ''
+  const maxTitleLen = Math.max(0, maxWidth - 14) // "+-- Form: " (10) + " --+" (4)
+  const headerLabel = cleanTitle && maxTitleLen >= 3 ? `Form: ${truncateVisible(cleanTitle, maxTitleLen)}` : 'Form'
+
+  const minHeaderWidth = headerLabel.length + 8 // "+-- " (4) + label + " --+" (4)
+  const maxContentLen = Math.max(0, ...contentLines.map((l) => visibleLength(l)))
+  const boxWidth = Math.min(maxWidth, Math.max(minHeaderWidth, maxContentLen + 4))
+  const boxInnerWidth = Math.max(1, boxWidth - 4)
+
+  const ch = asciiOnly
+    ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|' }
+    : { tl: '┌', tr: '┐', bl: '└', br: '┘', h: '─', v: '│' }
+
+  const trailingDashes = Math.max(2, boxWidth - headerLabel.length - 6)
+  const styledLabel = color ? `${ANSI.bold}${ANSI.cyan}${headerLabel}${ANSI.reset}` : headerLabel
+  const topBorder = `${ch.tl}${ch.h}${ch.h} ${styledLabel} ${ch.h.repeat(trailingDashes)}${ch.tr}`
+  const bottomBorder = `${ch.bl}${ch.h.repeat(boxWidth - 2)}${ch.br}`
+
+  const result: string[] = [topBorder]
+  for (const line of contentLines) {
+    result.push(`${ch.v} ${padLine(line, boxInnerWidth, asciiOnly)} ${ch.v}`)
+  }
+  result.push(bottomBorder)
+  return result
+}
+
 function renderFlowBlocks(
   blocks: ContentBlock[],
   innerWidth: number,
@@ -438,6 +552,38 @@ function renderFlowBlocks(
   let i = 0
   while (i < blocks.length) {
     const block = blocks[i]!
+    if (block.formId) {
+      const formId = block.formId
+      const formBlocks: ContentBlock[] = []
+      while (i < blocks.length && blocks[i]!.formId === formId) {
+        formBlocks.push(blocks[i]!)
+        i++
+      }
+      const rendered = renderAsciiForm(formBlocks, innerWidth, { asciiOnly, color, showRefs })
+      if (rendered.length > 0) {
+        lines.push(...rendered)
+        if (addSpacing) lines.push('')
+      }
+      continue
+    }
+    if (isFormControl(block)) {
+      let j = i
+      let hasField = false
+      while (j < blocks.length && !blocks[j]!.formId && isFormControl(blocks[j]!)) {
+        if (blocks[j]!.kind === 'input' || blocks[j]!.kind === 'select') hasField = true
+        j++
+      }
+      if (hasField && j - i >= 2) {
+        const formBlocks = blocks.slice(i, j)
+        const rendered = renderAsciiForm(formBlocks, innerWidth, { asciiOnly, color, showRefs })
+        if (rendered.length > 0) {
+          lines.push(...rendered)
+          if (addSpacing) lines.push('')
+        }
+        i = j
+        continue
+      }
+    }
     if (block.kind === 'table-row') {
       const tableRows: ContentBlock[] = []
       while (i < blocks.length && blocks[i]!.kind === 'table-row') {
@@ -586,6 +732,7 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
 interface PositionedBlock {
   block: ContentBlock
   tableRows?: ContentBlock[]
+  formBlocks?: ContentBlock[]
   box: Rect
   order: number
 }
@@ -696,9 +843,30 @@ export function renderSpatialBlocks(
   // Sort top-to-bottom, left-to-right, preserving DOM order on exact ties
   const sortedRaw = [...positioned].sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x || a.order - b.order)
 
-  // Group table-row blocks that share horizontal extent and are vertically adjacent into unified tables
+  // Group form blocks sharing the same formId, and table-row blocks sharing horizontal extent
   const sorted: PositionedBlock[] = []
   for (const item of sortedRaw) {
+    if (item.block.formId) {
+      let matched: PositionedBlock | undefined
+      for (let k = sorted.length - 1; k >= 0; k--) {
+        const candidate = sorted[k]!
+        if (candidate.formBlocks && candidate.block.formId === item.block.formId) {
+          matched = candidate
+          break
+        }
+      }
+      if (matched && matched.formBlocks) {
+        matched.formBlocks.push(item.block)
+        const minBoxX = Math.min(matched.box.x, item.box.x)
+        const minBoxY = Math.min(matched.box.y, item.box.y)
+        const maxBoxR = Math.max(matched.box.x + matched.box.width, item.box.x + item.box.width)
+        const maxBoxB = Math.max(matched.box.y + matched.box.height, item.box.y + item.box.height)
+        matched.box = { x: minBoxX, y: minBoxY, width: maxBoxR - minBoxX, height: maxBoxB - minBoxY }
+        continue
+      }
+      sorted.push({ ...item, formBlocks: [item.block] })
+      continue
+    }
     if (item.block.kind === 'table-row') {
       let matched: PositionedBlock | undefined
       for (let k = sorted.length - 1; k >= 0; k--) {
@@ -789,6 +957,7 @@ export function renderSpatialBlocks(
     const availableSpan = Math.max(1, maxRightCol - item.colStart)
     const boxSpan = Math.max(1, Math.min(item.colEnd, maxRightCol) - item.colStart)
     const isCompactInline =
+      Boolean(item.formBlocks) ||
       item.block.kind === 'link' ||
       item.block.kind === 'button' ||
       item.block.kind === 'input' ||
@@ -798,9 +967,11 @@ export function renderSpatialBlocks(
     const drawWidth = isCompactInline ? availableSpan : Math.min(availableSpan, Math.max(boxSpan, Math.min(availableSpan, 8)))
 
     // Format without ANSI codes so character positions align 1:1 with grid columns
-    const rawFormatted = item.tableRows
-      ? renderAsciiTable(item.tableRows, drawWidth, { asciiOnly, color: false })
-      : formatBlock(item.block, drawWidth, asciiOnly, false, showRefs)
+    const rawFormatted = item.formBlocks
+      ? renderAsciiForm(item.formBlocks, drawWidth, { asciiOnly, color: false, showRefs })
+      : item.tableRows
+        ? renderAsciiTable(item.tableRows, drawWidth, { asciiOnly, color: false })
+        : formatBlock(item.block, drawWidth, asciiOnly, false, showRefs)
     const formatted = rawFormatted
       .map((l) => {
         const plain = asciiOnly ? sanitizeAscii(stripAnsi(l)) : stripAnsi(l)

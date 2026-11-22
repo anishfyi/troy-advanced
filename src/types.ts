@@ -68,6 +68,8 @@ export interface ContentBlock {
   isHeader?: boolean
   alt?: string
   links?: InlineLink[]
+  formId?: string
+  formTitle?: string
 }
 
 export interface PageSnapshot {

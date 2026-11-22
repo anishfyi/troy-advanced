@@ -137,6 +137,47 @@ const SNAPSHOT_SCRIPT = `(() => {
 
   const blocks = [];
   const consumedLinks = new Set();
+  const formMetaMap = new WeakMap();
+  let formCounter = 0;
+
+  function formInfoFor(el) {
+    const form = el.closest ? el.closest('form') : null;
+    if (!form) return null;
+    let info = formMetaMap.get(form);
+    if (!info) {
+      formCounter += 1;
+      const id = 'form-' + formCounter;
+      let title = (form.getAttribute('aria-label') || '').trim();
+      if (!title) {
+        const labelledBy = form.getAttribute('aria-labelledby');
+        if (labelledBy) {
+          title = labelledBy.split(/\\s+/).map((refId) => document.getElementById(refId)?.textContent?.trim() || '').filter(Boolean).join(' ');
+        }
+      }
+      if (!title) title = (form.getAttribute('title') || '').trim();
+      if (!title) {
+        const legend = form.querySelector('legend');
+        if (legend) title = (legend.textContent || '').replace(/\\s+/g, ' ').trim();
+      }
+      if (!title) {
+        const rawName = (form.getAttribute('name') || form.id || '').trim();
+        if (rawName && !/^(?:form[-_\\s]?\\d+|f\\d+)$/i.test(rawName)) {
+          const stripped = rawName.replace(/(?:[-_\\s]?form)$/i, '').trim() || rawName;
+          title = stripped.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_]+/g, ' ').replace(/\\s+/g, ' ').trim()
+            .split(' ').map((w) => (w ? w[0].toUpperCase() + w.slice(1) : '')).join(' ');
+        }
+      }
+      info = { formId: id, ...(title ? { formTitle: title } : {}) };
+      formMetaMap.set(form, info);
+    }
+    return info;
+  }
+
+  function pushBlock(el, block) {
+    const fInfo = formInfoFor(el);
+    blocks.push(fInfo ? { ...block, ...fInfo } : block);
+  }
+
   const blockSel = 'h1, h2, h3, h4, h5, h6, p, a[href], button, input:not([type="hidden"]), textarea, select, li, pre, tr, img, hr';
   const body = document.body || document.documentElement;
   if (body) {
@@ -150,7 +191,7 @@ const SNAPSHOT_SCRIPT = `(() => {
 
       if (/^h[1-6]$/.test(tag)) {
         const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        if (txt) blocks.push({ kind: 'heading', level: Number(tag[1]), text: txt, tag, box });
+        if (txt) pushBlock(el, { kind: 'heading', level: Number(tag[1]), text: txt, tag, box });
       } else if (tag === 'p') {
         const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
         if (txt) {
@@ -175,7 +216,7 @@ const SNAPSHOT_SCRIPT = `(() => {
             }
             inlineLinks.push(entry);
           }
-          blocks.push({
+          pushBlock(el, {
             kind: 'paragraph',
             text: txt,
             tag,
@@ -186,14 +227,14 @@ const SNAPSHOT_SCRIPT = `(() => {
       } else if (tag === 'a') {
         if (consumedLinks.has(el)) continue;
         const txt = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
-        if (txt) blocks.push({ kind: 'link', text: txt, href: el.href || undefined, tag, box, selector: tracked?.selector });
+        if (txt) pushBlock(el, { kind: 'link', text: txt, href: el.href || undefined, tag, box, selector: tracked?.selector });
       } else if (tag === 'button' || (tag === 'input' && ['submit','button','reset'].includes(String(el.type).toLowerCase()))) {
         const txt = (el.innerText || el.value || el.getAttribute('aria-label') || 'Button').replace(/\\s+/g, ' ').trim();
-        blocks.push({ kind: 'button', text: txt, tag, box, selector: tracked?.selector });
+        pushBlock(el, { kind: 'button', text: txt, tag, box, selector: tracked?.selector });
       } else if (tag === 'input' || tag === 'textarea') {
         const type = String(el.type || 'text').toLowerCase();
         const isPassword = type === 'password';
-        blocks.push({
+        pushBlock(el, {
           kind: 'input',
           text: tracked?.label || tracked?.text || type,
           placeholder: el.getAttribute('placeholder') || undefined,
@@ -204,7 +245,7 @@ const SNAPSHOT_SCRIPT = `(() => {
           selector: tracked?.selector,
         });
       } else if (tag === 'select') {
-        blocks.push({
+        pushBlock(el, {
           kind: 'select',
           text: tracked?.label || tracked?.text || 'select',
           value: tracked?.value || '',
@@ -214,10 +255,10 @@ const SNAPSHOT_SCRIPT = `(() => {
         });
       } else if (tag === 'li') {
         const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        if (txt) blocks.push({ kind: 'list-item', text: txt, tag, box });
+        if (txt) pushBlock(el, { kind: 'list-item', text: txt, tag, box });
       } else if (tag === 'pre') {
         const txt = (el.innerText || '').trim();
-        if (txt) blocks.push({ kind: 'code', text: txt.slice(0, 2000), tag, box });
+        if (txt) pushBlock(el, { kind: 'code', text: txt.slice(0, 2000), tag, box });
       } else if (tag === 'tr') {
         const directCells = Array.from(el.children).filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
         const cellEls = directCells.length > 0 ? directCells : Array.from(el.querySelectorAll('th,td'));
@@ -227,13 +268,13 @@ const SNAPSHOT_SCRIPT = `(() => {
           Boolean(el.closest('thead'))
         );
         if (cells.length > 0 && cells.some(Boolean)) {
-          blocks.push({ kind: 'table-row', text: cells.join(' | '), cells, tag, box, isHeader: isHeader || undefined });
+          pushBlock(el, { kind: 'table-row', text: cells.join(' | '), cells, tag, box, isHeader: isHeader || undefined });
         }
       } else if (tag === 'img') {
         const alt = el.getAttribute('alt') || el.getAttribute('title') || '';
-        if (alt) blocks.push({ kind: 'image', text: alt, alt, tag, box });
+        if (alt) pushBlock(el, { kind: 'image', text: alt, alt, tag, box });
       } else if (tag === 'hr') {
-        blocks.push({ kind: 'hr', text: '---', tag, box });
+        pushBlock(el, { kind: 'hr', text: '---', tag, box });
       }
     }
   }

@@ -33,6 +33,27 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
         </body></html>`)
         return
       }
+      if (url.pathname === '/forms') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(`<html><head><title>Auth & Subscribe</title></head><body>
+          <h1>Access</h1>
+          <form aria-label="Login" action="/login" method="POST">
+            <label for="u">Username</label>
+            <input id="u" name="username" type="text" placeholder="alice" />
+            <input id="p" name="password" type="password" />
+            <button type="submit">Login</button>
+          </form>
+          <form action="/subscribe" method="POST">
+            <fieldset>
+              <legend>Newsletter</legend>
+              <label for="em">Email</label>
+              <input id="em" name="email" type="email" />
+              <button type="submit">Join</button>
+            </fieldset>
+          </form>
+        </body></html>`)
+        return
+      }
       if (url.pathname === '/table') {
         res.writeHead(200, { 'content-type': 'text/html' })
         res.end(`<html><head><title>EC2 Fleet</title></head><body>
@@ -196,5 +217,22 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
     const clicked = await api('/tool', { tabId, name: 'page_click', args: { ref } })
     expect(clicked.data.ok).toBe(true)
     expect(String(clicked.data.url)).toContain('/search?q=api')
+  })
+
+  it('groups HTML <form> controls into labeled ASCII form container boxes in Lite engine', async () => {
+    const opened = await api('/open', { url: `${baseUrl}/forms`, activate: true })
+    expect(opened.data.ok).toBe(true)
+    const tabId = Number(opened.data.id)
+
+    const asciiRes = await api('/ascii', { tabId, width: 88, height: 32 })
+    expect(asciiRes.data.ok).toBe(true)
+    const ascii = String(asciiRes.data.ascii)
+    expect(/^[\x20-\x7e\n]+$/.test(ascii)).toBe(true)
+    expect(ascii).toMatch(/\+-- Form: Login -+\+/)
+    expect(ascii).toMatch(/\+-- Form: Newsletter -+\+/)
+    expect(ascii).toContain('Username:')
+    expect(ascii).toContain('< Login >')
+    expect(ascii).toContain('Email:')
+    expect(ascii).toContain('< Join >')
   })
 })
