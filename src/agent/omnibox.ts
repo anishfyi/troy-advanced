@@ -40,19 +40,35 @@ const TRACKER_PARAMS = new Set([
   'mkt_tok',
 ])
 
-const BLOCKED_TRACKER_HOSTS = [
+export const BLOCKED_TRACKER_HOSTS: readonly string[] = [
   'doubleclick.net',
   'googlesyndication.com',
   'google-analytics.com',
   'googletagmanager.com',
+  'googleadservices.com',
+  'adservice.google.com',
   'connect.facebook.net',
   'analytics.tiktok.com',
   'bat.bing.com',
   'segment.io',
+  'cdn.segment.com',
   'mixpanel.com',
   'hotjar.com',
   'fullstory.com',
   'clarity.ms',
+  'scorecardresearch.com',
+  'quantserve.com',
+  'ads-twitter.com',
+  'px.ads.linkedin.com',
+  'tr.snapchat.com',
+  'mc.yandex.ru',
+]
+
+export const AD_BEACON_URL_PATTERNS: readonly string[] = [
+  '*://*/__utm.gif*',
+  '*://*/pagead/1p-conversion*',
+  '*://*/pagead/viewthroughconversion*',
+  '*://*/g/collect?*',
 ]
 
 export type ResolveResult =
@@ -77,13 +93,117 @@ export function stripTrackingParams(rawUrl: string): { url: string; strippedPara
   }
 }
 
-export function isTrackerHost(rawUrl: string): boolean {
+export function isTrackerHost(rawUrl: string, extraHosts?: readonly string[]): boolean {
   try {
     const host = new URL(rawUrl).hostname.toLowerCase()
-    return BLOCKED_TRACKER_HOSTS.some((d) => host === d || host.endsWith(`.${d}`))
+    const check = (d: string) => {
+      const norm = d.trim().toLowerCase().replace(/^\*\./, '').replace(/^\./, '')
+      return Boolean(norm) && (host === norm || host.endsWith(`.${norm}`))
+    }
+    if (BLOCKED_TRACKER_HOSTS.some(check)) return true
+    if (extraHosts && extraHosts.length > 0 && extraHosts.some(check)) return true
+    return false
   } catch {
     return false
   }
+}
+
+export function matchesUrlWildcard(rawUrl: string, pattern: string): boolean {
+  if (!pattern) return false
+  // Escape regex metacharacters except `*`, which maps to `.*`
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')
+  try {
+    return new RegExp(`^${escaped}$`, 'i').test(rawUrl)
+  } catch {
+    return false
+  }
+}
+
+export interface TrackerMatchResult {
+  blocked: boolean
+  reason?: 'tracker-host' | 'ad-beacon' | 'custom-pattern'
+  matched?: string
+}
+
+export function isTrackerOrBeaconUrl(
+  rawUrl: string,
+  opts: {
+    extraHosts?: readonly string[]
+    extraUrlPatterns?: readonly string[]
+    includeBeacons?: boolean
+  } = {},
+): TrackerMatchResult {
+  try {
+    const parsed = new URL(rawUrl)
+    const host = parsed.hostname.toLowerCase()
+    for (const d of BLOCKED_TRACKER_HOSTS) {
+      if (host === d || host.endsWith(`.${d}`)) {
+        return { blocked: true, reason: 'tracker-host', matched: d }
+      }
+    }
+    if (opts.extraHosts) {
+      for (const raw of opts.extraHosts) {
+        const d = raw.trim().toLowerCase().replace(/^\*\./, '').replace(/^\./, '')
+        if (d && (host === d || host.endsWith(`.${d}`))) {
+          return { blocked: true, reason: 'tracker-host', matched: d }
+        }
+      }
+    }
+  } catch {
+    // non-URL strings still checked against custom patterns below
+  }
+
+  if (opts.includeBeacons !== false) {
+    for (const pat of AD_BEACON_URL_PATTERNS) {
+      if (matchesUrlWildcard(rawUrl, pat)) {
+        return { blocked: true, reason: 'ad-beacon', matched: pat }
+      }
+    }
+  }
+
+  if (opts.extraUrlPatterns) {
+    for (const pat of opts.extraUrlPatterns) {
+      if (pat && matchesUrlWildcard(rawUrl, pat)) {
+        return { blocked: true, reason: 'custom-pattern', matched: pat }
+      }
+    }
+  }
+
+  return { blocked: false }
+}
+
+export function buildCdpTrackerUrlPatterns(
+  opts: {
+    extraHosts?: readonly string[]
+    extraUrlPatterns?: readonly string[]
+    includeBeacons?: boolean
+  } = {},
+): string[] {
+  const patterns = new Set<string>()
+  const addHost = (rawHost: string) => {
+    const host = rawHost.trim().toLowerCase().replace(/^\*\./, '').replace(/^\./, '')
+    if (!host) return
+    patterns.add(`*://${host}/*`)
+    patterns.add(`*://*.${host}/*`)
+    patterns.add(`*://${host}`)
+    patterns.add(`*://*.${host}`)
+  }
+
+  for (const h of BLOCKED_TRACKER_HOSTS) addHost(h)
+  if (opts.extraHosts) {
+    for (const h of opts.extraHosts) addHost(h)
+  }
+  if (opts.includeBeacons !== false) {
+    for (const p of AD_BEACON_URL_PATTERNS) patterns.add(p)
+  }
+  if (opts.extraUrlPatterns) {
+    for (const p of opts.extraUrlPatterns) {
+      const trimmed = p.trim()
+      if (trimmed) patterns.add(trimmed)
+    }
+  }
+
+  return [...patterns]
 }
 
 export function exactOrigin(value: unknown): string | null {

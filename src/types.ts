@@ -118,6 +118,28 @@ export interface NetworkEntry {
   durationMs?: number
   ts: number
   error?: string
+  blocked?: boolean
+  blockedReason?: string
+}
+
+export type TrackerBlockMode = 'fetch' | 'network' | 'both' | 'off'
+
+export interface TrackerBlockingOptions {
+  enabled?: boolean
+  mode?: TrackerBlockMode
+  extraBlockedHosts?: string[]
+  extraBlockedUrlPatterns?: string[]
+  includeBeacons?: boolean
+}
+
+export interface BlockedTrackerStats {
+  enabled: boolean
+  mode: TrackerBlockMode
+  effectiveMode: TrackerBlockMode
+  patternCount: number
+  blockedCount: number
+  continuedCount: number
+  blockedByHost: Record<string, number>
 }
 
 export type AsciiLayoutMode = 'flow' | 'spatial' | 'auto'

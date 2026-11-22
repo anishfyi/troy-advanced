@@ -4,7 +4,17 @@
 
 import path from 'node:path'
 import os from 'node:os'
-import type { ActStep, AsciiRenderOptions, EngineKind, MarkdownRenderOptions, PageSnapshot, PixelAsciiOptions, Rect, TabSummary } from '../types.js'
+import type {
+  ActStep,
+  AsciiRenderOptions,
+  EngineKind,
+  MarkdownRenderOptions,
+  PageSnapshot,
+  PixelAsciiOptions,
+  Rect,
+  TabSummary,
+  TrackerBlockingOptions,
+} from '../types.js'
 import { ElementRegistry } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
@@ -54,6 +64,7 @@ export interface BrowserManagerOptions {
   remoteCdpPort?: number
   memoryEnabled?: boolean
   chromeBin?: string
+  trackerBlocking?: TrackerBlockingOptions
 }
 
 export class BrowserManager {
@@ -85,6 +96,7 @@ export class BrowserManager {
         cdpPort: opts.cdpPort,
         remoteCdpPort: opts.remoteCdpPort,
         profileDir: path.join(profileDir, 'chrome-data'),
+        trackerBlocking: opts.trackerBlocking,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -95,6 +107,7 @@ export class BrowserManager {
             cdpPort: opts.cdpPort,
             remoteCdpPort: opts.remoteCdpPort,
             profileDir: path.join(profileDir, 'chrome-data'),
+            trackerBlocking: opts.trackerBlocking,
           })
         } catch {
           engine = new LiteBrowserEngine()
@@ -720,9 +733,16 @@ export class BrowserManager {
         const entries = session.driver.getNetwork({
           clear: Boolean(args.clear),
           failedOnly: Boolean(args.failedOnly),
+          blockedOnly: Boolean(args.blockedOnly),
           limit: typeof args.limit === 'number' ? args.limit : 50,
         })
-        return { ok: true, count: entries.length, entries }
+        const trackerBlocking = session.driver.getBlockedTrackerStats?.()
+        return {
+          ok: true,
+          count: entries.length,
+          entries,
+          ...(trackerBlocking ? { trackerBlocking } : {}),
+        }
       }
 
       case 'page_eval': {

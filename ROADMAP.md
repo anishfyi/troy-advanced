@@ -20,7 +20,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M15: Benchmark & golden snapshot tests verifying ASCII layout speed (<5ms per page) and deterministic output
 
 ## Track 2: Chromium CDP Engine Depth (Milestones 16–30)
-- [ ] M16: Automatic CDP tracker & ad-beacon request interception (`Fetch.enable` / `Network.setBlockedURLs`) matching `omnibox.ts` tracker list
+- [x] M16: Automatic CDP tracker & ad-beacon request interception (`Fetch.enable` / `Network.setBlockedURLs`) matching `omnibox.ts` tracker list
 - [ ] M17: Real `page_wait` conditions in Chromium & Lite: wait for `--text`, `--selector`, `--url`, `--state visible|hidden|attached`, and `--timeout`
 - [ ] M18: Network idle + DOM mutation settle detector (`waitForPageSettle`) so SPAs finish hydrating before snapshots
 - [ ] M19: Full keyboard chord support (`Control+A`, `Shift+Tab`, `Escape`, `ArrowDown`, `Meta+K`) with proper CDP modifier bitmasks and Windows virtual key codes

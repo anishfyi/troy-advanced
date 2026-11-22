@@ -2,7 +2,7 @@
 
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import type { EngineKind } from './types.js'
+import type { EngineKind, TrackerBlockingOptions, TrackerBlockMode } from './types.js'
 import { BrowserManager } from './engine/manager.js'
 import { readLiveEndpoint } from './bridge/endpoint.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
@@ -73,6 +73,7 @@ const VALUE_FLAGS = new Set([
   '--limit',
   '--level',
   '--origin',
+  '--tracker-mode',
 ])
 
 function parseArgv(argv: string[]) {
@@ -124,6 +125,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   const engine = (typeof flags.engine === 'string' ? flags.engine : 'auto') as EngineKind
   const endpointFlag = typeof flags.endpoint === 'string' ? flags.endpoint : undefined
+  const trackerBlocking: TrackerBlockingOptions | undefined =
+    flags['no-block-trackers'] || typeof flags['tracker-mode'] === 'string'
+      ? {
+          enabled: !flags['no-block-trackers'],
+          mode: typeof flags['tracker-mode'] === 'string' ? (flags['tracker-mode'] as TrackerBlockMode) : undefined,
+        }
+      : undefined
 
   if (cmd === 'doctor') {
     const report = runDoctor()
@@ -165,6 +173,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       endpointFile: endpointFlag,
       compatTroy: Boolean(flags['compat-troy']),
       initialUrl: typeof flags.url === 'string' ? flags.url : undefined,
+      trackerBlocking,
     }
 
     if (sub === 'run') {
@@ -199,6 +208,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      trackerBlocking,
     })
     try {
       await runTerminalBrowser(manager, {
@@ -216,6 +226,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      trackerBlocking,
     })
     try {
       await runMcpStdioServer(manager)
@@ -230,6 +241,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      trackerBlocking,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -241,7 +253,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   // One-shot ASCII / Markdown / Visual fetch without needing a running daemon
   if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md') && positional[1] && !readLiveEndpoint(endpointFlag)) {
-    const manager = await BrowserManager.create({ engine })
+    const manager = await BrowserManager.create({ engine, trackerBlocking })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })
       if (!opened.ok) {
@@ -446,7 +458,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       res = await callDaemon(live.endpoint, '/tool', {
         tabId,
         name: 'page_network',
-        args: { clear: Boolean(flags.clear), failedOnly: Boolean(flags.failed), limit: flags.limit ? Number(flags.limit) : 50 },
+        args: {
+          clear: Boolean(flags.clear),
+          failedOnly: Boolean(flags.failed),
+          blockedOnly: Boolean(flags.blocked),
+          limit: flags.limit ? Number(flags.limit) : 50,
+        },
       })
       break
     case 'eval':

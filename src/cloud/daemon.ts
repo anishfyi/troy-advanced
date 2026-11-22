@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { EngineKind } from '../types.js'
+import type { EngineKind, TrackerBlockingOptions } from '../types.js'
 import { BrowserManager } from '../engine/manager.js'
 import { createAgentSocket } from '../bridge/agent-socket.js'
 import {
@@ -24,6 +24,7 @@ export interface DaemonOptions {
   endpointFile?: string
   compatTroy?: boolean
   initialUrl?: string
+  trackerBlocking?: TrackerBlockingOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -32,6 +33,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     profileDir: opts.profileDir,
     cdpPort: opts.cdpPort,
     remoteCdpPort: opts.remoteCdpPort,
+    trackerBlocking: opts.trackerBlocking,
   })
 
   if (opts.initialUrl) {
@@ -111,6 +113,8 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.endpointFile) args.push('--endpoint', opts.endpointFile)
   if (opts.compatTroy) args.push('--compat-troy')
   if (opts.initialUrl) args.push('--url', opts.initialUrl)
+  if (opts.trackerBlocking?.enabled === false) args.push('--no-block-trackers')
+  if (opts.trackerBlocking?.mode) args.push('--tracker-mode', opts.trackerBlocking.mode)
 
   const child = spawn(process.execPath, args, {
     detached: true,

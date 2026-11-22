@@ -1,4 +1,4 @@
-import type { ConsoleEntry, NetworkEntry, PageSnapshot } from '../types.js'
+import type { BlockedTrackerStats, ConsoleEntry, NetworkEntry, PageSnapshot } from '../types.js'
 
 export interface TabDriver {
   readonly id: number
@@ -19,7 +19,8 @@ export interface TabDriver {
   evaluate(expression: string): Promise<unknown>
   screenshot(opts?: { fullPage?: boolean }): Promise<Buffer | null>
   getConsole(opts?: { clear?: boolean; level?: string; limit?: number }): ConsoleEntry[]
-  getNetwork(opts?: { clear?: boolean; failedOnly?: boolean; limit?: number }): NetworkEntry[]
+  getNetwork(opts?: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number }): NetworkEntry[]
+  getBlockedTrackerStats?(): BlockedTrackerStats
   close(): Promise<void>
 }
 

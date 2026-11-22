@@ -6,8 +6,17 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import type { ConsoleEntry, ContentBlock, ElementDescriptor, NetworkEntry, PageSnapshot } from '../types.js'
+import type {
+  BlockedTrackerStats,
+  ConsoleEntry,
+  ContentBlock,
+  ElementDescriptor,
+  NetworkEntry,
+  PageSnapshot,
+  TrackerBlockingOptions,
+} from '../types.js'
 import { CdpClient } from './cdp-client.js'
+import { CdpTrackerBlocker } from './tracker-blocker.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 
 const SNAPSHOT_SCRIPT = `(() => {
@@ -432,12 +441,29 @@ class ChromiumTab implements TabDriver {
   private consoleLogs: ConsoleEntry[] = []
   private networkLogs: NetworkEntry[] = []
   private reqStart = new Map<string, { url: string; method: string; ts: number }>()
+  private blockedByFetch = new Map<string, string>()
+  private trackerBlocker: CdpTrackerBlocker
 
-  constructor(id: number, targetId: string, cdp: CdpClient, cdpPort: number) {
+  constructor(
+    id: number,
+    targetId: string,
+    cdp: CdpClient,
+    cdpPort: number,
+    trackerBlocking?: TrackerBlockingOptions,
+  ) {
     this.id = id
     this.targetId = targetId
     this.cdp = cdp
     this.cdpPort = cdpPort
+    this.trackerBlocker = new CdpTrackerBlocker(cdp, trackerBlocking, {
+      onBlocked: (ev) => {
+        this.blockedByFetch.set(ev.url, ev.reason)
+        if (this.blockedByFetch.size > 200) {
+          const first = this.blockedByFetch.keys().next().value
+          if (first !== undefined) this.blockedByFetch.delete(first)
+        }
+      },
+    })
 
     this.cdp.on('Page.frameNavigated', (params) => {
       const frame = params.frame as { parentId?: string; url?: string } | undefined
@@ -488,13 +514,32 @@ class ChromiumTab implements TabDriver {
       const idStr = String(params.requestId ?? '')
       const started = this.reqStart.get(idStr)
       this.reqStart.delete(idStr)
+      const url = started?.url ?? ''
+      const errorText = String(params.errorText ?? 'failed')
+      let blocked = false
+      let blockedReason: string | undefined
+
+      if (url && this.blockedByFetch.has(url)) {
+        blocked = true
+        blockedReason = this.blockedByFetch.get(url)
+        this.blockedByFetch.delete(url)
+      } else if (url && (params.blockedReason === 'inspector' || errorText === 'net::ERR_BLOCKED_BY_CLIENT')) {
+        const netMatch = this.trackerBlocker.recordNetworkLevelBlock(url)
+        if (netMatch.blocked) {
+          blocked = true
+          blockedReason = netMatch.reason ?? 'tracker'
+        }
+      }
+
       this.networkLogs.push({
-        url: started?.url ?? '',
+        url,
         method: started?.method ?? 'GET',
         ok: false,
+        resourceType: params.type ? String(params.type) : undefined,
         durationMs: started ? Date.now() - started.ts : undefined,
         ts: Date.now(),
-        error: String(params.errorText ?? 'failed'),
+        error: errorText,
+        ...(blocked ? { blocked: true, blockedReason } : {}),
       })
       if (this.networkLogs.length > 300) this.networkLogs.shift()
     })
@@ -512,6 +557,7 @@ class ChromiumTab implements TabDriver {
         mobile: false,
       }),
     ])
+    await this.trackerBlocker.enable()
   }
 
   getUrl(): string {
@@ -744,11 +790,16 @@ class ChromiumTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
-  getNetwork(opts: { clear?: boolean; failedOnly?: boolean; limit?: number } = {}): NetworkEntry[] {
+  getNetwork(opts: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number } = {}): NetworkEntry[] {
     let items = [...this.networkLogs]
     if (opts.failedOnly) items = items.filter((i) => !i.ok)
+    if (opts.blockedOnly) items = items.filter((i) => Boolean(i.blocked))
     if (opts.clear) this.networkLogs = []
     return items.slice(-(opts.limit ?? 50))
+  }
+
+  getBlockedTrackerStats(): BlockedTrackerStats {
+    return this.trackerBlocker.getStats()
   }
 
   async close(): Promise<void> {
@@ -766,6 +817,7 @@ export interface ChromiumLaunchOptions {
   cdpPort?: number
   profileDir?: string
   remoteCdpPort?: number
+  trackerBlocking?: TrackerBlockingOptions
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
@@ -773,16 +825,18 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   readonly cdpPort: number
   private proc: ChildProcess | null
   private nextTabId = 1
+  private trackerBlocking?: TrackerBlockingOptions
 
-  private constructor(cdpPort: number, proc: ChildProcess | null) {
+  private constructor(cdpPort: number, proc: ChildProcess | null, trackerBlocking?: TrackerBlockingOptions) {
     this.cdpPort = cdpPort
     this.proc = proc
+    this.trackerBlocking = trackerBlocking
   }
 
   static async launch(opts: ChromiumLaunchOptions = {}): Promise<ChromiumBrowserEngine> {
     if (opts.remoteCdpPort && opts.remoteCdpPort > 0) {
       await waitForCdp(opts.remoteCdpPort, 5000)
-      return new ChromiumBrowserEngine(opts.remoteCdpPort, null)
+      return new ChromiumBrowserEngine(opts.remoteCdpPort, null, opts.trackerBlocking)
     }
 
     const chromeBin = opts.chromeBin || findChromeBinary()
@@ -829,7 +883,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       throw new Error(`${(err as Error).message}${stderrTail ? `\nChrome stderr: ${stderrTail}` : ''}`)
     }
 
-    return new ChromiumBrowserEngine(port, proc)
+    return new ChromiumBrowserEngine(port, proc, opts.trackerBlocking)
   }
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
@@ -841,7 +895,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     }
     const target = (await res.json()) as { id: string; webSocketDebuggerUrl: string }
     const cdp = await CdpClient.connect(target.webSocketDebuggerUrl)
-    const tab = new ChromiumTab(this.nextTabId++, target.id, cdp, this.cdpPort)
+    const tab = new ChromiumTab(this.nextTabId++, target.id, cdp, this.cdpPort, this.trackerBlocking)
     await tab.init()
     if (initialUrl) {
       await tab.navigate(initialUrl)

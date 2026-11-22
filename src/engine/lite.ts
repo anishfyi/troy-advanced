@@ -774,9 +774,10 @@ class LiteTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
-  getNetwork(opts: { clear?: boolean; failedOnly?: boolean; limit?: number } = {}): NetworkEntry[] {
+  getNetwork(opts: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number } = {}): NetworkEntry[] {
     let items = [...this.networkLogs]
     if (opts.failedOnly) items = items.filter((i) => !i.ok)
+    if (opts.blockedOnly) items = items.filter((i) => Boolean(i.blocked))
     if (opts.clear) this.networkLogs = []
     return items.slice(-(opts.limit ?? 50))
   }
