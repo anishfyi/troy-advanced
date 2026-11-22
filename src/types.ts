@@ -104,6 +104,8 @@ export interface NetworkEntry {
 
 export type AsciiLayoutMode = 'flow' | 'spatial' | 'auto'
 
+export type AsciiDensity = 'compact' | 'normal' | 'wide'
+
 export interface AsciiRenderOptions {
   width?: number
   height?: number
@@ -114,6 +116,7 @@ export interface AsciiRenderOptions {
   showScrollbar?: boolean
   scrollOffset?: number
   layout?: AsciiLayoutMode
+  density?: AsciiDensity
   tabs?: TabSummary[]
   activeTabId?: number
   statusMessage?: string

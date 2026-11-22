@@ -27,9 +27,10 @@ const MCP_TOOLS = [
       type: 'object',
       properties: {
         tabId: { type: 'number' },
-        width: { type: 'number', description: 'Viewport character width (default 100)' },
-        height: { type: 'number', description: 'Viewport row height (default 36)' },
+        width: { type: 'number', description: 'Viewport character width (default depends on density: 80 compact / 100 normal / 140 wide)' },
+        height: { type: 'number', description: 'Viewport row height (default depends on density: 28 compact / 36 normal / 48 wide)' },
         layout: { type: 'string', enum: ['flow', 'spatial', 'auto'], description: 'Layout mode: flow (linear), spatial (2D box coordinates), or auto' },
+        density: { type: 'string', enum: ['compact', 'normal', 'wide'], description: 'Density profile: compact (small LLM token budgets), normal (default), or wide (140-col)' },
         since: { type: 'boolean', description: 'Return only structural delta since previous read' },
       },
     },
@@ -152,6 +153,7 @@ export async function handleMcpRequest(
           width: args.width,
           height: args.height,
           layout: args.layout,
+          density: args.density,
           since: args.since,
           asciiOnly: true,
         })

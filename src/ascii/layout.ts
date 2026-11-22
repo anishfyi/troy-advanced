@@ -2,7 +2,92 @@
 // Designed so both AI agents (even in strict 7-bit ASCII mode) and humans over SSH/EC2
 // can inspect and drive any live web page directly inside a terminal.
 
-import type { AsciiLayoutMode, AsciiRenderOptions, ContentBlock, InlineLink, PageSnapshot, Rect } from '../types.js'
+import type { AsciiDensity, AsciiLayoutMode, AsciiRenderOptions, ContentBlock, InlineLink, PageSnapshot, Rect } from '../types.js'
+
+export interface AsciiDensityProfile {
+  name: AsciiDensity
+  defaultWidth: number
+  defaultHeight: number
+  defaultShowChrome: boolean
+  defaultLayout: AsciiLayoutMode
+  addSpacing: boolean
+  compactHeadings: boolean
+  compactForms: boolean
+  compactTables: boolean
+  collapseParagraphs: boolean
+  maxParagraphLines: number
+  maxCodeLines: number
+  maxOrphanRefs: number
+  inputFieldMaxWidth: number
+  formTitleMaxLen: number
+  spatialMaxRowStep: number
+}
+
+const DENSITY_PROFILES: Record<AsciiDensity, AsciiDensityProfile> = {
+  compact: {
+    name: 'compact',
+    defaultWidth: 80,
+    defaultHeight: 28,
+    defaultShowChrome: false,
+    defaultLayout: 'flow',
+    addSpacing: false,
+    compactHeadings: true,
+    compactForms: true,
+    compactTables: true,
+    collapseParagraphs: true,
+    maxParagraphLines: 2,
+    maxCodeLines: 4,
+    maxOrphanRefs: 16,
+    inputFieldMaxWidth: 16,
+    formTitleMaxLen: 24,
+    spatialMaxRowStep: 1,
+  },
+  normal: {
+    name: 'normal',
+    defaultWidth: 100,
+    defaultHeight: 36,
+    defaultShowChrome: true,
+    defaultLayout: 'flow',
+    addSpacing: true,
+    compactHeadings: false,
+    compactForms: false,
+    compactTables: false,
+    collapseParagraphs: false,
+    maxParagraphLines: Number.POSITIVE_INFINITY,
+    maxCodeLines: 12,
+    maxOrphanRefs: 40,
+    inputFieldMaxWidth: 36,
+    formTitleMaxLen: 36,
+    spatialMaxRowStep: 2,
+  },
+  wide: {
+    name: 'wide',
+    defaultWidth: 140,
+    defaultHeight: 48,
+    defaultShowChrome: true,
+    defaultLayout: 'auto',
+    addSpacing: true,
+    compactHeadings: false,
+    compactForms: false,
+    compactTables: false,
+    collapseParagraphs: false,
+    maxParagraphLines: Number.POSITIVE_INFINITY,
+    maxCodeLines: 24,
+    maxOrphanRefs: 80,
+    inputFieldMaxWidth: 48,
+    formTitleMaxLen: 48,
+    spatialMaxRowStep: 2,
+  },
+}
+
+export function parseAsciiDensity(raw: unknown): AsciiDensity | undefined {
+  if (raw === 'compact' || raw === 'normal' || raw === 'wide') return raw
+  return undefined
+}
+
+export function resolveDensityProfile(density?: AsciiDensity): AsciiDensityProfile {
+  return DENSITY_PROFILES[density ?? 'normal']
+}
 
 const ANSI = {
   reset: '\x1b[0m',
@@ -312,11 +397,12 @@ function wrapCellText(text: string, width: number, maxLines = 3): string[] {
 export function renderAsciiTable(
   rows: ContentBlock[],
   maxWidth: number,
-  options: { asciiOnly?: boolean; color?: boolean } = {},
+  options: { asciiOnly?: boolean; color?: boolean; compact?: boolean } = {},
 ): string[] {
   if (rows.length === 0 || maxWidth <= 0) return []
   const asciiOnly = options.asciiOnly ?? true
   const color = asciiOnly ? false : (options.color ?? false)
+  const compact = options.compact ?? false
   const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s).replace(/\s+/g, ' ').trim()
 
   const normalized = rows.map((row) => ({
@@ -329,6 +415,14 @@ export function renderAsciiTable(
 
   for (const r of normalized) {
     while (r.cells.length < colCount) r.cells.push('')
+  }
+
+  if (compact) {
+    const sep = asciiOnly ? ' | ' : ' │ '
+    return normalized.map((r) => {
+      const joined = truncateVisible(r.cells.join(sep), maxWidth)
+      return r.isHeader && color ? `${ANSI.bold}${joined}${ANSI.reset}` : joined
+    })
   }
 
   // Border overhead: "| " + " | " * (colCount - 1) + " |" = 3 * colCount + 1
@@ -477,18 +571,57 @@ function isFormControl(block: ContentBlock): boolean {
 export function renderAsciiForm(
   blocks: ContentBlock[],
   maxWidth: number,
-  options: { title?: string; asciiOnly?: boolean; color?: boolean; showRefs?: boolean } = {},
+  options: {
+    title?: string
+    asciiOnly?: boolean
+    color?: boolean
+    showRefs?: boolean
+    compact?: boolean
+    profile?: AsciiDensityProfile
+  } = {},
 ): string[] {
   if (blocks.length === 0 || maxWidth <= 0) return []
   const asciiOnly = options.asciiOnly ?? true
   const color = asciiOnly ? false : (options.color ?? false)
   const showRefs = options.showRefs ?? true
+  const profile = options.profile ?? DENSITY_PROFILES.normal
+  const compact = options.compact ?? profile.compactForms
   const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s).replace(/\s+/g, ' ').trim()
+
+  if (compact) {
+    const rawTitle = options.title ?? inferFormTitle(blocks)
+    const cleanTitle = rawTitle ? clean(rawTitle) : ''
+    const maxTitleLen = Math.max(0, Math.min(profile.formTitleMaxLen, maxWidth - 10))
+    const header = cleanTitle && maxTitleLen >= 3 ? `[Form: ${truncateVisible(cleanTitle, maxTitleLen)}]` : '[Form]'
+    const styledHeader = color ? `${ANSI.bold}${ANSI.cyan}${header}${ANSI.reset}` : header
+    const innerMax = Math.max(4, maxWidth - 2)
+    const result: string[] = [styledHeader]
+    let i = 0
+    while (i < blocks.length) {
+      const b = blocks[i]!
+      if (b.kind === 'table-row') {
+        const tableRows: ContentBlock[] = []
+        while (i < blocks.length && blocks[i]!.kind === 'table-row') {
+          tableRows.push(blocks[i]!)
+          i++
+        }
+        for (const tl of renderAsciiTable(tableRows, innerMax, { asciiOnly, color, compact: true })) {
+          result.push(`  ${tl}`)
+        }
+        continue
+      }
+      for (const line of formatBlock(b, innerMax, asciiOnly, color, showRefs, profile)) {
+        result.push(`  ${line}`)
+      }
+      i++
+    }
+    return result.length > 1 ? result : []
+  }
 
   if (maxWidth < 12) {
     const fallback: string[] = []
     for (const b of blocks) {
-      fallback.push(...formatBlock(b, maxWidth, asciiOnly, color, showRefs))
+      fallback.push(...formatBlock(b, maxWidth, asciiOnly, color, showRefs, profile))
     }
     return fallback
   }
@@ -504,10 +637,10 @@ export function renderAsciiForm(
         tableRows.push(blocks[i]!)
         i++
       }
-      contentLines.push(...renderAsciiTable(tableRows, innerMax, { asciiOnly, color }))
+      contentLines.push(...renderAsciiTable(tableRows, innerMax, { asciiOnly, color, compact: profile.compactTables }))
       continue
     }
-    contentLines.push(...formatBlock(b, innerMax, asciiOnly, color, showRefs))
+    contentLines.push(...formatBlock(b, innerMax, asciiOnly, color, showRefs, profile))
     i++
   }
 
@@ -515,7 +648,7 @@ export function renderAsciiForm(
 
   const rawTitle = options.title ?? inferFormTitle(blocks)
   const cleanTitle = rawTitle ? clean(rawTitle) : ''
-  const maxTitleLen = Math.max(0, maxWidth - 14) // "+-- Form: " (10) + " --+" (4)
+  const maxTitleLen = Math.max(0, Math.min(profile.formTitleMaxLen, maxWidth - 14)) // "+-- Form: " (10) + " --+" (4)
   const headerLabel = cleanTitle && maxTitleLen >= 3 ? `Form: ${truncateVisible(cleanTitle, maxTitleLen)}` : 'Form'
 
   const minHeaderWidth = headerLabel.length + 8 // "+-- " (4) + label + " --+" (4)
@@ -547,6 +680,7 @@ function renderFlowBlocks(
   color: boolean,
   showRefs: boolean,
   addSpacing: boolean,
+  profile: AsciiDensityProfile = DENSITY_PROFILES.normal,
 ): string[] {
   const lines: string[] = []
   let i = 0
@@ -559,7 +693,13 @@ function renderFlowBlocks(
         formBlocks.push(blocks[i]!)
         i++
       }
-      const rendered = renderAsciiForm(formBlocks, innerWidth, { asciiOnly, color, showRefs })
+      const rendered = renderAsciiForm(formBlocks, innerWidth, {
+        asciiOnly,
+        color,
+        showRefs,
+        compact: profile.compactForms,
+        profile,
+      })
       if (rendered.length > 0) {
         lines.push(...rendered)
         if (addSpacing) lines.push('')
@@ -575,7 +715,13 @@ function renderFlowBlocks(
       }
       if (hasField && j - i >= 2) {
         const formBlocks = blocks.slice(i, j)
-        const rendered = renderAsciiForm(formBlocks, innerWidth, { asciiOnly, color, showRefs })
+        const rendered = renderAsciiForm(formBlocks, innerWidth, {
+          asciiOnly,
+          color,
+          showRefs,
+          compact: profile.compactForms,
+          profile,
+        })
         if (rendered.length > 0) {
           lines.push(...rendered)
           if (addSpacing) lines.push('')
@@ -590,14 +736,18 @@ function renderFlowBlocks(
         tableRows.push(blocks[i]!)
         i++
       }
-      const rendered = renderAsciiTable(tableRows, innerWidth, { asciiOnly, color })
+      const rendered = renderAsciiTable(tableRows, innerWidth, {
+        asciiOnly,
+        color,
+        compact: profile.compactTables,
+      })
       if (rendered.length > 0) {
         lines.push(...rendered)
         if (addSpacing) lines.push('')
       }
       continue
     }
-    const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs)
+    const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs, profile)
     if (rendered.length > 0) {
       lines.push(...rendered)
       if (addSpacing && (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code')) {
@@ -619,7 +769,14 @@ function padLine(line: string, width: number, asciiOnly: boolean): string {
   return truncateVisible(asciiOnly ? sanitizeAscii(plain) : plain, width)
 }
 
-function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean, color: boolean, showRefs: boolean): string[] {
+function formatBlock(
+  block: ContentBlock,
+  innerWidth: number,
+  asciiOnly: boolean,
+  color: boolean,
+  showRefs: boolean,
+  profile: AsciiDensityProfile = DENSITY_PROFILES.normal,
+): string[] {
   const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s)
   const refBadge = (ref?: string) => {
     if (!showRefs || !ref) return ''
@@ -630,7 +787,7 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
     case 'heading': {
       const level = Math.max(1, Math.min(6, block.level ?? 1))
       const text = clean(block.text)
-      if (level === 1) {
+      if (level === 1 && !profile.compactHeadings) {
         const prefix = color ? ANSI.bold + ANSI.cyan : ''
         const suffix = color ? ANSI.reset : ''
         const bar = (asciiOnly ? '=' : '━').repeat(Math.min(innerWidth, Math.max(8, text.length + 2)))
@@ -640,13 +797,33 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
         ]
       }
       const hashes = '#'.repeat(level)
-      const prefix = color ? ANSI.bold : ''
+      const prefix = color ? (level === 1 ? ANSI.bold + ANSI.cyan : ANSI.bold) : ''
       const suffix = color ? ANSI.reset : ''
       return wrapText(`${hashes} ${text}`, innerWidth).map((l) => `${prefix}${l}${suffix}`)
     }
 
     case 'paragraph': {
-      return wrapInlineParagraph(block.text, block.links, innerWidth, { asciiOnly, color, showRefs })
+      const lines = wrapInlineParagraph(block.text, block.links, innerWidth, { asciiOnly, color, showRefs })
+      if (!profile.collapseParagraphs || lines.length <= profile.maxParagraphLines) {
+        return lines
+      }
+      const kept = lines.slice(0, profile.maxParagraphLines)
+      const lastPlain = stripAnsi(kept[kept.length - 1] ?? '')
+      kept[kept.length - 1] = truncateVisible(
+        lastPlain.endsWith('...') ? lastPlain : `${lastPlain.replace(/\s+$/, '')}...`,
+        innerWidth,
+      )
+      // Preserve any inline [eN: label] refs that fell beyond the collapsed line cap
+      if (showRefs && block.links && block.links.length > 0) {
+        const keptJoined = kept.map(stripAnsi).join(' ')
+        const missingLinks = block.links
+          .filter((lnk) => lnk.ref && !keptJoined.includes(`[${lnk.ref}:`))
+          .map((lnk) => `[${lnk.ref}: ${clean(lnk.text || lnk.href || 'link').trim()}]`)
+        if (missingLinks.length > 0) {
+          kept.push(...wrapText(missingLinks.join(' '), innerWidth))
+        }
+      }
+      return kept
     }
 
     case 'link': {
@@ -677,11 +854,12 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
         const box = block.tag === 'radio' ? `(${mark})` : `[${mark}]`
         return [`${badge}${box} ${label}`]
       }
-      const fieldWidth = Math.max(4, Math.min(36, innerWidth - label.length - 10))
-      const displayVal = val ? truncateVisible(val, fieldWidth) : '_'.repeat(Math.min(16, fieldWidth))
+      const fieldWidth = Math.max(4, Math.min(profile.inputFieldMaxWidth, innerWidth - label.length - 10))
+      const padTarget = profile.name === 'compact' ? Math.min(8, fieldWidth) : Math.min(16, fieldWidth)
+      const displayVal = val ? truncateVisible(val, fieldWidth) : '_'.repeat(padTarget)
       const field = color
-        ? `${ANSI.magenta}[${displayVal.padEnd(Math.min(16, fieldWidth), ' ')}]${ANSI.reset}`
-        : `[${displayVal.padEnd(Math.min(16, fieldWidth), ' ')}]`
+        ? `${ANSI.magenta}[${displayVal.padEnd(padTarget, ' ')}]${ANSI.reset}`
+        : `[${displayVal.padEnd(padTarget, ' ')}]`
       return [`${badge}${label}: ${field}`]
     }
 
@@ -704,9 +882,9 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
     }
 
     case 'code': {
-      const rawLines = clean(block.text).split('\n').slice(0, 12)
+      const rawLines = block.text.split(/\r?\n/).slice(0, profile.maxCodeLines)
       const border = asciiOnly ? '| ' : '│ '
-      return rawLines.map((l) => `${border}${truncateVisible(l, Math.max(8, innerWidth - 2))}`)
+      return rawLines.map((l) => `${border}${truncateVisible(clean(l), Math.max(8, innerWidth - 2))}`)
     }
 
     case 'table-row': {
@@ -721,7 +899,8 @@ function formatBlock(block: ContentBlock, innerWidth: number, asciiOnly: boolean
     }
 
     case 'hr': {
-      return [(asciiOnly ? '-' : '─').repeat(innerWidth)]
+      const ch = asciiOnly ? '-' : '─'
+      return [profile.compactHeadings ? ch.repeat(Math.min(innerWidth, 3)) : ch.repeat(innerWidth)]
     }
 
     default:
@@ -829,6 +1008,7 @@ export function renderSpatialBlocks(
   asciiOnly: boolean,
   color: boolean,
   showRefs: boolean,
+  profile: AsciiDensityProfile = DENSITY_PROFILES.normal,
 ): string[] | null {
   const { positioned, unpositioned } = resolvePositionedBlocks(snapshot)
   if (positioned.length === 0) return null
@@ -968,10 +1148,16 @@ export function renderSpatialBlocks(
 
     // Format without ANSI codes so character positions align 1:1 with grid columns
     const rawFormatted = item.formBlocks
-      ? renderAsciiForm(item.formBlocks, drawWidth, { asciiOnly, color: false, showRefs })
+      ? renderAsciiForm(item.formBlocks, drawWidth, {
+          asciiOnly,
+          color: false,
+          showRefs,
+          compact: profile.compactForms,
+          profile,
+        })
       : item.tableRows
-        ? renderAsciiTable(item.tableRows, drawWidth, { asciiOnly, color: false })
-        : formatBlock(item.block, drawWidth, asciiOnly, false, showRefs)
+        ? renderAsciiTable(item.tableRows, drawWidth, { asciiOnly, color: false, compact: profile.compactTables })
+        : formatBlock(item.block, drawWidth, asciiOnly, false, showRefs, profile)
     const formatted = rawFormatted
       .map((l) => {
         const plain = asciiOnly ? sanitizeAscii(stripAnsi(l)) : stripAnsi(l)
@@ -984,10 +1170,10 @@ export function renderSpatialBlocks(
     const rawRow = Math.max(0, Math.round((item.box.y - minY) / pxPerRow))
     let targetRow = Math.max(0, rawRow - yShift)
 
-    // Compress full-width blank gaps larger than 1 empty line
-    if (maxOccupiedRow >= 0 && targetRow > maxOccupiedRow + 2) {
-      yShift += targetRow - (maxOccupiedRow + 2)
-      targetRow = maxOccupiedRow + 2
+    // Compress full-width blank gaps larger than profile allows
+    if (maxOccupiedRow >= 0 && targetRow > maxOccupiedRow + profile.spatialMaxRowStep) {
+      yShift += targetRow - (maxOccupiedRow + profile.spatialMaxRowStep)
+      targetRow = maxOccupiedRow + profile.spatialMaxRowStep
     }
 
     // Resolve any vertical collision inside these columns
@@ -1047,8 +1233,8 @@ export function renderSpatialBlocks(
 
   // Append any unpositioned blocks below the spatial canvas
   if (unpositioned.length > 0) {
-    if (resultLines.length > 0) resultLines.push('')
-    resultLines.push(...renderFlowBlocks(unpositioned, innerWidth, asciiOnly, color, showRefs, false))
+    if (resultLines.length > 0 && profile.addSpacing) resultLines.push('')
+    resultLines.push(...renderFlowBlocks(unpositioned, innerWidth, asciiOnly, color, showRefs, false, profile))
   }
 
   return resultLines
@@ -1110,21 +1296,23 @@ export function computeScrollbarGutter(
 }
 
 export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
-  const width = Math.max(40, Math.min(240, options.width ?? 100))
-  const height = Math.max(14, Math.min(200, options.height ?? 36))
+  const profile = resolveDensityProfile(options.density)
+  const width = Math.max(40, Math.min(240, options.width ?? profile.defaultWidth))
+  const height = Math.max(14, Math.min(200, options.height ?? profile.defaultHeight))
   const asciiOnly = options.asciiOnly ?? true
   const color = asciiOnly ? false : (options.color ?? false)
   const showRefs = options.showRefs ?? true
-  const showChrome = options.showChrome ?? true
+  const showChrome = options.showChrome ?? profile.defaultShowChrome
+  const showCompactHeader = !showChrome && profile.name === 'compact' && options.showChrome === undefined
   const showScrollbar = options.showScrollbar ?? showChrome
   const scrollOffset = Math.max(0, options.scrollOffset ?? 0)
-  const requestedLayout: AsciiLayoutMode = options.layout ?? 'flow'
+  const requestedLayout: AsciiLayoutMode = options.layout ?? profile.defaultLayout
 
   const box = asciiOnly
     ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', ml: '+', mr: '+' }
     : { tl: '┌', tr: '┐', bl: '└', br: '┘', h: '─', v: '│', ml: '├', mr: '┤' }
 
-  const innerWidth = width - 4 // "| " + content + " |"
+  const innerWidth = showChrome ? width - 4 : showScrollbar ? width - 2 : width
   const topBorder = `${box.tl}${box.h.repeat(width - 2)}${box.tr}`
   const midBorder = `${box.ml}${box.h.repeat(width - 2)}${box.mr}`
   const botBorder = `${box.bl}${box.h.repeat(width - 2)}${box.br}`
@@ -1133,21 +1321,25 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
 
   // Render content blocks into lines first so header scroll% and right-edge scrollbar stay in sync
   const bodyLines: string[] = []
-  if (snapshot.title) {
+  if (snapshot.title && !showCompactHeader) {
     const t = asciiOnly ? sanitizeAscii(snapshot.title) : snapshot.title
-    bodyLines.push(color ? `${ANSI.bold}${t}${ANSI.reset}` : `TITLE: ${t}`)
-    bodyLines.push((asciiOnly ? '-' : '─').repeat(Math.min(innerWidth, Math.max(12, t.length + 7))))
+    if (profile.compactHeadings) {
+      bodyLines.push(color ? `${ANSI.bold}${t}${ANSI.reset}` : `TITLE: ${t}`)
+    } else {
+      bodyLines.push(color ? `${ANSI.bold}${t}${ANSI.reset}` : `TITLE: ${t}`)
+      bodyLines.push((asciiOnly ? '-' : '─').repeat(Math.min(innerWidth, Math.max(12, t.length + 7))))
+    }
   }
 
   const useSpatial =
     requestedLayout === 'spatial' || (requestedLayout === 'auto' && hasMultiColumnLayout(snapshot))
-  const spatialLines = useSpatial ? renderSpatialBlocks(snapshot, innerWidth, asciiOnly, color, showRefs) : null
+  const spatialLines = useSpatial ? renderSpatialBlocks(snapshot, innerWidth, asciiOnly, color, showRefs, profile) : null
   const activeLayout: 'spatial' | 'flow' = spatialLines ? 'spatial' : 'flow'
 
   if (spatialLines) {
     bodyLines.push(...spatialLines)
   } else {
-    bodyLines.push(...renderFlowBlocks(snapshot.blocks, innerWidth, asciiOnly, color, showRefs, true))
+    bodyLines.push(...renderFlowBlocks(snapshot.blocks, innerWidth, asciiOnly, color, showRefs, profile.addSpacing, profile))
   }
 
   // Append interactive refs index if page had elements not already emitted in blocks
@@ -1162,11 +1354,16 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   }
   const orphanElements = snapshot.elements.filter((el) => el.ref && !emittedRefs.has(el.ref))
   if (showRefs && orphanElements.length > 0) {
-    bodyLines.push((asciiOnly ? '-' : '─').repeat(innerWidth))
-    bodyLines.push('INTERACTIVE REFS:')
-    for (const el of orphanElements.slice(0, 40)) {
+    if (!profile.compactHeadings) {
+      bodyLines.push((asciiOnly ? '-' : '─').repeat(innerWidth))
+    }
+    bodyLines.push(profile.compactHeadings ? 'REFS:' : 'INTERACTIVE REFS:')
+    for (const el of orphanElements.slice(0, profile.maxOrphanRefs)) {
       const desc = el.text || el.label || el.ariaLabel || el.placeholder || el.name || el.tag
-      bodyLines.push(`  [${el.ref}] (${el.tag}${el.type ? `:${el.type}` : ''}) ${truncateVisible(desc, innerWidth - 22)}`)
+      const prefix = profile.compactHeadings ? '' : '  '
+      bodyLines.push(
+        `${prefix}[${el.ref}] (${el.tag}${el.type ? `:${el.type}` : ''}) ${truncateVisible(desc, Math.max(12, innerWidth - 22))}`,
+      )
     }
   }
 
@@ -1174,7 +1371,7 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
     bodyLines.push('(empty page)')
   }
 
-  const chromeOverhead = showChrome ? 6 : 0
+  const chromeOverhead = showChrome ? 6 : showCompactHeader ? 1 : 0
   const viewportRows = Math.max(6, height - chromeOverhead)
   const maxOffset = Math.max(0, bodyLines.length - viewportRows)
   const start = Math.min(scrollOffset, maxOffset)
@@ -1195,6 +1392,7 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
       : computeScrollbarGutter(viewportRows, bodyLines.length, viewportRows, 0, { asciiOnly, color })
 
   const output: string[] = []
+  const refCount = snapshot.elements.filter((e) => e.ref).length
 
   if (showChrome) {
     output.push(topBorder)
@@ -1226,15 +1424,31 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
     const spacer = Math.max(1, innerWidth - visibleLength(urlLine) - posTag.length)
     output.push(frameLine(`${truncateVisible(urlLine, innerWidth - posTag.length - 1)}${' '.repeat(spacer)}${posTag}`))
     output.push(midBorder)
+  } else if (showCompactHeader) {
+    const cleanTitle = snapshot.title ? (asciiOnly ? sanitizeAscii(snapshot.title) : snapshot.title).trim() : ''
+    const cleanUrl = asciiOnly ? sanitizeAscii(snapshot.url || 'about:blank') : snapshot.url || 'about:blank'
+    const parts = [
+      cleanTitle ? truncateVisible(cleanTitle, 28) : undefined,
+      truncateVisible(cleanUrl, 40),
+      `refs:${refCount}`,
+      scrollbar.scrollable ? `${scrollbar.percent}%` : undefined,
+    ].filter((p): p is string => Boolean(p))
+    output.push(truncateVisible(`[compact] ${parts.join(' | ')}`, innerWidth))
   }
 
-  for (let i = 0; i < viewportRows; i++) {
+  const trimUnframedCompact = !showChrome && !showScrollbar && profile.name === 'compact'
+  const rowCount = trimUnframedCompact ? visible.length : viewportRows
+  for (let i = 0; i < rowCount; i++) {
     const line = visible[i] ?? ''
     const gutterChar = showScrollbar ? (scrollbar.chars[i] ?? box.v) : box.v
     if (showChrome) {
       output.push(frameLine(line, gutterChar))
     } else if (showScrollbar) {
       output.push(`${padLine(line, innerWidth, asciiOnly)} ${gutterChar}`)
+    } else if (trimUnframedCompact) {
+      const cleaned = asciiOnly ? sanitizeAscii(stripAnsi(line)) : line
+      const trimmed = visibleLength(cleaned) > innerWidth ? truncateVisible(stripAnsi(cleaned), innerWidth) : cleaned
+      output.push(trimmed.replace(/\s+$/, ''))
     } else {
       output.push(padLine(line, innerWidth, asciiOnly))
     }
@@ -1242,12 +1456,12 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
 
   if (showChrome) {
     output.push(midBorder)
-    const refCount = snapshot.elements.filter((e) => e.ref).length
     const lineRange = `lines ${start + 1}-${Math.min(bodyLines.length, start + viewportRows)}/${bodyLines.length}`
     const layoutTag = activeLayout === 'spatial' ? ' | layout:2d' : ''
+    const densityTag = profile.name !== 'normal' ? ` | density:${profile.name}` : ''
     const status = options.statusMessage
-      ? `${options.statusMessage} | refs:${refCount}${layoutTag} | ${lineRange}`
-      : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag} | ${lineRange} | cmds: open click fill find scroll`
+      ? `${options.statusMessage} | refs:${refCount}${layoutTag}${densityTag} | ${lineRange}`
+      : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag}${densityTag} | ${lineRange} | cmds: open click fill find scroll`
     output.push(frameLine(status))
     output.push(botBorder)
   }

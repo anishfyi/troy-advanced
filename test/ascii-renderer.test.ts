@@ -4,10 +4,12 @@ import {
   computeScrollbarGutter,
   hasMultiColumnLayout,
   humanizeFormName,
+  parseAsciiDensity,
   renderAsciiForm,
   renderAsciiTable,
   renderPageAscii,
   renderSpatialBlocks,
+  resolveDensityProfile,
   sanitizeAscii,
   wrapInlineParagraph,
 } from '../src/ascii/layout.js'
@@ -617,5 +619,114 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     const heroAndFormRow = spatialAscii.split('\n').find((l) => l.includes('Welcome Back') && l.includes('+-- Form: Login'))
     expect(heroAndFormRow).toBeDefined()
     expect(heroAndFormRow!.indexOf('Welcome Back')).toBeLessThan(heroAndFormRow!.indexOf('+-- Form: Login'))
+  })
+
+  it('supports compact, normal, and wide ASCII density profiles for LLM token budgets', () => {
+    expect(parseAsciiDensity('compact')).toBe('compact')
+    expect(parseAsciiDensity('normal')).toBe('normal')
+    expect(parseAsciiDensity('wide')).toBe('wide')
+    expect(parseAsciiDensity('huge')).toBeUndefined()
+    expect(resolveDensityProfile('compact').defaultWidth).toBe(80)
+    expect(resolveDensityProfile('normal').defaultWidth).toBe(100)
+    expect(resolveDensityProfile('wide').defaultWidth).toBe(140)
+
+    const richSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://ops.example.com/cluster',
+      title: 'Cluster Ops',
+      epoch: 3,
+      viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+      blocks: [
+        { kind: 'heading', level: 1, text: 'Cluster Control' },
+        {
+          kind: 'paragraph',
+          text:
+            'This long operational overview explains multi-region failover across availability zones, ' +
+            'automated health checks, zero-downtime rolling restarts, and detailed audit trails. ' +
+            'See the Runbook and Escalation Policy for emergency procedures.',
+          links: [
+            { text: 'Runbook', ref: 'e1', href: 'https://ops.example.com/runbook' },
+            { text: 'Escalation Policy', ref: 'e2', href: 'https://ops.example.com/escalation' },
+          ],
+        },
+        { kind: 'table-row', isHeader: true, text: 'Node | State', cells: ['Node', 'State'] },
+        { kind: 'table-row', text: 'ec2-1 | healthy', cells: ['ec2-1', 'healthy'] },
+        { kind: 'input', text: 'Filter', value: 'prod', ref: 'e3', formId: 'form-1', formTitle: 'Filter Nodes' },
+        { kind: 'button', text: 'Apply', ref: 'e4', formId: 'form-1', formTitle: 'Filter Nodes' },
+        { kind: 'code', text: 'line1\nline2\nline3\nline4\nline5\nline6\nline7' },
+      ],
+      elements: [
+        { ref: 'e1', selector: 'a.rb', tag: 'a', type: 'link', text: 'Runbook' },
+        { ref: 'e2', selector: 'a.ep', tag: 'a', type: 'link', text: 'Escalation Policy' },
+        { ref: 'e3', selector: '#flt', tag: 'input', type: 'text', text: 'Filter', value: 'prod' },
+        { ref: 'e4', selector: '#go', tag: 'button', type: 'submit', text: 'Apply' },
+      ],
+      text: 'Cluster Control',
+      capturedAt: Date.now(),
+    }
+
+    const compactOut = renderPageAscii(richSnap, { density: 'compact', asciiOnly: true })
+    const normalOut = renderPageAscii(richSnap, { density: 'normal', asciiOnly: true })
+    const defaultOut = renderPageAscii(richSnap, { asciiOnly: true })
+    const wideOut = renderPageAscii(richSnap, { density: 'wide', asciiOnly: true })
+
+    // Normal is 100% identical to default
+    expect(normalOut).toBe(defaultOut)
+
+    // Compact is strict 7-bit ASCII, drastically smaller for small LLM token budgets
+    expect(/^[\x20-\x7e\n]+$/.test(compactOut)).toBe(true)
+    expect(compactOut.length).toBeLessThan(normalOut.length * 0.4)
+    expect(compactOut).toContain('[compact]')
+    expect(compactOut).not.toContain('TROY-ADV')
+    expect(compactOut).toContain('# Cluster Control')
+    expect(compactOut).not.toContain('================')
+    expect(compactOut).toContain('Node | State')
+    expect(compactOut).not.toContain('+=======+')
+    expect(compactOut).toContain('[Form: Filter Nodes]')
+    expect(compactOut).not.toContain('+-- Form: Filter Nodes')
+    // Code block truncated to 4 lines in compact mode
+    expect(compactOut).toContain('| line4')
+    expect(compactOut).not.toContain('| line5')
+    // All interactive refs preserved even when long paragraph is collapsed
+    expect(compactOut).toContain('[e1: Runbook]')
+    expect(compactOut).toContain('[e2: Escalation Policy]')
+    expect(compactOut).toContain('[e3]')
+    expect(compactOut).toContain('[e4]')
+    // No trailing spaces on any line in unframed compact mode
+    for (const line of compactOut.split('\n')) {
+      expect(line).toBe(line.replace(/\s+$/, ''))
+    }
+
+    // Explicit showChrome: true with compact density keeps frame + density:compact status tag
+    const framedCompact = renderPageAscii(richSnap, { density: 'compact', showChrome: true, asciiOnly: true })
+    expect(framedCompact).toContain('TROY-ADV')
+    expect(framedCompact).toContain('density:compact')
+    expect(framedCompact).toContain('[Form: Filter Nodes]')
+
+    // Wide density uses 140-col frame, taller viewport than normal, and density:wide status tag
+    const wideLines = wideOut.split('\n')
+    expect(wideLines[0]!.length).toBe(140)
+    expect(wideLines.length).toBeGreaterThan(normalOut.split('\n').length)
+    expect(wideOut).toContain('density:wide')
+    expect(wideOut).toContain('| line7')
+
+    // Wide density auto-enables 2D spatial layout on multi-column pages
+    const multiColSnap: PageSnapshot = {
+      tabId: 1,
+      url: 'https://ops.example.com/grid',
+      title: 'Grid',
+      epoch: 1,
+      viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+      blocks: [
+        { kind: 'link', text: 'Nav', ref: 'e1', box: { x: 10, y: 20, width: 200, height: 30 } },
+        { kind: 'heading', level: 2, text: 'Main Pane', box: { x: 300, y: 20, width: 600, height: 30 } },
+      ],
+      elements: [{ ref: 'e1', selector: 'a.nav', tag: 'a', type: 'link', text: 'Nav', box: { x: 10, y: 20, width: 200, height: 30 } }],
+      text: 'Nav Main Pane',
+      capturedAt: Date.now(),
+    }
+    const wideAuto = renderPageAscii(multiColSnap, { density: 'wide', asciiOnly: true })
+    expect(wideAuto).toContain('layout:2d')
+    expect(wideAuto).toContain('density:wide')
   })
 })

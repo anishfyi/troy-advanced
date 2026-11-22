@@ -73,8 +73,21 @@ export async function executePipeCommand(
     }
     case 'ascii':
     case 'render': {
-      const width = rest[0] ? Number(rest[0]) : 100
-      const res = await manager.runTool(undefined, 'page_read_ascii', { width: Number.isFinite(width) ? width : 100, asciiOnly: true })
+      let width: number | undefined
+      let density: string | undefined
+      for (let i = 0; i < rest.length; i++) {
+        const tok = rest[i]!
+        if (tok === '--density' && rest[i + 1]) {
+          density = rest[++i]
+        } else if (tok.startsWith('--density=')) {
+          density = tok.slice('--density='.length)
+        } else if (tok === 'compact' || tok === 'normal' || tok === 'wide') {
+          density = tok
+        } else if (/^\d+$/.test(tok)) {
+          width = Number(tok)
+        }
+      }
+      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, asciiOnly: true })
       return { output: format(res) }
     }
     case 'visual': {

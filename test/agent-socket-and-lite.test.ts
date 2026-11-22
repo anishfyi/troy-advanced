@@ -235,4 +235,44 @@ describe('Lite engine + Agent Socket + MCP + Pipe REPL integration', () => {
     expect(ascii).toContain('Email:')
     expect(ascii).toContain('< Join >')
   })
+
+  it('supports compact, normal, and wide density across Agent Socket, MCP, and Pipe REPL', async () => {
+    const opened = await api('/open', { url: `${baseUrl}/forms`, activate: true })
+    expect(opened.data.ok).toBe(true)
+    const tabId = Number(opened.data.id)
+
+    const compactRes = await api('/ascii', { tabId, density: 'compact' })
+    const normalRes = await api('/ascii', { tabId, density: 'normal' })
+    const wideRes = await api('/ascii', { tabId, density: 'wide' })
+    expect(compactRes.data.ok).toBe(true)
+    expect(normalRes.data.ok).toBe(true)
+    expect(wideRes.data.ok).toBe(true)
+
+    const compactAscii = String(compactRes.data.ascii)
+    const normalAscii = String(normalRes.data.ascii)
+    const wideAscii = String(wideRes.data.ascii)
+
+    expect(compactAscii).toContain('[compact]')
+    expect(compactAscii).toContain('[Form: Login]')
+    expect(compactAscii.length).toBeLessThan(normalAscii.length * 0.5)
+    expect(wideAscii.split('\n')[0]!.length).toBe(140)
+    expect(wideAscii).toContain('density:wide')
+
+    const mcpCompact = await handleMcpRequest(manager, {
+      jsonrpc: '2.0',
+      id: 99,
+      method: 'tools/call',
+      params: { name: 'troy_read_ascii', arguments: { tabId, density: 'compact' } },
+    })
+    const mcpText = ((mcpCompact?.result as { content: Array<{ text: string }> }).content[0]?.text) ?? ''
+    expect(mcpText).toContain('[compact]')
+    expect(mcpText).toContain('[Form: Login]')
+
+    const pipeCompact = await executePipeCommand(manager, 'ascii compact')
+    expect(pipeCompact.output).toContain('[compact]')
+    const pipeJsonCompact = await executePipeCommand(manager, '{"cmd":"read_ascii","density":"compact"}')
+    const parsed = JSON.parse(pipeJsonCompact.output) as { ok: boolean; ascii: string }
+    expect(parsed.ok).toBe(true)
+    expect(parsed.ascii).toContain('[compact]')
+  })
 })

@@ -29,7 +29,8 @@ Client Commands (talk to running daemon, or use --oneshot):
   status                                  Daemon health + memory stats
   tabs                                    List open tabs
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
-  ascii [--width N] [--height N]          Render tab as strict 7-bit ASCII viewport with [eN] refs
+  ascii [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto]
+                                          Render tab as strict 7-bit ASCII viewport with [eN] refs
   visual [--mode ascii|braille|halfblock] [--annotate]   Render Chromium PNG screenshot as ASCII
   read [--since] [--visual] [--json]      Read page structure or delta
   find <query>                            Find interactive elements as eN refs
@@ -59,6 +60,8 @@ const VALUE_FLAGS = new Set([
   '--url',
   '--width',
   '--height',
+  '--layout',
+  '--density',
   '--mode',
   '--ref',
   '--amount',
@@ -242,9 +245,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       }
       const toolName = cmd === 'visual' ? 'page_screenshot_ascii' : 'page_read_ascii'
       const res = await manager.runTool(opened.id, toolName, {
-        width: flags.width ? Number(flags.width) : cmd === 'visual' ? 80 : 100,
-        height: flags.height ? Number(flags.height) : 36,
+        width: flags.width ? Number(flags.width) : cmd === 'visual' ? 80 : undefined,
+        height: flags.height ? Number(flags.height) : undefined,
         layout: typeof flags.layout === 'string' ? flags.layout : undefined,
+        density: typeof flags.density === 'string' ? flags.density : undefined,
         mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
         annotate: Boolean(flags.annotate),
       })
@@ -289,9 +293,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       if (res.ok && flags.ascii) {
         res = await callDaemon(live.endpoint, '/ascii', {
           tabId: res.id,
-          width: flags.width ? Number(flags.width) : 100,
-          height: flags.height ? Number(flags.height) : 36,
+          width: flags.width ? Number(flags.width) : undefined,
+          height: flags.height ? Number(flags.height) : undefined,
           layout: typeof flags.layout === 'string' ? flags.layout : undefined,
+          density: typeof flags.density === 'string' ? flags.density : undefined,
         })
       }
       break
@@ -307,9 +312,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'ascii':
       res = await callDaemon(live.endpoint, '/ascii', {
         tabId,
-        width: flags.width ? Number(flags.width) : 100,
-        height: flags.height ? Number(flags.height) : 36,
+        width: flags.width ? Number(flags.width) : undefined,
+        height: flags.height ? Number(flags.height) : undefined,
         layout: typeof flags.layout === 'string' ? flags.layout : undefined,
+        density: typeof flags.density === 'string' ? flags.density : undefined,
         asciiOnly: true,
       })
       break
@@ -330,8 +336,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         name: flags.visual ? 'page_read_visual' : flags.ascii ? 'page_read_ascii' : 'page_read',
         args: {
           since: Boolean(flags.since),
-          width: flags.width ? Number(flags.width) : 100,
+          width: flags.width ? Number(flags.width) : undefined,
+          height: flags.height ? Number(flags.height) : undefined,
           layout: typeof flags.layout === 'string' ? flags.layout : undefined,
+          density: typeof flags.density === 'string' ? flags.density : undefined,
         },
       })
       break

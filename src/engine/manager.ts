@@ -10,7 +10,7 @@ import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { computePageDelta } from '../agent/delta.js'
-import { renderCompactRefsAscii, renderPageAscii } from '../ascii/layout.js'
+import { parseAsciiDensity, renderCompactRefsAscii, renderPageAscii } from '../ascii/layout.js'
 import { renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { LiteBrowserEngine } from './lite.js'
@@ -281,13 +281,15 @@ export class BrowserManager {
 
         const layoutOpt =
           args.layout === 'spatial' || args.layout === 'auto' || args.layout === 'flow' ? args.layout : undefined
+        const densityOpt = parseAsciiDensity(args.density)
         const ascii = renderPageAscii(snap, {
-          width: typeof args.width === 'number' ? args.width : 100,
-          height: typeof args.height === 'number' ? args.height : 36,
+          width: typeof args.width === 'number' ? args.width : undefined,
+          height: typeof args.height === 'number' ? args.height : undefined,
           asciiOnly: args.asciiOnly !== false,
           color: Boolean(args.color),
-          showChrome: args.showChrome !== false,
+          showChrome: typeof args.showChrome === 'boolean' ? args.showChrome : undefined,
           layout: layoutOpt,
+          density: densityOpt,
           tabs: this.listTabs(),
           activeTabId: this.activeTabId ?? snap.tabId,
         })

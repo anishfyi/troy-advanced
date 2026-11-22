@@ -4,6 +4,7 @@
 
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
+import { parseAsciiDensity } from '../ascii/layout.js'
 import type { BrowserManager } from '../engine/manager.js'
 
 const MAX_BODY = 128 * 1024
@@ -74,13 +75,16 @@ export async function createAgentSocket(
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
         const layoutOpt =
           body.layout === 'spatial' || body.layout === 'auto' || body.layout === 'flow' ? body.layout : undefined
+        const densityOpt = parseAsciiDensity(body.density)
         const res = await manager.renderAscii(tabId, {
-          width: typeof body.width === 'number' ? body.width : 100,
-          height: typeof body.height === 'number' ? body.height : 36,
+          width: typeof body.width === 'number' ? body.width : undefined,
+          height: typeof body.height === 'number' ? body.height : undefined,
           asciiOnly: body.asciiOnly !== false,
           color: Boolean(body.color),
+          showChrome: typeof body.showChrome === 'boolean' ? body.showChrome : undefined,
           scrollOffset: typeof body.scrollOffset === 'number' ? body.scrollOffset : 0,
           layout: layoutOpt,
+          density: densityOpt,
         })
         return {
           status: 200,
