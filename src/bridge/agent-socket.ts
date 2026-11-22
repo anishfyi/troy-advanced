@@ -85,6 +85,8 @@ export async function createAgentSocket(
           scrollOffset: typeof body.scrollOffset === 'number' ? body.scrollOffset : 0,
           layout: layoutOpt,
           density: densityOpt,
+          crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
+          ref: typeof body.ref === 'string' ? body.ref : undefined,
           since: Boolean(body.since),
         })
         return {
@@ -97,6 +99,8 @@ export async function createAgentSocket(
                 url: res.snapshot?.url,
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
+                ...(res.crop ? { crop: res.crop } : {}),
+                ...(res.cropRef ? { cropRef: res.cropRef } : {}),
                 ...(res.delta ? { delta: res.delta } : {}),
               }
             : { ok: false, error: res.error },

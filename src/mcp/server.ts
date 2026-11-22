@@ -31,20 +31,26 @@ const MCP_TOOLS = [
         height: { type: 'number', description: 'Viewport row height (default depends on density: 28 compact / 36 normal / 48 wide)' },
         layout: { type: 'string', enum: ['flow', 'spatial', 'auto'], description: 'Layout mode: flow (linear), spatial (2D box coordinates), or auto' },
         density: { type: 'string', enum: ['compact', 'normal', 'wide'], description: 'Density profile: compact (small LLM token budgets), normal (default), or wide (140-col)' },
+        crop: { type: 'string', description: 'Region crop in viewport pixels: "x,y,w,h"' },
+        ref: { type: 'string', description: 'Element ref (e.g. "e5") whose bounding box to zoom into' },
         since: { type: 'boolean', description: 'Return only structural delta since previous read' },
       },
     },
   },
   {
     name: 'troy_screenshot_ascii',
-    description: 'Capture a Chromium screenshot and render it as ASCII, Sobel edge wireframe, Braille, or halfblock art with optional [eN] overlays for text-only AIs.',
+    description: 'Capture a Chromium screenshot and render it as ASCII, Sobel edge wireframe, Braille, or halfblock art with optional [eN] overlays and region crop for text-only AIs.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'number' },
         width: { type: 'number' },
+        height: { type: 'number' },
         mode: { type: 'string', enum: ['ascii', 'edge', 'braille', 'halfblock'] },
         edgeThreshold: { type: 'number', description: 'Sobel edge magnitude threshold (0..1, default 0.18) for mode=edge' },
+        crop: { type: 'string', description: 'Region crop in viewport pixels: "x,y,w,h"' },
+        ref: { type: 'string', description: 'Element ref (e.g. "e5") whose bounding box to crop/zoom into' },
+        overlayStyle: { type: 'string', enum: ['box', 'badge'] },
         annotate: { type: 'boolean' },
       },
     },
@@ -155,6 +161,8 @@ export async function handleMcpRequest(
           height: args.height,
           layout: args.layout,
           density: args.density,
+          crop: args.crop,
+          ref: args.ref,
           since: args.since,
           asciiOnly: true,
         })
@@ -162,7 +170,12 @@ export async function handleMcpRequest(
       case 'troy_screenshot_ascii':
         result = await manager.runTool(tabId, 'page_screenshot_ascii', {
           width: args.width,
+          height: args.height,
           mode: args.mode,
+          edgeThreshold: args.edgeThreshold,
+          crop: args.crop,
+          ref: args.ref,
+          overlayStyle: args.overlayStyle,
           annotate: args.annotate,
         })
         break

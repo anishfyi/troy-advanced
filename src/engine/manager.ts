@@ -4,14 +4,14 @@
 
 import path from 'node:path'
 import os from 'node:os'
-import type { ActStep, AsciiRenderOptions, EngineKind, PageSnapshot, PixelAsciiOptions, TabSummary } from '../types.js'
+import type { ActStep, AsciiRenderOptions, EngineKind, PageSnapshot, PixelAsciiOptions, Rect, TabSummary } from '../types.js'
 import { ElementRegistry } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
 import { parseAsciiDensity, renderCompactRefsAscii, renderDeltaAscii, renderPageAscii } from '../ascii/layout.js'
-import { renderPngToAscii } from '../ascii/pixels.js'
+import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { LiteBrowserEngine } from './lite.js'
 import type { BrowserEngine, TabDriver } from './types.js'
@@ -247,12 +247,49 @@ export class BrowserManager {
     return indexed
   }
 
+  private resolveCropArgs(
+    session: TabSession,
+    args: { crop?: unknown; ref?: unknown },
+  ): { crop?: Rect; cropRef?: string } | { error: string } {
+    if (args.crop !== undefined && args.crop !== null && args.crop !== '' && args.crop !== false) {
+      const parsed = parseCropRect(args.crop)
+      if (!parsed) {
+        return {
+          error: 'invalid crop region; expected "x,y,w,h" or {x,y,width,height} with non-negative x,y and positive width,height',
+        }
+      }
+      return { crop: parsed }
+    }
+    if (args.ref !== undefined && args.ref !== null && args.ref !== '') {
+      const ctx = { tabId: session.driver.id, url: session.driver.getUrl(), epoch: session.driver.getEpoch() }
+      const resolved = session.elements.resolve(args.ref, ctx)
+      if ('error' in resolved) return { error: resolved.error }
+      const box = resolved.item.box
+      if (!box || box.width <= 0 || box.height <= 0) {
+        return { error: `element ${String(args.ref).trim()} has no bounding box to crop` }
+      }
+      return { crop: { ...box }, cropRef: String(args.ref).trim() }
+    }
+    return {}
+  }
+
   async renderAscii(
     tabId?: number,
-    opts: AsciiRenderOptions & { since?: boolean } = {},
-  ): Promise<{ ok: boolean; ascii?: string; snapshot?: PageSnapshot; delta?: PageDelta; mode?: 'full' | 'delta'; error?: string }> {
+    opts: Omit<AsciiRenderOptions, 'crop'> & { since?: boolean; crop?: Rect | string; ref?: string } = {},
+  ): Promise<{
+    ok: boolean
+    ascii?: string
+    snapshot?: PageSnapshot
+    delta?: PageDelta
+    crop?: Rect
+    cropRef?: string
+    mode?: 'full' | 'delta'
+    error?: string
+  }> {
     const session = this.resolveSession(tabId)
     if (!session) return { ok: false, error: 'no open tab' }
+    const cropRes = this.resolveCropArgs(session, { crop: opts.crop, ref: opts.ref })
+    if ('error' in cropRes) return { ok: false, error: cropRes.error }
     const prev = session.lastSnapshot
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
@@ -267,12 +304,22 @@ export class BrowserManager {
       })
       return { ok: true, mode: 'delta', ascii, snapshot: snap, delta }
     }
+    const { crop: _rawCrop, ref: _rawRef, since: _since, ...renderOpts } = opts
     const ascii = renderPageAscii(snap, {
-      ...opts,
+      ...renderOpts,
+      crop: cropRes.crop,
+      cropLabel: cropRes.cropRef ?? opts.cropLabel,
       tabs: this.listTabs(),
       activeTabId: this.activeTabId ?? snap.tabId,
     })
-    return { ok: true, mode: 'full', ascii, snapshot: snap }
+    return {
+      ok: true,
+      mode: 'full',
+      ascii,
+      snapshot: snap,
+      ...(cropRes.crop ? { crop: cropRes.crop } : {}),
+      ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
+    }
   }
 
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -285,6 +332,9 @@ export class BrowserManager {
       case 'page_read':
       case 'page_read_visual':
       case 'page_read_ascii': {
+        const cropRes = this.resolveCropArgs(session, { crop: args.crop, ref: args.ref })
+        if ('error' in cropRes) return { ok: false, error: cropRes.error }
+
         const prev = session.lastSnapshot
         const snap = await this.takeIndexedSnapshot(session)
         session.lastSnapshot = snap
@@ -318,6 +368,8 @@ export class BrowserManager {
           showChrome: typeof args.showChrome === 'boolean' ? args.showChrome : undefined,
           layout: layoutOpt,
           density: densityOpt,
+          crop: cropRes.crop,
+          cropLabel: cropRes.cropRef,
           tabs: this.listTabs(),
           activeTabId: this.activeTabId ?? snap.tabId,
         })
@@ -334,6 +386,7 @@ export class BrowserManager {
               width: typeof args.width === 'number' ? args.width : 80,
               mode: (args.pixelMode as PixelAsciiOptions['mode']) || 'ascii',
               edgeThreshold: typeof args.edgeThreshold === 'number' ? args.edgeThreshold : undefined,
+              crop: cropRes.crop,
               overlays,
               overlayStyle:
                 args.overlayStyle === 'badge' || args.overlayStyle === 'box' ? args.overlayStyle : undefined,
@@ -354,6 +407,8 @@ export class BrowserManager {
           ascii,
           compactRefs: renderCompactRefsAscii(snap),
           ...(pixelAscii ? { pixelAscii } : {}),
+          ...(cropRes.crop ? { crop: cropRes.crop } : {}),
+          ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
           content: name === 'page_read_ascii' ? ascii : snap.text,
         })
       }
@@ -519,6 +574,9 @@ export class BrowserManager {
 
       case 'page_screenshot':
       case 'page_screenshot_ascii': {
+        const cropRes = this.resolveCropArgs(session, { crop: args.crop, ref: args.ref })
+        if ('error' in cropRes) return { ok: false, error: cropRes.error }
+
         const png = await session.driver.screenshot({ fullPage: Boolean(args.fullPage) })
         if (!png) {
           return {
@@ -539,12 +597,19 @@ export class BrowserManager {
             height: typeof args.height === 'number' ? args.height : undefined,
             mode: (args.mode as PixelAsciiOptions['mode']) || 'ascii',
             edgeThreshold: typeof args.edgeThreshold === 'number' ? args.edgeThreshold : undefined,
+            crop: cropRes.crop,
             overlays,
             overlayStyle:
               args.overlayStyle === 'badge' || args.overlayStyle === 'box' ? args.overlayStyle : undefined,
             viewport: snap.viewport,
           })
-          return { ok: true, ascii, bytes: png.length }
+          return {
+            ok: true,
+            ascii,
+            bytes: png.length,
+            ...(cropRes.crop ? { crop: cropRes.crop } : {}),
+            ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
+          }
         }
         return { ok: true, mimeType: 'image/png', dataBase64: png.toString('base64'), bytes: png.length }
       }

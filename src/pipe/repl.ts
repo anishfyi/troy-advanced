@@ -75,6 +75,8 @@ export async function executePipeCommand(
     case 'render': {
       let width: number | undefined
       let density: string | undefined
+      let crop: string | undefined
+      let ref: string | undefined
       let since = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
@@ -84,19 +86,51 @@ export async function executePipeCommand(
           density = rest[++i]
         } else if (tok.startsWith('--density=')) {
           density = tok.slice('--density='.length)
+        } else if (tok === '--crop' && rest[i + 1]) {
+          crop = rest[++i]
+        } else if (tok.startsWith('--crop=')) {
+          crop = tok.slice('--crop='.length)
+        } else if (tok === '--ref' && rest[i + 1]) {
+          ref = rest[++i]
+        } else if (tok.startsWith('--ref=')) {
+          ref = tok.slice('--ref='.length)
         } else if (tok === 'compact' || tok === 'normal' || tok === 'wide') {
           density = tok
         } else if (/^\d+$/.test(tok)) {
           width = Number(tok)
         }
       }
-      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, since, asciiOnly: true })
+      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, crop, ref, since, asciiOnly: true })
       return { output: format(res) }
     }
     case 'visual': {
-      const width = rest[0] ? Number(rest[0]) : 80
+      let width = 80
+      let mode: string | undefined
+      let crop: string | undefined
+      let ref: string | undefined
+      for (let i = 0; i < rest.length; i++) {
+        const tok = rest[i]!
+        if (tok === '--crop' && rest[i + 1]) {
+          crop = rest[++i]
+        } else if (tok.startsWith('--crop=')) {
+          crop = tok.slice('--crop='.length)
+        } else if (tok === '--ref' && rest[i + 1]) {
+          ref = rest[++i]
+        } else if (tok.startsWith('--ref=')) {
+          ref = tok.slice('--ref='.length)
+        } else if (tok === '--mode' && rest[i + 1]) {
+          mode = rest[++i]
+        } else if (tok.startsWith('--mode=')) {
+          mode = tok.slice('--mode='.length)
+        } else if (/^\d+$/.test(tok)) {
+          width = Number(tok)
+        }
+      }
       const res = await manager.runTool(undefined, 'page_screenshot_ascii', {
         width: Number.isFinite(width) ? width : 80,
+        mode,
+        crop,
+        ref,
         annotate: true,
       })
       return { output: format(res) }

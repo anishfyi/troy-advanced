@@ -117,6 +117,8 @@ export interface AsciiRenderOptions {
   scrollOffset?: number
   layout?: AsciiLayoutMode
   density?: AsciiDensity
+  crop?: Rect
+  cropLabel?: string
   tabs?: TabSummary[]
   activeTabId?: number
   statusMessage?: string
@@ -128,6 +130,7 @@ export interface PixelAsciiOptions {
   mode?: 'ascii' | 'edge' | 'braille' | 'halfblock'
   invert?: boolean
   edgeThreshold?: number
+  crop?: Rect
   overlays?: Array<{ ref: string; box: Rect }>
   overlayStyle?: 'box' | 'badge'
   viewport?: { width: number; height: number }

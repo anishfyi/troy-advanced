@@ -2,11 +2,81 @@
 // with optional Set-of-Marks [eN] overlay stamped onto the ASCII canvas.
 // Allows text-only AI models and SSH terminals to "see" screenshots & canvases.
 
-import type { PixelAsciiOptions } from '../types.js'
+import type { PixelAsciiOptions, Rect } from '../types.js'
 import { decodePng, type DecodedPng } from './png-decoder.js'
 
 const LUMINANCE_RAMP = ' .:-=+*#%@'
 const DEFAULT_EDGE_THRESHOLD = 0.18
+
+/**
+ * Parse a crop region from either a "x,y,w,h" string or a Rect-like object
+ * ({ x, y, width, height } or { x, y, w, h }). Returns undefined if invalid.
+ */
+export function parseCropRect(input: unknown): Rect | undefined {
+  if (input === undefined || input === null || input === '') return undefined
+
+  if (typeof input === 'string') {
+    const parts = input.split(',')
+    if (parts.length !== 4) return undefined
+    const nums = parts.map((p) => {
+      const trimmed = p.trim()
+      if (!trimmed) return Number.NaN
+      return Number(trimmed)
+    })
+    const [x, y, width, height] = nums as [number, number, number, number]
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) {
+      return undefined
+    }
+    if (x < 0 || y < 0 || width <= 0 || height <= 0) return undefined
+    return { x, y, width, height }
+  }
+
+  if (typeof input === 'object') {
+    const obj = input as Record<string, unknown>
+    const x = Number(obj.x)
+    const y = Number(obj.y)
+    const width = Number(obj.width ?? obj.w)
+    const height = Number(obj.height ?? obj.h)
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) {
+      return undefined
+    }
+    if (x < 0 || y < 0 || width <= 0 || height <= 0) return undefined
+    return { x, y, width, height }
+  }
+
+  return undefined
+}
+
+/**
+ * Crop a DecodedPng to the specified region. When `viewport` is supplied,
+ * `crop` is interpreted in viewport (CSS pixel) coordinates and scaled to
+ * the underlying PNG pixel dimensions (supporting HiDPI screenshots).
+ */
+export function cropRgba(
+  img: DecodedPng,
+  crop: Rect,
+  viewport?: { width: number; height: number },
+): DecodedPng {
+  const vpW = viewport && viewport.width > 0 ? viewport.width : img.width
+  const vpH = viewport && viewport.height > 0 ? viewport.height : img.height
+  const scaleX = img.width / vpW
+  const scaleY = img.height / vpH
+
+  const x0 = Math.max(0, Math.min(img.width - 1, Math.floor(crop.x * scaleX)))
+  const y0 = Math.max(0, Math.min(img.height - 1, Math.floor(crop.y * scaleY)))
+  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.ceil((crop.x + Math.max(1, crop.width)) * scaleX)))
+  const y1 = Math.max(y0 + 1, Math.min(img.height, Math.ceil((crop.y + Math.max(1, crop.height)) * scaleY)))
+
+  const outW = x1 - x0
+  const outH = y1 - y0
+  const rgba = new Uint8Array(outW * outH * 4)
+  for (let row = 0; row < outH; row++) {
+    const srcStart = ((y0 + row) * img.width + x0) * 4
+    const srcEnd = srcStart + outW * 4
+    rgba.set(img.rgba.subarray(srcStart, srcEnd), row * outW * 4)
+  }
+  return { width: outW, height: outH, rgba }
+}
 
 function sampleRgba(img: DecodedPng, x: number, y: number): [number, number, number, number] {
   const cx = Math.max(0, Math.min(img.width - 1, Math.floor(x)))
@@ -211,23 +281,57 @@ function frameAsciiGrid(grid: string[][], cols: number): string {
 }
 
 export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = {}): string {
-  const cols = Math.max(16, Math.min(200, options.width ?? 80))
-  const aspect = img.height / Math.max(1, img.width)
+  let activeImg = img
+  let activeOptions = options
+
+  if (options.crop && options.crop.width > 0 && options.crop.height > 0) {
+    const vpW = options.viewport && options.viewport.width > 0 ? options.viewport.width : img.width
+    const vpH = options.viewport && options.viewport.height > 0 ? options.viewport.height : img.height
+    const scaleX = img.width / vpW
+    const scaleY = img.height / vpH
+
+    const x0 = Math.max(0, Math.min(img.width - 1, Math.floor(options.crop.x * scaleX)))
+    const y0 = Math.max(0, Math.min(img.height - 1, Math.floor(options.crop.y * scaleY)))
+    activeImg = cropRgba(img, options.crop, options.viewport)
+
+    const actualX = x0 / scaleX
+    const actualY = y0 / scaleY
+    const actualW = activeImg.width / scaleX
+    const actualH = activeImg.height / scaleY
+
+    activeOptions = {
+      ...options,
+      crop: undefined,
+      viewport: { width: actualW, height: actualH },
+      overlays: options.overlays?.map((ov) => ({
+        ref: ov.ref,
+        box: {
+          x: ov.box.x - actualX,
+          y: ov.box.y - actualY,
+          width: ov.box.width,
+          height: ov.box.height,
+        },
+      })),
+    }
+  }
+
+  const cols = Math.max(16, Math.min(200, activeOptions.width ?? 80))
+  const aspect = activeImg.height / Math.max(1, activeImg.width)
   // Terminal character cells are ~2x taller than wide
-  const rows = Math.max(8, Math.min(100, options.height ?? Math.round(cols * aspect * 0.5)))
-  const mode = options.mode ?? 'ascii'
-  const invert = options.invert ?? false
+  const rows = Math.max(8, Math.min(100, activeOptions.height ?? Math.round(cols * aspect * 0.5)))
+  const mode = activeOptions.mode ?? 'ascii'
+  const invert = activeOptions.invert ?? false
 
   if (mode === 'halfblock') {
     const lines: string[] = []
     for (let row = 0; row < rows; row++) {
       let line = ''
       for (let col = 0; col < cols; col++) {
-        const sx = (col / cols) * img.width
-        const syTop = ((row * 2) / (rows * 2)) * img.height
-        const syBot = ((row * 2 + 1) / (rows * 2)) * img.height
-        const [r1, g1, b1] = sampleRgba(img, sx, syTop)
-        const [r2, g2, b2] = sampleRgba(img, sx, syBot)
+        const sx = (col / cols) * activeImg.width
+        const syTop = ((row * 2) / (rows * 2)) * activeImg.height
+        const syBot = ((row * 2 + 1) / (rows * 2)) * activeImg.height
+        const [r1, g1, b1] = sampleRgba(activeImg, sx, syTop)
+        const [r2, g2, b2] = sampleRgba(activeImg, sx, syBot)
         line += `\x1b[38;2;${r1};${g1};${b1}m\x1b[48;2;${r2};${g2};${b2}m▀`
       }
       lines.push(`${line}\x1b[0m`)
@@ -249,9 +353,9 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
         let bits = 0
         for (let dy = 0; dy < 4; dy++) {
           for (let dx = 0; dx < 2; dx++) {
-            const sx = ((col * 2 + dx) / (cols * 2)) * img.width
-            const sy = ((row * 4 + dy) / (rows * 4)) * img.height
-            const [r, g, b, a] = sampleRgba(img, sx, sy)
+            const sx = ((col * 2 + dx) / (cols * 2)) * activeImg.width
+            const sy = ((row * 4 + dy) / (rows * 4)) * activeImg.height
+            const [r, g, b, a] = sampleRgba(activeImg, sx, sy)
             const lum = luma(r, g, b, a)
             const lit = invert ? lum > 0.55 : lum < 0.55
             if (lit) bits |= dotBits[dy]![dx]!
@@ -265,8 +369,8 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
   }
 
   if (mode === 'edge') {
-    const threshold = options.edgeThreshold ?? DEFAULT_EDGE_THRESHOLD
-    const lumGrid = buildLuminanceGrid(img, cols, rows)
+    const threshold = activeOptions.edgeThreshold ?? DEFAULT_EDGE_THRESHOLD
+    const lumGrid = buildLuminanceGrid(activeImg, cols, rows)
     const sampleLum = (r: number, c: number): number => {
       const cr = Math.max(0, Math.min(rows - 1, r))
       const cc = Math.max(0, Math.min(cols - 1, c))
@@ -293,7 +397,7 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
       grid.push(line)
     }
 
-    stampOverlays(grid, cols, rows, img, options)
+    stampOverlays(grid, cols, rows, activeImg, activeOptions)
     return frameAsciiGrid(grid, cols)
   }
 
@@ -302,9 +406,9 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
   for (let row = 0; row < rows; row++) {
     const line: string[] = []
     for (let col = 0; col < cols; col++) {
-      const sx = ((col + 0.5) / cols) * img.width
-      const sy = ((row + 0.5) / rows) * img.height
-      const [r, g, b, a] = sampleRgba(img, sx, sy)
+      const sx = ((col + 0.5) / cols) * activeImg.width
+      const sy = ((row + 0.5) / rows) * activeImg.height
+      const [r, g, b, a] = sampleRgba(activeImg, sx, sy)
       const lum = luma(r, g, b, a)
       const intensity = invert ? lum : 1 - lum
       const idx = Math.max(0, Math.min(LUMINANCE_RAMP.length - 1, Math.round(intensity * (LUMINANCE_RAMP.length - 1))))
@@ -314,7 +418,7 @@ export function renderRgbaToAscii(img: DecodedPng, options: PixelAsciiOptions = 
   }
 
   // Stamp Set-of-Marks [eN] badges directly onto the ASCII grid
-  stampOverlays(grid, cols, rows, img, options)
+  stampOverlays(grid, cols, rows, activeImg, activeOptions)
   return frameAsciiGrid(grid, cols)
 }
 

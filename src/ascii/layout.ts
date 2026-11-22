@@ -1295,7 +1295,64 @@ export function computeScrollbarGutter(
   return { scrollable: true, thumbStart, thumbSize, percent, chars }
 }
 
-export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
+function rectsIntersect(a: Rect, b: Rect): boolean {
+  const aW = Math.max(1, a.width)
+  const aH = Math.max(1, a.height)
+  const bW = Math.max(1, b.width)
+  const bH = Math.max(1, b.height)
+  return a.x < b.x + bW && a.x + aW > b.x && a.y < b.y + bH && a.y + aH > b.y
+}
+
+function translateBoxToCrop(box: Rect, crop: Rect): Rect {
+  return {
+    x: Math.max(0, box.x - crop.x),
+    y: Math.max(0, box.y - crop.y),
+    width: Math.max(0, Math.min(box.width, crop.x + crop.width - Math.max(box.x, crop.x))),
+    height: Math.max(0, Math.min(box.height, crop.y + crop.height - Math.max(box.y, crop.y))),
+  }
+}
+
+export function cropPageSnapshot(snapshot: PageSnapshot, crop: Rect): PageSnapshot {
+  const safeW = Math.max(1, crop.width)
+  const safeH = Math.max(1, crop.height)
+  const normalizedCrop: Rect = {
+    x: Math.max(0, crop.x),
+    y: Math.max(0, crop.y),
+    width: safeW,
+    height: safeH,
+  }
+
+  const blocks = snapshot.blocks
+    .filter((b) => b.box && rectsIntersect(b.box, normalizedCrop))
+    .map((b) => ({
+      ...b,
+      box: translateBoxToCrop(b.box!, normalizedCrop),
+    }))
+
+  const elements = snapshot.elements
+    .filter((e) => e.box && rectsIntersect(e.box, normalizedCrop))
+    .map((e) => ({
+      ...e,
+      box: translateBoxToCrop(e.box!, normalizedCrop),
+    }))
+
+  return {
+    ...snapshot,
+    viewport: {
+      width: safeW,
+      height: safeH,
+      scrollX: 0,
+      scrollY: 0,
+      scrollHeight: safeH,
+    },
+    blocks,
+    elements,
+  }
+}
+
+export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
+  const activeCrop = options.crop && options.crop.width > 0 && options.crop.height > 0 ? options.crop : undefined
+  const snapshot = activeCrop ? cropPageSnapshot(rawSnapshot, activeCrop) : rawSnapshot
   const profile = resolveDensityProfile(options.density)
   const width = Math.max(40, Math.min(240, options.width ?? profile.defaultWidth))
   const height = Math.max(14, Math.min(200, options.height ?? profile.defaultHeight))
@@ -1427,9 +1484,15 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
   } else if (showCompactHeader) {
     const cleanTitle = snapshot.title ? (asciiOnly ? sanitizeAscii(snapshot.title) : snapshot.title).trim() : ''
     const cleanUrl = asciiOnly ? sanitizeAscii(snapshot.url || 'about:blank') : snapshot.url || 'about:blank'
+    const cropTag = activeCrop
+      ? options.cropLabel
+        ? `zoom:${options.cropLabel}`
+        : `crop:${Math.round(activeCrop.x)},${Math.round(activeCrop.y)},${Math.round(activeCrop.width)}x${Math.round(activeCrop.height)}`
+      : undefined
     const parts = [
       cleanTitle ? truncateVisible(cleanTitle, 28) : undefined,
       truncateVisible(cleanUrl, 40),
+      cropTag,
       `refs:${refCount}`,
       scrollbar.scrollable ? `${scrollbar.percent}%` : undefined,
     ].filter((p): p is string => Boolean(p))
@@ -1459,9 +1522,14 @@ export function renderPageAscii(snapshot: PageSnapshot, options: AsciiRenderOpti
     const lineRange = `lines ${start + 1}-${Math.min(bodyLines.length, start + viewportRows)}/${bodyLines.length}`
     const layoutTag = activeLayout === 'spatial' ? ' | layout:2d' : ''
     const densityTag = profile.name !== 'normal' ? ` | density:${profile.name}` : ''
+    const cropTag = activeCrop
+      ? options.cropLabel
+        ? ` | zoom:${options.cropLabel}`
+        : ` | crop:${Math.round(activeCrop.x)},${Math.round(activeCrop.y)},${Math.round(activeCrop.width)}x${Math.round(activeCrop.height)}`
+      : ''
     const status = options.statusMessage
-      ? `${options.statusMessage} | refs:${refCount}${layoutTag}${densityTag} | ${lineRange}`
-      : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag}${densityTag} | ${lineRange} | cmds: open click fill find scroll`
+      ? `${options.statusMessage} | refs:${refCount}${layoutTag}${densityTag}${cropTag} | ${lineRange}`
+      : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag}${densityTag}${cropTag} | ${lineRange} | cmds: open click fill find scroll`
     output.push(frameLine(status))
     output.push(botBorder)
   }

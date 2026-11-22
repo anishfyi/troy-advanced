@@ -29,10 +29,12 @@ Client Commands (talk to running daemon, or use --oneshot):
   status                                  Daemon health + memory stats
   tabs                                    List open tabs
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
-  ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto]
+  ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--crop x,y,w,h] [--ref eN]
                                           Render tab as strict 7-bit ASCII viewport (or diff with --since)
-  visual [--mode ascii|edge|braille|halfblock] [--annotate]   Render Chromium PNG screenshot as ASCII
-  read [--since] [--ascii] [--visual] [--json]  Read page structure or ASCII/JSON delta
+  visual [--mode ascii|edge|braille|halfblock] [--annotate] [--crop x,y,w,h] [--ref eN]
+                                          Render Chromium PNG screenshot (or cropped region) as ASCII
+  read [--since] [--ascii] [--visual] [--crop x,y,w,h] [--ref eN] [--json]
+                                          Read page structure or ASCII/JSON delta
   find <query>                            Find interactive elements as eN refs
   click <ref> [--allow-submit]            Click element ref
   fill <ref> <text> [--clear]             Fill input ref
@@ -63,6 +65,7 @@ const VALUE_FLAGS = new Set([
   '--layout',
   '--density',
   '--mode',
+  '--crop',
   '--ref',
   '--amount',
   '--limit',
@@ -250,6 +253,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         density: typeof flags.density === 'string' ? flags.density : undefined,
         mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
+        crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+        ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         annotate: Boolean(flags.annotate),
       })
       if (flags.json) console.log(JSON.stringify(res, null, 2))
@@ -316,6 +321,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         height: flags.height ? Number(flags.height) : undefined,
         layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         density: typeof flags.density === 'string' ? flags.density : undefined,
+        crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+        ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         since: Boolean(flags.since),
         asciiOnly: true,
       })
@@ -326,7 +333,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         name: 'page_screenshot_ascii',
         args: {
           width: flags.width ? Number(flags.width) : 80,
+          height: flags.height ? Number(flags.height) : undefined,
           mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
+          crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+          ref: typeof flags.ref === 'string' ? flags.ref : undefined,
           annotate: Boolean(flags.annotate),
         },
       })
@@ -341,6 +351,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           height: flags.height ? Number(flags.height) : undefined,
           layout: typeof flags.layout === 'string' ? flags.layout : undefined,
           density: typeof flags.density === 'string' ? flags.density : undefined,
+          crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+          ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         },
       })
       break
