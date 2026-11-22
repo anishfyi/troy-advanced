@@ -1,0 +1,37 @@
++--------------------------------------------------------------------------------------------------+
+| TROY-ADV [1* Troy Advanced A...]                                                                 |
+| URL: https://docs.troy.local/architecture                                              scroll:0% |
++--------------------------------------------------------------------------------------------------+
+| TITLE: Troy Advanced Architecture                                                                #
+| ---------------------------------                                                                #
+| TROY ADVANCED ARCHITECTURE                                                                       #
+| ============================                                                                     #
+|                                                                                                  #
+| Read the [e3: Quickstart Guide] and explore the [e4: CDP Bridge] to connect terminal agents with #
+| live Chromium tabs.                                                                              #
+|                                                                                                  #
+| ## Engine Comparison                                                                             #
+|                                                                                                  #
+| +--------------+---------+--------+-----------+                                                  #
+| | Engine       | Startup | JS     | Footprint |                                                  #
+| +==============+=========+========+===========+                                                  #
+| | Chromium CDP | 450ms   | Full   | 180MB     |                                                  #
+| | Lite Engine  | 12ms    | Static | 24MB      |                                                  #
+| +--------------+---------+--------+-----------+                                                  #
+|                                                                                                  #
+| ## Quick CLI Usage                                                                               #
+|                                                                                                  #
+| | troy-advanced daemon start                                                                     #
+| | troy-advanced open https://example.com                                                         #
+| | troy-advanced read --density compact                                                           #
+|                                                                                                  #
+| [e5] < Copy Snippet >                                                                            #
+| * Strict 7-bit ASCII output with zero Unicode drift                                              #
+| * Deterministic opaque [eN] refs bound to live DOM elements                                      #
+| * Sub-5ms spatial layout rendering for high-frequency loops                                      |
+| ------------------------------------------------------------------------------------------------ |
+| [IMG: Architecture Diagram (640x360 (natural 1280x720) @(20,560))]                               |
+| [e6] [Next: Spatial Layout ->]                                                                   |
++--------------------------------------------------------------------------------------------------+
+| refs:6 | epoch:3 | lines 1-30/34 | cmds: open click fill find scroll                             |
++--------------------------------------------------------------------------------------------------+

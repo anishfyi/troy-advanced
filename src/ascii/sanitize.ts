@@ -64,12 +64,31 @@ const SPECIAL_LATIN_MAP: Record<string, string> = {
   '\u00F0': 'd',  // ð
 }
 
+function isAlreadyCleanAscii(input: string, preserveNewlines: boolean): boolean {
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i)
+    if (code >= 0x20 && code <= 0x7e) continue
+    if (preserveNewlines && code === 0x0a) continue
+    return false
+  }
+  return true
+}
+
+function hasAnsiOrC1(input: string): boolean {
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i)
+    if (code === 0x1b || (code >= 0x90 && code <= 0x9f)) return true
+  }
+  return false
+}
+
 /**
  * Strip all ANSI/VT100/VT220/xterm terminal escape sequences (CSI, OSC 0/2/8/52,
  * DCS/SOS/PM/APC, 2-byte ESC, 8-bit C1 sequences, and stray ESC bytes).
  */
 export function stripAnsi(input: string): string {
   if (!input) return ''
+  if (!hasAnsiOrC1(input)) return input
   return input.replace(ANSI_ESCAPE_RE, '')
 }
 
@@ -86,6 +105,7 @@ export function stripAnsi(input: string): string {
  */
 export function sanitizeAscii(input: string, options: SanitizeAsciiOptions = {}): string {
   if (!input) return ''
+  if (isAlreadyCleanAscii(input, Boolean(options.preserveNewlines))) return input
 
   let out = stripAnsi(input)
 

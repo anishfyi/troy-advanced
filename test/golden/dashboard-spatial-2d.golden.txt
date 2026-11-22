@@ -1,0 +1,29 @@
++------------------------------------------------------------------------------------------------------------+
+| TROY-ADV [2* Ops Console - C...]                                                                           |
+| URL: https://ops.troy.local/dashboard                                                          scroll:100% |
++------------------------------------------------------------------------------------------------------------+
+| TITLE: Ops Console - Cluster Health                                                                        |
+| -----------------------------------                                                                        |
+|   OPS CONSOLE                                                          [e4] Search: [________________]     |
+|   =============                                                                                            |
+|   ### Navigation                                                                                           |
+|                       ## Cluster Health                                         ### Quick Actions          |
+|   [e1] [Overview ->]                                                                                       |
+|                       us-east-1 production fleet is healthy. P95 render         Release v2.4.1             |
+|   [e2] [Clusters ->]  latency is 1.4ms across 12 workers.                       ready                      |
+|   [e3] [Alerts (2)...                                                           [e5] < Deploy >            |
+|                       Active tabs: 18 | Memory RSS: 142MB | Blocked                                        |
+|                       trackers: 412                                             [e6] < Drain Node >        |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
+|                                                                                                            |
++------------------------------------------------------------------------------------------------------------+
+| refs:6 | epoch:7 | layout:2d | lines 1-12/12 | cmds: open click fill find scroll                           |
++------------------------------------------------------------------------------------------------------------+

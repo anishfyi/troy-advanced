@@ -1,0 +1,21 @@
++----------------------------------------------------------------------------------------------+
+| TROY-ADV DELTA [CHANGED]                          https://app.troy.local/tasks?status=active |
++----------------------------------------------------------------------------------------------+
+| ~ URL: https://app.troy.local/tasks -> https://app.troy.local/tasks?status=active            |
+| ~ TITLE: "Task Queue (2)" -> "Task Queue (3)"                                                |
+|                                                                                              |
+| ELEMENTS (+1 -1 ~2):                                                                         |
+| + [e4] <a> "View Live Logs" href="https://app.troy.local/logs"                               |
+| ~ [e1] <input> val:""->"nightly-eval"                                                        |
+| ~ [e2] <button> text:"Run Job"->"Running...", disabled:false->true                           |
+| - [e3] <button> "Cancel Old"                                                                 |
+|                                                                                              |
+| TEXT (+3 -2):                                                                                |
+| + Pending jobs: 3                                                                            |
+| + Worker status: running                                                                     |
+| + Job nightly-eval queued                                                                    |
+| - Pending jobs: 2                                                                            |
+| - Worker status: idle                                                                        |
++----------------------------------------------------------------------------------------------+
+| delta: +1 -1 ~2 elems | +3 -2 lines                                                          |
++----------------------------------------------------------------------------------------------+

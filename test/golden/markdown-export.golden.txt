@@ -1,0 +1,45 @@
+---
+title: "Troy Advanced Architecture"
+url: "https://docs.troy.local/architecture"
+tabId: 1
+epoch: 3
+refs: 6
+---
+
+# Troy Advanced Architecture
+
+Read the [Quickstart Guide](https://docs.troy.local/quickstart) [e3] and explore the [CDP Bridge](https://docs.troy.local/cdp) [e4] to connect terminal agents with live Chromium tabs.
+
+## Engine Comparison
+
+| Engine | Startup | JS | Footprint |
+| --- | --- | --- | --- |
+| Chromium CDP | 450ms | Full | 180MB |
+| Lite Engine | 12ms | Static | 24MB |
+
+## Quick CLI Usage
+
+```
+troy-advanced daemon start troy-advanced open https://example.com troy-advanced read --density compact
+```
+
+- [e5] **[Copy Snippet]**
+
+- Strict 7-bit ASCII output with zero Unicode drift
+- Deterministic opaque [eN] refs bound to live DOM elements
+- Sub-5ms spatial layout rendering for high-frequency loops
+
+---
+
+![Architecture Diagram](https://docs.troy.local/img/arch.png) *(640x360 (natural 1280x720) @(20,560))*
+
+[Next: Spatial Layout](https://docs.troy.local/spatial) [e6]
+
+## Media Summary (1)
+
+- **Image**: Architecture Diagram *(640x360 (natural 1280x720) @(20,560))* -- https://docs.troy.local/img/arch.png
+
+## Additional Interactive Elements
+
+- [e1] `link` Guide -- https://docs.troy.local/guide
+- [e2] `link` API Reference -- https://docs.troy.local/api

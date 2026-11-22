@@ -229,7 +229,8 @@ function renderElementRefLine(
   if (opts.includeUrls && el.href) {
     extras.push(formatMarkdownHref(cleanText(el.href, opts.asciiOnly)))
   }
-  const suffix = extras.length > 0 ? ` — ${extras.join(' | ')}` : ''
+  const dash = opts.asciiOnly ? '--' : '—'
+  const suffix = extras.length > 0 ? ` ${dash} ${extras.join(' | ')}` : ''
   return `- ${refPrefix}\`${roleTag}\` ${label}${suffix}`
 }
 
@@ -507,7 +508,8 @@ export function renderPageMarkdown(
       for (const item of media) {
         const meta = formatMediaMeta(item)
         const label = normalizeInline(item.label, asciiOnly)
-        const srcSuffix = includeUrls && item.src ? ` — ${formatMarkdownHref(cleanText(item.src, asciiOnly))}` : ''
+        const dash = asciiOnly ? '--' : '—'
+        const srcSuffix = includeUrls && item.src ? ` ${dash} ${formatMarkdownHref(cleanText(item.src, asciiOnly))}` : ''
         mediaLines.push(`- **${item.kind === 'canvas' ? 'Canvas' : 'Image'}**: ${label}${meta ? ` *(${meta})*` : ''}${srcSuffix}`)
         if (item.asciiPreview) {
           const fence = pickCodeFence(item.asciiPreview)
@@ -546,5 +548,6 @@ export function renderPageMarkdown(
     }
   }
 
-  return sections.filter((s) => s.length > 0).join('\n\n')
+  const joined = sections.filter((s) => s.length > 0).join('\n\n')
+  return asciiOnly ? joined.split('\n').map((line) => sanitizeAscii(line)).join('\n') : joined
 }

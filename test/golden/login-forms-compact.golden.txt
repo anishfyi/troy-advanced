@@ -1,0 +1,10 @@
+[compact] Workspace Access | https://auth.troy.local/login | refs:6
+# Workspace Access
+Authenticate your terminal session to attach to remote clusters.
+[Form: Sign In]
+  [e1] Work Email: [ops@troy.local]
+  [e2] Workspace: [________]
+  [e3] Region: [ us-east-1 v ]
+  [e4] Keep session active: [________]
+  [e5] < Sign In >
+[e6] [Reset access key ->]

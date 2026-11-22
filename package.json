@@ -24,6 +24,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bench:ascii": "npm run build && node ./scripts/bench-ascii.mjs",
     "doctor": "node ./bin/troy-advanced.mjs doctor",
     "daemon": "node ./bin/troy-advanced.mjs daemon start",
     "browse": "node ./bin/troy-advanced.mjs browse",
