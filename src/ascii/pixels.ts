@@ -4,6 +4,7 @@
 
 import type { PixelAsciiOptions, Rect } from '../types.js'
 import { decodePng, type DecodedPng } from './png-decoder.js'
+import { stripAnsi } from './sanitize.js'
 
 const LUMINANCE_RAMP = ' .:-=+*#%@'
 const DEFAULT_EDGE_THRESHOLD = 0.18
@@ -175,7 +176,7 @@ function stampOverlays(grid: string[][], cols: number, rows: number, img: Decode
       const cx = Math.floor((overlay.box.x / vpW) * cols)
       const cy = Math.floor((overlay.box.y / vpH) * rows)
       if (cy < 0 || cy >= rows) continue
-      const badge = `[${overlay.ref.replace(/[^\x20-\x7e]/g, '')}]`
+      const badge = `[${stripAnsi(overlay.ref).replace(/[^\x20-\x7e]/g, '')}]`
       for (let i = 0; i < badge.length; i++) {
         const px = cx + i
         if (px >= 0 && px < cols) {
@@ -205,7 +206,7 @@ function stampOverlays(grid: string[][], cols: number, rows: number, img: Decode
     const y1 = Math.min(rows - 1, rawY1)
 
     mapped.push({
-      badge: `[${overlay.ref.replace(/[^\x20-\x7e]/g, '')}]`,
+      badge: `[${stripAnsi(overlay.ref).replace(/[^\x20-\x7e]/g, '')}]`,
       x0,
       y0,
       x1,

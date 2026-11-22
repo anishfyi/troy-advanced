@@ -4,6 +4,9 @@
 
 import type { AsciiDensity, AsciiLayoutMode, AsciiRenderOptions, ContentBlock, InlineLink, PageSnapshot, Rect } from '../types.js'
 import { formatMediaMeta, renderMediaSummaryAscii, resolveBlockCanvasPreview } from './media.js'
+import { sanitizeAscii, stripAnsi } from './sanitize.js'
+
+export { sanitizeAscii, stripAnsi, isStrictAscii } from './sanitize.js'
 
 export interface AsciiDensityProfile {
   name: AsciiDensity
@@ -102,20 +105,6 @@ const ANSI = {
   inverse: '\x1b[7m',
 }
 
-export function sanitizeAscii(input: string): string {
-  return input
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[\u2013\u2014]/g, '-')
-    .replace(/\u2026/g, '...')
-    .replace(/\u00a0/g, ' ')
-    .replace(/[^\x20-\x7e]/g, '?')
-}
-
-function stripAnsi(s: string): string {
-  return s.replace(/\x1b\[[0-9;]*m/g, '')
-}
-
 function visibleLength(s: string): number {
   return stripAnsi(s).length
 }
@@ -182,7 +171,7 @@ export function wrapInlineParagraph(
   const asciiOnly = options.asciiOnly ?? true
   const color = asciiOnly ? false : (options.color ?? false)
   const showRefs = options.showRefs ?? true
-  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s)
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s))
 
   if (!links || links.length === 0) {
     return wrapText(clean(text), maxWidth)
@@ -404,7 +393,7 @@ export function renderAsciiTable(
   const asciiOnly = options.asciiOnly ?? true
   const color = asciiOnly ? false : (options.color ?? false)
   const compact = options.compact ?? false
-  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s).replace(/\s+/g, ' ').trim()
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s)).replace(/\s+/g, ' ').trim()
 
   const normalized = rows.map((row) => ({
     cells: (row.cells && row.cells.length > 0 ? row.cells : [row.text]).map(clean),
@@ -587,7 +576,7 @@ export function renderAsciiForm(
   const showRefs = options.showRefs ?? true
   const profile = options.profile ?? DENSITY_PROFILES.normal
   const compact = options.compact ?? profile.compactForms
-  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s).replace(/\s+/g, ' ').trim()
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s)).replace(/\s+/g, ' ').trim()
 
   if (compact) {
     const rawTitle = options.title ?? inferFormTitle(blocks)
@@ -778,7 +767,7 @@ function formatBlock(
   showRefs: boolean,
   profile: AsciiDensityProfile = DENSITY_PROFILES.normal,
 ): string[] {
-  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : s)
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s))
   const refBadge = (ref?: string) => {
     if (!showRefs || !ref) return ''
     return color ? `${ANSI.yellow}[${ref}]${ANSI.reset} ` : `[${ref}] `
@@ -1408,7 +1397,7 @@ export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderO
   // Render content blocks into lines first so header scroll% and right-edge scrollbar stay in sync
   const bodyLines: string[] = []
   if (snapshot.title && !showCompactHeader) {
-    const t = asciiOnly ? sanitizeAscii(snapshot.title) : snapshot.title
+    const t = asciiOnly ? sanitizeAscii(snapshot.title) : stripAnsi(snapshot.title)
     if (profile.compactHeadings) {
       bodyLines.push(color ? `${ANSI.bold}${t}${ANSI.reset}` : `TITLE: ${t}`)
     } else {
@@ -1511,7 +1500,7 @@ export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderO
     const tabStr = tabs
       .map((t) => {
         const mark = t.id === (options.activeTabId ?? snapshot.tabId) || t.active ? '*' : ''
-        const label = truncateVisible(asciiOnly ? sanitizeAscii(t.title || t.url || 'tab') : t.title || t.url || 'tab', 18)
+        const label = truncateVisible(asciiOnly ? sanitizeAscii(t.title || t.url || 'tab') : stripAnsi(t.title || t.url || 'tab'), 18)
         return `[${t.id}${mark} ${label}]`
       })
       .join(' ')
@@ -1519,7 +1508,7 @@ export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderO
     output.push(frameLine(headerLeft))
 
     // URL + Title bar
-    const urlStr = truncateVisible(asciiOnly ? sanitizeAscii(snapshot.url || 'about:blank') : snapshot.url || 'about:blank', innerWidth - 16)
+    const urlStr = truncateVisible(asciiOnly ? sanitizeAscii(snapshot.url || 'about:blank') : stripAnsi(snapshot.url || 'about:blank'), innerWidth - 16)
     const urlLine = `URL: ${urlStr}`
     const posTag = `scroll:${scrollbar.percent}%`
     const spacer = Math.max(1, innerWidth - visibleLength(urlLine) - posTag.length)

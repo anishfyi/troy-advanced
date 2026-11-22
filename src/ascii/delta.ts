@@ -4,7 +4,8 @@
 
 import type { PageDelta } from '../agent/delta.js'
 import type { AsciiDensity, ElementDescriptor } from '../types.js'
-import { resolveDensityProfile, sanitizeAscii } from './layout.js'
+import { resolveDensityProfile } from './layout.js'
+import { sanitizeAscii, stripAnsi } from './sanitize.js'
 
 export interface DeltaAsciiOptions {
   width?: number
@@ -25,10 +26,6 @@ const ANSI = {
   red: '\x1b[31m',
   yellow: '\x1b[33m',
   cyan: '\x1b[36m',
-}
-
-function stripAnsi(s: string): string {
-  return s.replace(/\x1b\[[0-9;]*m/g, '')
 }
 
 function visibleLength(s: string): number {
@@ -169,7 +166,7 @@ export function renderDeltaAscii(delta: PageDelta, options: DeltaAsciiOptions = 
   const maxLines = Math.max(1, options.maxLines ?? defaultMaxLines)
 
   const paint = (text: string, code: string) => (color ? `${code}${text}${ANSI.reset}` : text)
-  const cleanText = (s: string) => (asciiOnly ? sanitizeAscii(s) : s)
+  const cleanText = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s))
 
   const summaryStats = `+${delta.addedElements.length} -${delta.removedElements.length} ~${delta.changedElements.length} elems | +${delta.addedLines.length} -${delta.removedLines.length} lines`
 

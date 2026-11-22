@@ -786,7 +786,7 @@ describe('ASCII spatial renderer & pure-Node PNG-to-ASCII', () => {
     expect(framed).toContain('~ URL: https://ops.example.com/jobs -> https://ops.example.com/jobs?active=1')
     expect(framed).toContain('~ TITLE: "Jobs - Queue" -> "Jobs - Active"')
     expect(framed).toContain('ELEMENTS (+1 -1 ~3):')
-    expect(framed).toContain('+ [e5] <button> "Cancel All ??"')
+    expect(framed).toContain('+ [e5] <button> "Cancel All ?"')
     expect(framed).toContain('~ [e1] <button> text:"Idle"->"Running", disabled:false->true')
     expect(framed).toContain('~ [e2] <input> val:"pending"->"active"')
     expect(framed).toContain('~ [e3] <input> checked:false->true')

@@ -3,18 +3,9 @@
 
 import type { ContentBlock, MediaSummaryItem, PageSnapshot, Rect } from '../types.js'
 import { renderPngToAscii } from './pixels.js'
+import { sanitizeAscii, stripAnsi } from './sanitize.js'
 
 const PNG_DATA_URL_PREFIX = /^data:image\/png;base64,/i
-
-function sanitize7Bit(input: string): string {
-  return input
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[\u2013\u2014]/g, '-')
-    .replace(/\u2026/g, '...')
-    .replace(/\u00a0/g, ' ')
-    .replace(/[^\x20-\x7e]/g, '?')
-}
 
 function truncate(text: string, maxLen: number): string {
   if (maxLen <= 0) return ''
@@ -196,7 +187,7 @@ export function renderMediaSummaryAscii(
   options: MediaSummaryRenderOptions = {},
 ): string {
   const asciiOnly = options.asciiOnly ?? true
-  const clean = (s: string) => (asciiOnly ? sanitize7Bit(s) : s)
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s))
   const maxWidth = Math.max(40, Math.min(200, options.width ?? 96))
   const previewWidth = options.previewWidth ?? Math.max(16, Math.min(44, maxWidth - 8))
   const previewHeight = options.previewHeight ?? 10
