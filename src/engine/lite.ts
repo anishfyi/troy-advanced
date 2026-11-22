@@ -35,6 +35,12 @@ function parseAttrs(attrString: string): Record<string, string> {
   return attrs
 }
 
+function parsePositiveDim(raw: string | undefined): number | undefined {
+  if (!raw) return undefined
+  const n = Number.parseFloat(raw)
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined
+}
+
 function resolveHref(href: string | undefined, baseUrl: string): string | undefined {
   if (!href) return undefined
   try {
@@ -97,7 +103,7 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
 
   // Better linear scan: handle paired and void tags cleanly
   const linearRe =
-    /<form\b([^>]*)>|<\/form>|<(h[1-6])\b([^>]*)>([\s\S]*?)<\/\2>|<p\b([^>]*)>([\s\S]*?)<\/p>|<a\b([^>]*)>([\s\S]*?)<\/a>|<button\b([^>]*)>([\s\S]*?)<\/button>|<input\b([^>]*)\/?>|<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<select\b([^>]*)>([\s\S]*?)<\/select>|<li\b([^>]*)>([\s\S]*?)<\/li>|<pre\b([^>]*)>([\s\S]*?)<\/pre>|<tr\b([^>]*)>([\s\S]*?)<\/tr>|<img\b([^>]*)\/?>|<hr\b[^>]*\/?>|<legend\b[^>]*>([\s\S]*?)<\/legend>/gi
+    /<form\b([^>]*)>|<\/form>|<(h[1-6])\b([^>]*)>([\s\S]*?)<\/\2>|<p\b([^>]*)>([\s\S]*?)<\/p>|<a\b([^>]*)>([\s\S]*?)<\/a>|<button\b([^>]*)>([\s\S]*?)<\/button>|<input\b([^>]*)\/?>|<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<select\b([^>]*)>([\s\S]*?)<\/select>|<li\b([^>]*)>([\s\S]*?)<\/li>|<pre\b([^>]*)>([\s\S]*?)<\/pre>|<tr\b([^>]*)>([\s\S]*?)<\/tr>|<img\b([^>]*)\/?>|<hr\b[^>]*\/?>|<legend\b[^>]*>([\s\S]*?)<\/legend>|<canvas\b([^>]*)>([\s\S]*?)<\/canvas>|<canvas\b([^>]*)\/?>/gi
 
   let m: RegExpExecArray | null
   while ((m = linearRe.exec(bodyHtml)) !== null) {
@@ -413,7 +419,36 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
       // <img>
       const attrs = parseAttrs(m[22])
       const alt = attrs.alt || attrs.title || attrs.src || 'image'
-      pushBlock({ kind: 'image', text: alt, alt, tag: 'img' })
+      const src = resolveHref(attrs.src, baseUrl)
+      const naturalWidth = parsePositiveDim(attrs.width)
+      const naturalHeight = parsePositiveDim(attrs.height)
+      pushBlock({
+        kind: 'image',
+        text: alt,
+        alt,
+        ...(src ? { src } : {}),
+        ...(naturalWidth ? { naturalWidth } : {}),
+        ...(naturalHeight ? { naturalHeight } : {}),
+        tag: 'img',
+      })
+      continue
+    }
+
+    if (m[24] !== undefined || m[26] !== undefined) {
+      // <canvas>
+      const attrs = parseAttrs(m[24] ?? m[26] ?? '')
+      const fallbackText = m[25] ? stripTags(m[25]) : ''
+      const label = attrs['aria-label'] || attrs.title || fallbackText || attrs.id || 'canvas'
+      const naturalWidth = parsePositiveDim(attrs.width)
+      const naturalHeight = parsePositiveDim(attrs.height)
+      pushBlock({
+        kind: 'canvas',
+        text: label,
+        alt: label,
+        ...(naturalWidth ? { naturalWidth } : {}),
+        ...(naturalHeight ? { naturalHeight } : {}),
+        tag: 'canvas',
+      })
       continue
     }
 

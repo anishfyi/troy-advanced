@@ -178,7 +178,8 @@ const SNAPSHOT_SCRIPT = `(() => {
     blocks.push(fInfo ? { ...block, ...fInfo } : block);
   }
 
-  const blockSel = 'h1, h2, h3, h4, h5, h6, p, a[href], button, input:not([type="hidden"]), textarea, select, li, pre, tr, img, hr';
+  const blockSel = 'h1, h2, h3, h4, h5, h6, p, a[href], button, input:not([type="hidden"]), textarea, select, li, pre, tr, img, canvas, hr';
+  let capturedCanvasCount = 0;
   const body = document.body || document.documentElement;
   if (body) {
     for (const el of body.querySelectorAll(blockSel)) {
@@ -271,8 +272,60 @@ const SNAPSHOT_SCRIPT = `(() => {
           pushBlock(el, { kind: 'table-row', text: cells.join(' | '), cells, tag, box, isHeader: isHeader || undefined });
         }
       } else if (tag === 'img') {
-        const alt = el.getAttribute('alt') || el.getAttribute('title') || '';
-        if (alt) pushBlock(el, { kind: 'image', text: alt, alt, tag, box });
+        const alt = (el.getAttribute('alt') || el.getAttribute('title') || '').trim();
+        const src = el.currentSrc || el.getAttribute('src') || undefined;
+        const naturalWidth = Number(el.naturalWidth) || Number(el.getAttribute('width')) || undefined;
+        const naturalHeight = Number(el.naturalHeight) || Number(el.getAttribute('height')) || undefined;
+        let label = alt;
+        if (!label && src && !/^data:/i.test(src)) {
+          try {
+            const pathname = new URL(src, location.href).pathname;
+            label = pathname.split('/').filter(Boolean).pop() || '';
+          } catch {}
+        }
+        if (label || (box.width > 0 && box.height > 0)) {
+          const finalLabel = label || 'image';
+          pushBlock(el, {
+            kind: 'image',
+            text: finalLabel,
+            alt: alt || finalLabel,
+            src,
+            naturalWidth: naturalWidth && naturalWidth > 0 ? naturalWidth : undefined,
+            naturalHeight: naturalHeight && naturalHeight > 0 ? naturalHeight : undefined,
+            tag,
+            box,
+          });
+        }
+      } else if (tag === 'canvas') {
+        const label = (
+          el.getAttribute('aria-label') ||
+          el.getAttribute('title') ||
+          (el.textContent || '').replace(/\\s+/g, ' ').trim() ||
+          el.id ||
+          'canvas'
+        ).slice(0, 120);
+        const naturalWidth = Number(el.width) || undefined;
+        const naturalHeight = Number(el.height) || undefined;
+        let canvasDataUrl;
+        if (capturedCanvasCount < 6 && el.width > 0 && el.height > 0 && typeof el.toDataURL === 'function') {
+          try {
+            const url = el.toDataURL('image/png');
+            if (typeof url === 'string' && url.startsWith('data:image/png;base64,') && url.length <= 524288) {
+              canvasDataUrl = url;
+              capturedCanvasCount += 1;
+            }
+          } catch {}
+        }
+        pushBlock(el, {
+          kind: 'canvas',
+          text: label,
+          alt: label,
+          naturalWidth,
+          naturalHeight,
+          ...(canvasDataUrl ? { canvasDataUrl } : {}),
+          tag,
+          box,
+        });
       } else if (tag === 'hr') {
         pushBlock(el, { kind: 'hr', text: '---', tag, box });
       }

@@ -54,22 +54,40 @@ export interface InlineLink {
 }
 
 export interface ContentBlock {
-  kind: 'heading' | 'paragraph' | 'link' | 'input' | 'button' | 'select' | 'list-item' | 'code' | 'table-row' | 'image' | 'hr'
+  kind: 'heading' | 'paragraph' | 'link' | 'input' | 'button' | 'select' | 'list-item' | 'code' | 'table-row' | 'image' | 'canvas' | 'hr'
   text: string
   level?: number
   ref?: string
   href?: string
+  src?: string
   value?: string
   placeholder?: string
   checked?: boolean
   tag?: string
   box?: Rect
+  naturalWidth?: number
+  naturalHeight?: number
+  canvasDataUrl?: string
+  asciiPreview?: string
   cells?: string[]
   isHeader?: boolean
   alt?: string
   links?: InlineLink[]
   formId?: string
   formTitle?: string
+}
+
+export interface MediaSummaryItem {
+  kind: 'image' | 'canvas'
+  label: string
+  tag: string
+  src?: string
+  width?: number
+  height?: number
+  naturalWidth?: number
+  naturalHeight?: number
+  box?: Rect
+  asciiPreview?: string
 }
 
 export interface PageSnapshot {
@@ -114,6 +132,9 @@ export interface AsciiRenderOptions {
   showRefs?: boolean
   showChrome?: boolean
   showScrollbar?: boolean
+  showMediaSummary?: boolean
+  canvasPreviewWidth?: number
+  canvasPreviewHeight?: number
   scrollOffset?: number
   layout?: AsciiLayoutMode
   density?: AsciiDensity

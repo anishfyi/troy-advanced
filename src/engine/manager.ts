@@ -10,7 +10,15 @@ import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
-import { parseAsciiDensity, renderCompactRefsAscii, renderDeltaAscii, renderPageAscii } from '../ascii/layout.js'
+import {
+  extractMediaSummary,
+  parseAsciiDensity,
+  renderCanvasPreviewAscii,
+  renderCompactRefsAscii,
+  renderDeltaAscii,
+  renderMediaSummaryAscii,
+  renderPageAscii,
+} from '../ascii/layout.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { LiteBrowserEngine } from './lite.js'
@@ -209,8 +217,15 @@ export class BrowserManager {
     }
 
     // Bind refs onto content blocks for seamless inline [eN] ASCII rendering
+    // and auto-generate strict 7-bit ASCII previews for <canvas> blocks.
     const blocks = snap.blocks.map((b) => {
       let next = b
+      if (next.kind === 'canvas' && !next.asciiPreview && next.canvasDataUrl) {
+        const preview = renderCanvasPreviewAscii(next.canvasDataUrl)
+        if (preview) {
+          next = { ...next, asciiPreview: preview }
+        }
+      }
       if (b.links && b.links.length > 0) {
         const boundLinks = b.links.map((lnk) => {
           if (lnk.ref) return lnk
@@ -366,6 +381,7 @@ export class BrowserManager {
           asciiOnly: args.asciiOnly !== false,
           color: Boolean(args.color),
           showChrome: typeof args.showChrome === 'boolean' ? args.showChrome : undefined,
+          showMediaSummary: Boolean(args.showMediaSummary),
           layout: layoutOpt,
           density: densityOpt,
           crop: cropRes.crop,
@@ -395,6 +411,9 @@ export class BrowserManager {
           }
         }
 
+        const media = extractMediaSummary(snap)
+        const mediaSummaryAscii = media.length > 0 ? renderMediaSummaryAscii(snap) : undefined
+
         return capPayload({
           ok: true,
           tabId: snap.tabId,
@@ -406,6 +425,7 @@ export class BrowserManager {
           elements: snap.elements.map(({ selector: _s, ...pub }) => pub),
           ascii,
           compactRefs: renderCompactRefsAscii(snap),
+          ...(media.length > 0 ? { media, mediaSummaryAscii } : {}),
           ...(pixelAscii ? { pixelAscii } : {}),
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
           ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),

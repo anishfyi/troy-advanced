@@ -82,6 +82,7 @@ export async function createAgentSocket(
           asciiOnly: body.asciiOnly !== false,
           color: Boolean(body.color),
           showChrome: typeof body.showChrome === 'boolean' ? body.showChrome : undefined,
+          showMediaSummary: Boolean(body.showMediaSummary),
           scrollOffset: typeof body.scrollOffset === 'number' ? body.scrollOffset : 0,
           layout: layoutOpt,
           density: densityOpt,

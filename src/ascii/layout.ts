@@ -3,6 +3,7 @@
 // can inspect and drive any live web page directly inside a terminal.
 
 import type { AsciiDensity, AsciiLayoutMode, AsciiRenderOptions, ContentBlock, InlineLink, PageSnapshot, Rect } from '../types.js'
+import { formatMediaMeta, renderMediaSummaryAscii, resolveBlockCanvasPreview } from './media.js'
 
 export interface AsciiDensityProfile {
   name: AsciiDensity
@@ -750,7 +751,7 @@ function renderFlowBlocks(
     const rendered = formatBlock(block, innerWidth, asciiOnly, color, showRefs, profile)
     if (rendered.length > 0) {
       lines.push(...rendered)
-      if (addSpacing && (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code')) {
+      if (addSpacing && (block.kind === 'heading' || block.kind === 'paragraph' || block.kind === 'code' || block.kind === 'canvas')) {
         lines.push('')
       }
     }
@@ -895,7 +896,35 @@ function formatBlock(
 
     case 'image': {
       const alt = clean(block.alt || block.text || 'image')
-      return [`[IMG: ${truncateVisible(alt, Math.max(8, innerWidth - 8))}]`]
+      const meta = formatMediaMeta({
+        naturalWidth: block.naturalWidth,
+        naturalHeight: block.naturalHeight,
+        box: block.box,
+      })
+      const suffix = meta ? ` (${meta})` : ''
+      const label = truncateVisible(`${alt}${suffix}`, Math.max(8, innerWidth - 8))
+      return [`[IMG: ${label}]`]
+    }
+
+    case 'canvas': {
+      const labelText = clean(block.alt || block.text || 'canvas')
+      const meta = formatMediaMeta({
+        naturalWidth: block.naturalWidth,
+        naturalHeight: block.naturalHeight,
+        box: block.box,
+      })
+      const suffix = meta ? ` (${meta})` : ''
+      const header = `[CANVAS: ${truncateVisible(`${labelText}${suffix}`, Math.max(8, innerWidth - 11))}]`
+      const previewCols = profile.name === 'compact'
+        ? Math.max(16, Math.min(28, innerWidth - 2))
+        : Math.max(16, Math.min(44, innerWidth - 2))
+      const previewRows = profile.name === 'compact' ? 8 : 10
+      const preview = resolveBlockCanvasPreview(block, { width: previewCols, height: previewRows })
+      if (!preview) return [header]
+      const previewLines = preview
+        .split('\n')
+        .map((l) => truncateVisible(clean(l), innerWidth))
+      return [header, ...previewLines]
     }
 
     case 'hr': {
@@ -1424,6 +1453,21 @@ export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderO
     }
   }
 
+  if (options.showMediaSummary) {
+    const mediaSummary = renderMediaSummaryAscii(snapshot, {
+      width: innerWidth,
+      asciiOnly,
+      previewWidth: options.canvasPreviewWidth,
+      previewHeight: options.canvasPreviewHeight,
+    })
+    if (mediaSummary) {
+      if (bodyLines.length > 0 && !profile.compactHeadings) {
+        bodyLines.push((asciiOnly ? '-' : '─').repeat(innerWidth))
+      }
+      bodyLines.push(...mediaSummary.split('\n'))
+    }
+  }
+
   if (bodyLines.length === 0) {
     bodyLines.push('(empty page)')
   }
@@ -1553,3 +1597,14 @@ export function renderCompactRefsAscii(snapshot: PageSnapshot, limit = 60): stri
 }
 
 export { renderDeltaAscii, type DeltaAsciiOptions } from './delta.js'
+export {
+  decodeCanvasDataUrl,
+  extractMediaSummary,
+  formatMediaMeta,
+  renderCanvasPreviewAscii,
+  renderMediaSummaryAscii,
+  resolveBlockCanvasPreview,
+  type CanvasPreviewOptions,
+  type MediaSummaryOptions,
+  type MediaSummaryRenderOptions,
+} from './media.js'

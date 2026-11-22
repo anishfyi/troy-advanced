@@ -255,6 +255,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
         crop: typeof flags.crop === 'string' ? flags.crop : undefined,
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+        showMediaSummary: Boolean(flags.media),
         annotate: Boolean(flags.annotate),
       })
       if (flags.json) console.log(JSON.stringify(res, null, 2))
@@ -323,6 +324,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         density: typeof flags.density === 'string' ? flags.density : undefined,
         crop: typeof flags.crop === 'string' ? flags.crop : undefined,
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+        showMediaSummary: Boolean(flags.media),
         since: Boolean(flags.since),
         asciiOnly: true,
       })
@@ -353,6 +355,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           density: typeof flags.density === 'string' ? flags.density : undefined,
           crop: typeof flags.crop === 'string' ? flags.crop : undefined,
           ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+          showMediaSummary: Boolean(flags.media),
         },
       })
       break

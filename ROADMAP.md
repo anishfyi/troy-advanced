@@ -14,7 +14,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M09: Sobel edge-detection ASCII mode (`mode: 'edge'`) in `src/ascii/pixels.ts` for crisp UI wireframe outlines (`/\-|`)
 - [x] M10: Bounding-box wireframe drawing in `renderRgbaToAscii` so Set-of-Marks draws actual `+--[e3]--+` rectangles around clickable elements
 - [x] M11: Region crop support (`--crop x,y,w,h` or `--ref eN`) to zoom in on a single chart, canvas, or modal in ASCII
-- [ ] M12: Image/Canvas extraction summary showing dimensions, bounding boxes, and auto-ASCII preview of `<canvas>` elements
+- [x] M12: Image/Canvas extraction summary showing dimensions, bounding boxes, and auto-ASCII preview of `<canvas>` elements
 - [ ] M13: Strict 7-bit ASCII sanitizer tests covering CJK, emoji, RTL marks, smart quotes, zero-width chars, and ANSI injection stripping
 - [ ] M14: Snapshot-to-Markdown exporter (`renderPageMarkdown`) preserving inline `[eN]` refs for hybrid AI workflows
 - [ ] M15: Benchmark & golden snapshot tests verifying ASCII layout speed (<5ms per page) and deterministic output

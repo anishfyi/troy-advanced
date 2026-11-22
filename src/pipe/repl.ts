@@ -78,10 +78,13 @@ export async function executePipeCommand(
       let crop: string | undefined
       let ref: string | undefined
       let since = false
+      let showMediaSummary = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
         if (tok === '--since') {
           since = true
+        } else if (tok === '--media') {
+          showMediaSummary = true
         } else if (tok === '--density' && rest[i + 1]) {
           density = rest[++i]
         } else if (tok.startsWith('--density=')) {
@@ -100,7 +103,7 @@ export async function executePipeCommand(
           width = Number(tok)
         }
       }
-      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, crop, ref, since, asciiOnly: true })
+      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, crop, ref, since, showMediaSummary, asciiOnly: true })
       return { output: format(res) }
     }
     case 'visual': {

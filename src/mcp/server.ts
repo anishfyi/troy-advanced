@@ -33,6 +33,7 @@ const MCP_TOOLS = [
         density: { type: 'string', enum: ['compact', 'normal', 'wide'], description: 'Density profile: compact (small LLM token budgets), normal (default), or wide (140-col)' },
         crop: { type: 'string', description: 'Region crop in viewport pixels: "x,y,w,h"' },
         ref: { type: 'string', description: 'Element ref (e.g. "e5") whose bounding box to zoom into' },
+        showMediaSummary: { type: 'boolean', description: 'Append Image/Canvas extraction summary with dimensions, bounding boxes, and <canvas> ASCII previews' },
         since: { type: 'boolean', description: 'Return only structural delta since previous read' },
       },
     },
@@ -163,6 +164,7 @@ export async function handleMcpRequest(
           density: args.density,
           crop: args.crop,
           ref: args.ref,
+          showMediaSummary: args.showMediaSummary,
           since: args.since,
           asciiOnly: true,
         })
