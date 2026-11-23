@@ -8,6 +8,16 @@ import { formatRefTooltip, renderPageAsciiWithMetrics } from '../ascii/layout.js
 import type { BrowserManager } from '../engine/manager.js'
 import type { ElementDescriptor, PageSnapshot } from '../types.js'
 import {
+  cloneCommandPaletteState,
+  createCommandPaletteState,
+  formatCommandPaletteStatus,
+  moveCommandPaletteSelection,
+  renderCommandPaletteBox,
+  updateCommandPaletteQuery,
+  type CommandPaletteState,
+  type PaletteCommand,
+} from './command-palette.js'
+import {
   cloneFormModalState,
   createFormModalState,
   isFormModalElement,
@@ -35,7 +45,7 @@ import {
   type LinkHintState,
 } from './link-hints.js'
 
-export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint'
+export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint' | 'palette'
 
 export interface TuiKeyEvent {
   name?: string
@@ -108,6 +118,7 @@ export interface TuiState {
   inspectorMaxScrollOffset: number
   formModal: FormModalState | null
   linkHint: LinkHintState | null
+  palette: CommandPaletteState | null
   exited: boolean
 }
 
@@ -143,6 +154,7 @@ export class TerminalBrowserController {
   private inspectorViewportRows = 12
   private formModal: FormModalState | null = null
   private linkHint: LinkHintState | null = null
+  private palette: CommandPaletteState | null = null
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -156,8 +168,8 @@ export class TerminalBrowserController {
     this.splitPane = Boolean(opts.splitPane)
     this.inspectorTab = opts.inspectorTab ?? 'console'
     this.statusMessage = this.isRawModeEnabled()
-      ? 'Keys: j/k scroll | g/G top/bottom | f jump | / search | : cmd | Tab focus | Enter act | i inspector | q quit'
-      : 'Type a command (open <url>, click e1, fill e2 txt, split, console, network, refs, activity, quit)'
+      ? 'Keys: j/k scroll | 1-9/t/w tabs | f jump | Ctrl+P palette | / search | : cmd | Tab focus | Enter act | i inspector | q quit'
+      : 'Type a command (open <url>, newtab, close, tabs, palette, click e1, fill e2 txt, split, quit)'
   }
 
   isRawModeEnabled(): boolean {
@@ -191,6 +203,7 @@ export class TerminalBrowserController {
       inspectorMaxScrollOffset: this.inspectorMaxScrollOffset,
       formModal: cloneFormModalState(this.formModal),
       linkHint: cloneLinkHintState(this.linkHint),
+      palette: cloneCommandPaletteState(this.palette),
       exited: this.exited,
     }
   }
@@ -294,6 +307,9 @@ export class TerminalBrowserController {
   }
 
   private buildStatusLine(): string {
+    if (this.mode === 'palette' && this.palette) {
+      return formatCommandPaletteStatus(this.palette, { asciiOnly: this.asciiOnly })
+    }
     if (this.mode === 'modal' && this.formModal) {
       const action = this.formModal.kind === 'select' ? 'Select' : 'Edit'
       return `MODAL ${action} [${this.formModal.ref}] <${this.formModal.tag}> | Enter: submit | Esc: cancel`
@@ -496,6 +512,14 @@ export class TerminalBrowserController {
         color: this.color,
       })
       frame = overlayModalOnFrame(frame, modalLines, { asciiOnly: this.asciiOnly })
+    } else if (this.mode === 'palette' && this.palette) {
+      const paletteLines = renderCommandPaletteBox(this.palette, {
+        maxWidth: width,
+        maxHeight: height,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+      })
+      frame = overlayModalOnFrame(frame, paletteLines, { asciiOnly: this.asciiOnly })
     }
 
     if (this.output.isTTY) {
@@ -854,6 +878,287 @@ export class TerminalBrowserController {
     return { shouldExit: false, drawn: false }
   }
 
+  private resetTabViewState(): void {
+    this.scrollOffset = 0
+    this.focusedRef = null
+    this.focusedRefIndex = -1
+    this.focusedLineIndex = null
+    this.searchMatches = []
+    this.searchMatchIndex = -1
+  }
+
+  private switchToTabSlot(slot: number): { switched: boolean; refresh: boolean } {
+    const tabs = this.manager.listTabs()
+    if (tabs.length === 0) {
+      this.statusMessage = 'No open tabs'
+      return { switched: false, refresh: false }
+    }
+    const idx = slot - 1
+    if (idx < 0 || idx >= tabs.length) {
+      this.statusMessage = `No tab at slot ${slot} (${tabs.length} open)`
+      return { switched: false, refresh: false }
+    }
+    const target = tabs[idx]!
+    const label = (target.title || target.url || 'New Tab').replace(/\s+/g, ' ').trim()
+    if (target.active) {
+      this.statusMessage = `Already on tab ${slot}/${tabs.length} (#${target.id}: ${label})`
+      return { switched: false, refresh: false }
+    }
+    const res = this.manager.activateTab(target.id)
+    if (!res.ok) {
+      this.statusMessage = `Error: ${res.error}`
+      return { switched: false, refresh: false }
+    }
+    this.resetTabViewState()
+    this.statusMessage = `Switched to tab ${slot}/${tabs.length} (#${target.id}: ${label})`
+    return { switched: true, refresh: true }
+  }
+
+  private async openNewTab(url?: string): Promise<{ refresh: boolean }> {
+    const trimmed = url?.trim()
+    const res = await this.manager.openTab(trimmed || undefined, { activate: true })
+    if (!res.ok) {
+      this.statusMessage = `Refused: ${res.error}`
+      return { refresh: false }
+    }
+    this.resetTabViewState()
+    const count = this.manager.listTabs().length
+    this.statusMessage = trimmed
+      ? `Opened tab #${res.id}: ${res.url} (${count} open)`
+      : `Opened new tab #${res.id} (${count} open)`
+    return { refresh: true }
+  }
+
+  private async closeActiveTab(explicitTabId?: number): Promise<{ refresh: boolean }> {
+    const tabs = this.manager.listTabs()
+    if (tabs.length === 0) {
+      return this.openNewTab()
+    }
+
+    const targetIdx =
+      explicitTabId !== undefined && Number.isFinite(explicitTabId)
+        ? tabs.findIndex((t) => t.id === explicitTabId)
+        : tabs.findIndex((t) => t.active)
+    const resolvedIdx = targetIdx >= 0 ? targetIdx : 0
+    const target = tabs[resolvedIdx]
+    if (!target) {
+      this.statusMessage = `Error: no tab ${explicitTabId}`
+      return { refresh: false }
+    }
+
+    if (tabs.length <= 1) {
+      await this.manager.closeTab(target.id)
+      const opened = await this.manager.openTab(undefined, { activate: true })
+      this.resetTabViewState()
+      this.statusMessage = opened.ok
+        ? `Closed last tab #${target.id}; opened blank tab #${opened.id}`
+        : `Closed tab #${target.id}`
+      return { refresh: true }
+    }
+
+    const closed = await this.manager.closeTab(target.id)
+    if (!closed.ok) {
+      this.statusMessage = `Error: ${closed.error}`
+      return { refresh: false }
+    }
+
+    const remaining = this.manager.listTabs()
+    const nextIdx = Math.min(resolvedIdx, remaining.length - 1)
+    const nextTab = remaining[nextIdx]
+    if (nextTab) {
+      this.manager.activateTab(nextTab.id)
+    }
+    this.resetTabViewState()
+    this.statusMessage = nextTab
+      ? `Closed tab #${target.id} -> tab #${nextTab.id} (${remaining.length} open)`
+      : `Closed tab #${target.id}`
+    return { refresh: true }
+  }
+
+  private enterCommandPalette(initialQuery = ''): void {
+    const state = createCommandPaletteState(
+      {
+        tabs: this.manager.listTabs(),
+        splitPane: this.splitPane,
+        asciiOnly: this.asciiOnly,
+        hasFocusedRef: Boolean(this.focusedRef),
+      },
+      initialQuery,
+    )
+    this.palette = state
+    this.mode = 'palette'
+    this.inputBuffer = ''
+  }
+
+  private async executePaletteCommand(
+    cmd: PaletteCommand,
+  ): Promise<{ shouldExit: boolean; skipDraw?: boolean; refresh?: boolean }> {
+    switch (cmd.action.type) {
+      case 'quit':
+        this.exited = true
+        return { shouldExit: true }
+      case 'new-tab': {
+        const { refresh } = await this.openNewTab()
+        return { shouldExit: false, refresh }
+      }
+      case 'close-tab': {
+        const { refresh } = await this.closeActiveTab()
+        return { shouldExit: false, refresh }
+      }
+      case 'switch-tab': {
+        const res = this.manager.activateTab(cmd.action.tabId)
+        if (res.ok) {
+          this.resetTabViewState()
+          const count = this.manager.listTabs().length
+          this.statusMessage = `Switched to tab ${cmd.action.slot}/${count} (#${cmd.action.tabId})`
+          return { shouldExit: false, refresh: true }
+        }
+        this.statusMessage = `Error: ${res.error}`
+        return { shouldExit: false, refresh: false }
+      }
+      case 'enter-hint':
+        this.enterHintMode()
+        return { shouldExit: false, refresh: false }
+      case 'enter-search':
+        this.mode = 'search'
+        this.inputBuffer = ''
+        return { shouldExit: false, refresh: false }
+      case 'clear-focus':
+        this.focusedRef = null
+        this.focusedRefIndex = -1
+        this.statusMessage = 'Focus cleared'
+        return { shouldExit: false, refresh: false }
+      case 'prompt':
+        this.mode = 'command'
+        this.inputBuffer = cmd.action.prefix
+        return { shouldExit: false, refresh: false }
+      case 'command':
+        return this.executeCommand(cmd.action.command)
+    }
+  }
+
+  private async handlePaletteKeypress(
+    seq: string,
+    k: TuiKeyEvent,
+  ): Promise<{ shouldExit: boolean; drawn: boolean }> {
+    const palette = this.palette
+    if (!palette) {
+      this.mode = 'normal'
+      return { shouldExit: false, drawn: false }
+    }
+    const name = k.name ?? ''
+
+    if (name === 'escape' || (k.ctrl && name === 'p')) {
+      this.palette = null
+      this.mode = 'normal'
+      this.statusMessage = 'Command palette closed'
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'return' || name === 'enter') {
+      const selected = palette.filtered[palette.selectedIndex]
+      if (!selected) {
+        this.statusMessage = `No commands match "${palette.query}"`
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      this.palette = null
+      this.mode = 'normal'
+      const result = await this.executePaletteCommand(selected)
+      if (result.shouldExit) {
+        return { shouldExit: true, drawn: false }
+      }
+      if (!result.skipDraw) {
+        await this.draw({ refresh: result.refresh })
+      }
+      return { shouldExit: false, drawn: !result.skipDraw }
+    }
+
+    if (name === 'down' || (k.ctrl && (name === 'n' || name === 'j')) || (name === 'tab' && !k.shift)) {
+      this.palette = moveCommandPaletteSelection(palette, 1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'up' || (k.ctrl && name === 'k') || (name === 'tab' && k.shift)) {
+      this.palette = moveCommandPaletteSelection(palette, -1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'home') {
+      this.palette = { ...palette, selectedIndex: 0 }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'end') {
+      this.palette = { ...palette, selectedIndex: Math.max(0, palette.filtered.length - 1) }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'left') {
+      this.palette = { ...palette, cursor: Math.max(0, palette.cursor - 1) }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'right') {
+      this.palette = { ...palette, cursor: Math.min(palette.query.length, palette.cursor + 1) }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (k.ctrl && name === 'a') {
+      this.palette = { ...palette, cursor: 0 }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (k.ctrl && name === 'e') {
+      this.palette = { ...palette, cursor: palette.query.length }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (k.ctrl && name === 'u') {
+      this.palette = updateCommandPaletteQuery(palette, '', 0)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'backspace') {
+      if (palette.cursor > 0) {
+        const nextQuery = palette.query.slice(0, palette.cursor - 1) + palette.query.slice(palette.cursor)
+        this.palette = updateCommandPaletteQuery(palette, nextQuery, palette.cursor - 1)
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      return { shouldExit: false, drawn: false }
+    }
+
+    if (name === 'delete') {
+      if (palette.cursor < palette.query.length) {
+        const nextQuery = palette.query.slice(0, palette.cursor) + palette.query.slice(palette.cursor + 1)
+        this.palette = updateCommandPaletteQuery(palette, nextQuery, palette.cursor)
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      return { shouldExit: false, drawn: false }
+    }
+
+    if (!k.ctrl && !k.meta && seq.length > 0 && seq >= ' ' && seq !== '\x7f') {
+      const nextQuery = palette.query.slice(0, palette.cursor) + seq + palette.query.slice(palette.cursor)
+      this.palette = updateCommandPaletteQuery(palette, nextQuery, palette.cursor + seq.length)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    return { shouldExit: false, drawn: false }
+  }
+
   private async runSearch(query: string): Promise<void> {
     const trimmed = query.trim()
     this.searchQuery = trimmed
@@ -981,12 +1286,30 @@ export class TerminalBrowserController {
         const res = this.manager.grantOrigin(arg)
         this.statusMessage = res.ok ? `Granted ${res.origin}` : `Error: ${res.error}`
       } else if (cmd === 'tab' || cmd === 't') {
-        const res = this.manager.activateTab(Number(rest[0]))
-        this.scrollOffset = 0
-        this.focusedRef = null
-        this.focusedRefIndex = -1
-        this.statusMessage = res.ok ? `Switched to tab ${rest[0]}` : `Error: ${res.error}`
-        refresh = true
+        if (!rest[0]) {
+          const opened = await this.openNewTab()
+          refresh = opened.refresh
+        } else {
+          const res = this.manager.activateTab(Number(rest[0]))
+          this.resetTabViewState()
+          this.statusMessage = res.ok ? `Switched to tab ${rest[0]}` : `Error: ${res.error}`
+          refresh = res.ok
+        }
+      } else if (cmd === 'newtab' || cmd === 'tabnew') {
+        const opened = await this.openNewTab(arg || undefined)
+        refresh = opened.refresh
+      } else if (cmd === 'close' || cmd === 'tabclose' || cmd === 'w') {
+        const targetId = rest[0] ? Number(rest[0]) : undefined
+        const closed = await this.closeActiveTab(targetId)
+        refresh = closed.refresh
+      } else if (cmd === 'tabs') {
+        const tabs = this.manager.listTabs()
+        const summary = tabs
+          .map((t, i) => `${i + 1}:${t.active ? '*' : ''}#${t.id}(${(t.title || t.url || 'New Tab').slice(0, 18)})`)
+          .join(' | ')
+        this.statusMessage = `Tabs (${tabs.length}): ${summary || '(none)'}`
+      } else if (cmd === 'palette') {
+        this.enterCommandPalette(arg)
       } else if (cmd === 'visual' || cmd === 'v') {
         const res = await this.manager.runTool(undefined, 'page_screenshot_ascii', {
           width: Math.max(40, Math.min(120, (this.output.columns || 80) - 4)),
@@ -1050,7 +1373,7 @@ export class TerminalBrowserController {
         }
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
-          'Keys: j/k g/G f / : Tab Enter i [/] I q | Cmds: open <url> | click eN | fill eN <txt> | hint [N] | split | console|network|refs|activity | quit'
+          'Keys: j/k g/G 1-9/t/w Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | newtab | close | tabs | palette | click eN | fill eN <txt> | hint [N] | split | quit'
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`
@@ -1077,6 +1400,11 @@ export class TerminalBrowserController {
     if (k.ctrl && name === 'c') {
       this.exited = true
       return { shouldExit: true, drawn: false }
+    }
+
+    // Command palette mode (Ctrl+P)
+    if (this.mode === 'palette') {
+      return this.handlePaletteKeypress(seq, k)
     }
 
     // Inline form-filling modal mode
@@ -1142,9 +1470,27 @@ export class TerminalBrowserController {
     }
 
     // Normal mode single-key bindings
+    if (k.ctrl && name === 'p') {
+      this.enterCommandPalette()
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
     if (!k.ctrl && !k.meta && seq === 'q') {
       this.exited = true
       return { shouldExit: true, drawn: false }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 't') {
+      const { refresh } = await this.openNewTab()
+      await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'w') {
+      const { refresh } = await this.closeActiveTab()
+      await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
     }
 
     if (!k.ctrl && !k.meta && !k.shift && seq === 'i') {
@@ -1181,6 +1527,12 @@ export class TerminalBrowserController {
         await this.draw()
         return { shouldExit: false, drawn: true }
       }
+    }
+
+    if (!k.ctrl && !k.meta && /^[1-9]$/.test(seq)) {
+      const { refresh } = this.switchToTabSlot(Number(seq))
+      await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
     }
 
     if ((!k.ctrl && !k.meta && seq === 'j') || name === 'down') {
