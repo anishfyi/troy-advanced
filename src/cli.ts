@@ -40,6 +40,7 @@ import { runMcpStdioServer } from './mcp/server.js'
 import { runPipeRepl } from './pipe/repl.js'
 import { runTerminalBrowser } from './tui/terminal-browser.js'
 import { parseInspectorTab } from './tui/inspector.js'
+import { parseViewMode } from './tui/pixel-preview.js'
 import { parseNonTtyPolicy } from './tui/tty-fallback.js'
 
 const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI browser
@@ -50,7 +51,7 @@ Daemon & Modes:
   daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
-  browse [url] [--ascii] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
+  browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Interactive ASCII terminal browser (auto-detects piped/non-TTY fallback)
   mcp          [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Model Context Protocol stdio server
@@ -396,12 +397,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const splitPaneFlag = Boolean(flags.split) || Boolean(flags.inspector)
       const nonTtyModeFlag =
         typeof flags['non-tty'] === 'string' ? parseNonTtyPolicy(flags['non-tty']) : undefined
+      const viewModeFlag =
+        typeof flags.view === 'string' ? (parseViewMode(flags.view) ?? undefined) : undefined
       await runTerminalBrowser(manager, {
         initialUrl: positional[1],
         asciiOnly: flags.ascii !== undefined ? Boolean(flags.ascii) : undefined,
         splitPane: splitPaneFlag,
         inspectorTab: inspectorTabFlag,
         nonTtyMode: nonTtyModeFlag,
+        viewMode: viewModeFlag,
       })
     } finally {
       await manager.close()

@@ -46,6 +46,15 @@ import {
   type LinkHintState,
 } from './link-hints.js'
 import {
+  cycleViewMode,
+  formatViewModeLabel,
+  isPixelViewMode,
+  parseViewMode,
+  renderPixelPreviewFrame,
+  type PixelPreviewSource,
+  type TuiViewMode,
+} from './pixel-preview.js'
+import {
   TerminalResizeWatcher,
   dimensionsEqual,
   formatResizeStatus,
@@ -147,6 +156,8 @@ export interface TuiOptions {
   nonTtyMode?: NonTtyPolicy
   /** Suppress the one-line diagnostic notice written to stderr when non-TTY fallback activates. */
   suppressFallbackNotice?: boolean
+  /** Initial view mode: layout (default), pixel-ascii, braille, or halfblock. */
+  viewMode?: TuiViewMode
 }
 
 export interface TuiSearchMatch {
@@ -193,6 +204,8 @@ export interface TuiState {
   currentPageBookmarked: boolean
   runtimeMode: TuiRuntimeMode
   ttyCapabilities: TuiTtyCapabilities
+  viewMode: TuiViewMode
+  pixelPreviewSource: PixelPreviewSource | null
   exited: boolean
 }
 
@@ -240,6 +253,9 @@ export class TerminalBrowserController {
   private sidebarSuspendedByWidth = false
   private splitPaneSuspendedByWidth = false
   private fallbackNoticeEmitted = false
+  private viewMode: TuiViewMode
+  private pixelPreviewSource: PixelPreviewSource | null = null
+  private cachedScreenshot: { tabId: number; epoch: number; png: Buffer | null } | null = null
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -267,6 +283,7 @@ export class TerminalBrowserController {
         : this.ttyCapabilities.isDumbTerm || (!this.ttyCapabilities.stdoutIsTTY && !this.ttyCapabilities.allowColor)
     this.splitPane = Boolean(opts.splitPane)
     this.inspectorTab = opts.inspectorTab ?? 'console'
+    this.viewMode = opts.viewMode ?? 'layout'
     const defaultLibraryPath = manager.profileDir ? path.join(manager.profileDir, 'tui-library.json') : null
     const libraryPath = opts.libraryPath === undefined ? defaultLibraryPath : opts.libraryPath
     this.library = new BookmarkHistoryStore({
@@ -279,8 +296,8 @@ export class TerminalBrowserController {
       this.mode = 'sidebar'
     }
     this.statusMessage = this.isRawModeEnabled()
-      ? 'Keys: j/k scroll | 1-9/t/w tabs | b/H library | f jump | Ctrl+P palette | / search | : cmd | Tab focus | i inspector | q quit'
-      : 'Type a command (open <url>, bookmarks, history, newtab, close, tabs, palette, click e1, split, quit)'
+      ? 'Keys: j/k scroll | v view | 1-9/t/w tabs | b/H library | f jump | Ctrl+P palette | / search | : cmd | Tab focus | i inspector | q quit'
+      : 'Type a command (open <url>, view, bookmarks, history, newtab, close, tabs, palette, click e1, split, quit)'
   }
 
   getLibrary(): BookmarkHistoryStore {
@@ -335,6 +352,8 @@ export class TerminalBrowserController {
       currentPageBookmarked: Boolean(this.lastSnapshot?.url && this.library.isBookmarked(this.lastSnapshot.url)),
       runtimeMode: this.ttyCapabilities.mode,
       ttyCapabilities: { ...this.ttyCapabilities },
+      viewMode: this.viewMode,
+      pixelPreviewSource: this.pixelPreviewSource,
       exited: this.exited,
     }
   }
@@ -587,6 +606,44 @@ export class TerminalBrowserController {
     }
   }
 
+  private setViewMode(nextMode: TuiViewMode, customMessage?: string): void {
+    this.viewMode = nextMode
+    if (!isPixelViewMode(nextMode)) {
+      this.pixelPreviewSource = null
+    }
+    this.scrollOffset = 0
+    this.statusMessage = customMessage ?? `View mode: ${formatViewModeLabel(nextMode)} (press v to cycle)`
+  }
+
+  private cycleCurrentViewMode(delta: 1 | -1 = 1): void {
+    this.setViewMode(cycleViewMode(this.viewMode, delta))
+  }
+
+  private async captureCachedScreenshot(forceRefresh: boolean): Promise<Buffer | null> {
+    const tabId = this.lastSnapshot?.tabId ?? 0
+    const epoch = this.lastSnapshot?.epoch ?? 0
+    if (
+      !forceRefresh &&
+      this.cachedScreenshot &&
+      this.cachedScreenshot.tabId === tabId &&
+      this.cachedScreenshot.epoch === epoch
+    ) {
+      return this.cachedScreenshot.png
+    }
+    try {
+      const res = await this.manager.runTool(undefined, 'page_screenshot', {})
+      const png =
+        res.ok && typeof res.dataBase64 === 'string' && res.dataBase64.length > 0
+          ? Buffer.from(res.dataBase64, 'base64')
+          : null
+      this.cachedScreenshot = { tabId, epoch, png }
+      return png
+    } catch {
+      this.cachedScreenshot = { tabId, epoch, png: null }
+      return null
+    }
+  }
+
   private findElementByRef(ref: string | null): ElementDescriptor | undefined {
     if (!ref || !this.lastSnapshot) return undefined
     return this.lastSnapshot.elements.find((e) => e.ref === ref)
@@ -609,7 +666,48 @@ export class TerminalBrowserController {
 
     const effectiveFocusedRef = this.mode === 'hint' ? undefined : (this.focusedRef ?? undefined)
 
-    if (!shouldRefresh && this.lastSnapshot) {
+    if (isPixelViewMode(this.viewMode)) {
+      if (shouldRefresh || !this.lastSnapshot) {
+        this.cachedScreenshot = null
+        const res = await this.manager.renderAscii(undefined, {
+          width: pageWidth,
+          height,
+          asciiOnly: this.asciiOnly,
+          color: this.color,
+          scrollOffset: this.scrollOffset,
+          statusMessage: this.buildStatusLine(),
+          focusedRef: effectiveFocusedRef,
+        })
+        if (res.ok) {
+          this.syncSnapshotRefs(res.snapshot)
+        }
+      }
+      const tabs = this.manager.listTabs()
+      const activeTab = tabs.find((t) => t.active)
+      const pngBuffer = await this.captureCachedScreenshot(Boolean(opts.refresh))
+      const rendered = renderPixelPreviewFrame({
+        snapshot: this.lastSnapshot,
+        pngBuffer,
+        viewMode: this.viewMode,
+        width: pageWidth,
+        height,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+        scrollOffset: this.scrollOffset,
+        tabs,
+        activeTabId: activeTab?.id ?? this.lastSnapshot?.tabId,
+        statusMessage: this.buildStatusLine(),
+        annotate: true,
+      })
+      this.pixelPreviewSource = rendered.source
+      this.scrollOffset = rendered.scrollOffset
+      this.maxScrollOffset = rendered.maxScrollOffset
+      this.totalLines = rendered.totalLines
+      this.viewportRows = rendered.viewportRows
+      this.focusedLineIndex = null
+      leftFrame = rendered.frame
+    } else if (!shouldRefresh && this.lastSnapshot) {
+      this.pixelPreviewSource = null
       const tabs = this.manager.listTabs()
       const activeTab = tabs.find((t) => t.active)
       let rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
@@ -687,6 +785,8 @@ export class TerminalBrowserController {
       this.viewportRows = rendered.viewportRows
       leftFrame = rendered.ascii
     } else {
+      this.pixelPreviewSource = null
+      this.cachedScreenshot = null
       const res = await this.manager.renderAscii(undefined, {
         width: pageWidth,
         height,
@@ -1164,6 +1264,7 @@ export class TerminalBrowserController {
     this.focusedLineIndex = null
     this.searchMatches = []
     this.searchMatchIndex = -1
+    this.cachedScreenshot = null
   }
 
   private switchToTabSlot(slot: number): { switched: boolean; refresh: boolean } {
@@ -1543,6 +1644,7 @@ export class TerminalBrowserController {
         hasFocusedRef: Boolean(this.focusedRef),
         sidebarOpen: this.sidebar !== null,
         currentPageBookmarked: Boolean(this.lastSnapshot?.url && this.library.isBookmarked(this.lastSnapshot.url)),
+        viewMode: this.viewMode,
       },
       initialQuery,
     )
@@ -1925,28 +2027,49 @@ export class TerminalBrowserController {
         } else {
           this.statusMessage = `Unknown history arg "${sub}". Use open|close|clear|list`
         }
-      } else if (cmd === 'visual' || cmd === 'v') {
-        const res = await this.manager.runTool(undefined, 'page_screenshot_ascii', {
-          width: Math.max(40, Math.min(120, (this.output.columns || 80) - 4)),
-          mode:
-            rest[0] === 'braille'
-              ? 'braille'
-              : rest[0] === 'halfblock'
-                ? 'halfblock'
-                : rest[0] === 'edge'
-                  ? 'edge'
-                  : 'ascii',
-          annotate: true,
-        })
-        if (res.ok && typeof res.ascii === 'string') {
-          const payload = !this.color ? sanitizeNonTtyOutput(res.ascii) : res.ascii
-          if (!safeWriteStream(this.output, `\n${payload}\n`)) {
-            this.exited = true
-            return { shouldExit: true, skipDraw: true }
+      } else if (cmd === 'view') {
+        const sub = (rest[0] ?? '').trim().toLowerCase()
+        if (!sub || sub === 'next' || sub === 'cycle' || sub === 'toggle') {
+          this.cycleCurrentViewMode(1)
+        } else if (sub === 'prev' || sub === 'back') {
+          this.cycleCurrentViewMode(-1)
+        } else {
+          const parsed = parseViewMode(sub)
+          if (parsed) {
+            this.setViewMode(parsed)
+          } else {
+            this.statusMessage = `Unknown view mode "${sub}". Use layout|pixel-ascii|braille|halfblock|next|prev`
           }
-          return { shouldExit: false, skipDraw: true }
         }
-        this.statusMessage = `Visual error: ${res.error}`
+      } else if (cmd === 'visual' || cmd === 'v') {
+        const sub = (rest[0] ?? '').trim().toLowerCase()
+        if (sub === 'edge') {
+          const res = await this.manager.runTool(undefined, 'page_screenshot_ascii', {
+            width: Math.max(40, Math.min(120, (this.output.columns || 80) - 4)),
+            mode: 'edge',
+            annotate: true,
+          })
+          if (res.ok && typeof res.ascii === 'string') {
+            const payload = !this.color ? sanitizeNonTtyOutput(res.ascii) : res.ascii
+            if (!safeWriteStream(this.output, `\n${payload}\n`)) {
+              this.exited = true
+              return { shouldExit: true, skipDraw: true }
+            }
+            return { shouldExit: false, skipDraw: true }
+          }
+          this.statusMessage = `Visual error: ${res.error}`
+        } else if (!sub || sub === 'next' || sub === 'cycle' || sub === 'toggle') {
+          this.cycleCurrentViewMode(1)
+        } else if (sub === 'prev' || sub === 'back') {
+          this.cycleCurrentViewMode(-1)
+        } else {
+          const parsed = parseViewMode(sub)
+          if (parsed) {
+            this.setViewMode(parsed)
+          } else {
+            this.statusMessage = `Unknown visual mode "${sub}". Use layout|pixel-ascii|braille|halfblock|edge`
+          }
+        }
       } else if (cmd === 'split' || cmd === 'inspector') {
         const sub = (rest[0] ?? '').toLowerCase()
         if (!sub || sub === 'toggle') {
@@ -1995,7 +2118,7 @@ export class TerminalBrowserController {
         return { shouldExit: false, skipDraw: true }
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
-          'Keys: j/k g/G 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | bookmarks | history | newtab | close | tabs | palette | split | quit'
+          'Keys: j/k g/G v/V 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | view | bookmarks | history | newtab | close | tabs | palette | split | quit'
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`
@@ -2139,6 +2262,18 @@ export class TerminalBrowserController {
 
     if (!k.ctrl && !k.meta && (seq === 'B' || (k.shift && name === 'b'))) {
       this.toggleCurrentPageBookmark()
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'v') {
+      this.cycleCurrentViewMode(1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && (seq === 'V' || (k.shift && name === 'v'))) {
+      this.cycleCurrentViewMode(-1)
       await this.draw()
       return { shouldExit: false, drawn: true }
     }

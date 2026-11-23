@@ -3,6 +3,7 @@
 
 import { sanitizeAscii, stripAnsi } from '../ascii/sanitize.js'
 import type { TabSummary } from '../types.js'
+import { cycleViewMode, formatViewModeLabel, type TuiViewMode } from './pixel-preview.js'
 
 export type PaletteCategory = 'Tab' | 'Navigate' | 'Page' | 'Library' | 'Inspector' | 'View' | 'Session'
 
@@ -36,6 +37,7 @@ export interface CommandPaletteContext {
   hasFocusedRef: boolean
   sidebarOpen?: boolean
   currentPageBookmarked?: boolean
+  viewMode?: TuiViewMode
 }
 
 export interface CommandPaletteState {
@@ -327,22 +329,49 @@ export function buildPaletteCommands(ctx: CommandPaletteContext): PaletteCommand
       action: { type: 'command', command: 'reflow' },
     },
     {
-      id: 'view.visual-ascii',
-      label: 'Visual Screenshot (ASCII)',
+      id: 'view.cycle-preview',
+      label: `Cycle Pixel Preview (next: ${formatViewModeLabel(cycleViewMode(ctx.viewMode ?? 'layout', 1))})`,
       category: 'View',
-      shortcut: ':visual',
-      description: 'Render pixel screenshot as ASCII art',
-      keywords: ['screenshot', 'image', 'pixels'],
-      action: { type: 'command', command: 'visual ascii' },
+      shortcut: 'v',
+      description: 'Cycle live view: Layout ASCII -> Pixel ASCII -> Braille -> Halfblock',
+      keywords: ['view', 'pixel', 'preview', 'braille', 'halfblock', 'layout', 'toggle', 'cycle'],
+      action: { type: 'command', command: 'view next' },
+    },
+    {
+      id: 'view.mode-layout',
+      label: 'View Mode: Layout ASCII',
+      category: 'View',
+      shortcut: ':view layout',
+      description: 'Switch back to interactive DOM Layout ASCII view',
+      keywords: ['view', 'layout', 'dom', 'text', 'ascii'],
+      action: { type: 'command', command: 'view layout' },
+    },
+    {
+      id: 'view.visual-ascii',
+      label: 'View Mode: Pixel ASCII',
+      category: 'View',
+      shortcut: ':view pixel',
+      description: 'Live pixel preview rendered as 7-bit ASCII with [eN] boxes',
+      keywords: ['screenshot', 'image', 'pixels', 'view', 'pixel-ascii'],
+      action: { type: 'command', command: 'view pixel-ascii' },
     },
     {
       id: 'view.visual-braille',
-      label: 'Visual Screenshot (Braille)',
+      label: 'View Mode: Braille',
       category: 'View',
-      shortcut: ':visual braille',
-      description: 'Render pixel screenshot as Braille dots',
-      keywords: ['screenshot', 'image', 'braille'],
-      action: { type: 'command', command: 'visual braille' },
+      shortcut: ':view braille',
+      description: 'Live pixel preview rendered as high-resolution Unicode Braille dots',
+      keywords: ['screenshot', 'image', 'braille', 'view', 'pixels'],
+      action: { type: 'command', command: 'view braille' },
+    },
+    {
+      id: 'view.visual-halfblock',
+      label: 'View Mode: Halfblock',
+      category: 'View',
+      shortcut: ':view halfblock',
+      description: 'Live pixel preview rendered as ANSI truecolor half-blocks',
+      keywords: ['screenshot', 'image', 'halfblock', 'truecolor', 'color', 'view', 'pixels'],
+      action: { type: 'command', command: 'view halfblock' },
     },
     {
       id: 'view.visual-edge',
