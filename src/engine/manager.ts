@@ -7,6 +7,7 @@ import os from 'node:os'
 import type {
   ActStep,
   AsciiRenderOptions,
+  ElementDescriptor,
   EngineKind,
   MarkdownRenderOptions,
   PageSnapshot,
@@ -17,7 +18,12 @@ import type {
   TabSummary,
   TrackerBlockingOptions,
 } from '../types.js'
-import { ElementRegistry } from '../agent/elements.js'
+import {
+  ElementRegistry,
+  recoverElementMatch,
+  type RefContext,
+  type RefRecoveryStrategy,
+} from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
@@ -441,6 +447,47 @@ export class BrowserManager {
     }
   }
 
+  private async trySameEpochDomRecovery(
+    session: TabSession,
+    refName: string,
+    staleItem: ElementDescriptor,
+    staleSelector: string,
+    startCtx: RefContext,
+  ): Promise<
+    | { recovered: true; selector: string; item: ElementDescriptor; strategy: RefRecoveryStrategy }
+    | { recovered: false }
+  > {
+    if (
+      session.driver.id !== startCtx.tabId ||
+      session.driver.getUrl() !== startCtx.url ||
+      session.driver.getEpoch() !== startCtx.epoch
+    ) {
+      return { recovered: false }
+    }
+
+    const freshSnap = await session.driver.snapshot()
+    if (
+      freshSnap.tabId !== startCtx.tabId ||
+      freshSnap.url !== startCtx.url ||
+      freshSnap.epoch !== startCtx.epoch
+    ) {
+      return { recovered: false }
+    }
+
+    const match = recoverElementMatch(staleItem, freshSnap.elements)
+    if (!match.recovered || match.selector === staleSelector) {
+      return { recovered: false }
+    }
+
+    session.elements.updateEntry(refName, match.selector, match.item, startCtx)
+    return {
+      recovered: true,
+      selector: match.selector,
+      item: match.item,
+      strategy: match.strategy,
+    }
+  }
+
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const session = this.resolveSession(tabId)
     if (!session) return { ok: false, error: 'no such tab', code: 'no-tab' }
@@ -612,7 +659,19 @@ export class BrowserManager {
         if (args.ref) {
           const resolved = session.elements.resolve(args.ref, ctx())
           if ('error' in resolved) return { ok: false, error: resolved.error }
-          return { ok: true, ref: args.ref, text: resolved.item.text, value: resolved.item.value }
+          return {
+            ok: true,
+            ref: args.ref,
+            text: resolved.item.text,
+            value: resolved.item.value,
+            ...(resolved.recovered
+              ? {
+                  recovered: true,
+                  recoveryStrategy: resolved.recoveryStrategy,
+                  ...(resolved.recoveredRef ? { recoveredRef: resolved.recoveredRef } : {}),
+                }
+              : {}),
+          }
         }
         const snap = await session.driver.snapshot()
         return capPayload({ ok: true, url: snap.url, title: snap.title, content: snap.text })
@@ -641,7 +700,8 @@ export class BrowserManager {
       }
 
       case 'page_click': {
-        const resolved = session.elements.resolve(args.ref, ctx())
+        const startCtx = ctx()
+        const resolved = session.elements.resolve(args.ref, startCtx)
         if ('error' in resolved) return { ok: false, error: resolved.error }
         const decision = authorizeAction({
           name: 'page_click',
@@ -653,21 +713,65 @@ export class BrowserManager {
           return { ok: false, ...decision, error: decision.reason }
         }
         const fromUrl = session.driver.getUrl()
-        const result = await session.driver.click(resolved.selector)
+        let activeSelector = resolved.selector
+        let activeItem = resolved.item
+        let recovered = Boolean(resolved.recovered)
+        let recoveryStrategy = resolved.recoveryStrategy
+        const recoveredRef = resolved.recoveredRef
+
+        let result = await session.driver.click(activeSelector)
+        if (!result.ok && (!result.note || /not found/i.test(result.note))) {
+          const domRec = await this.trySameEpochDomRecovery(
+            session,
+            String(args.ref ?? '').trim(),
+            activeItem,
+            activeSelector,
+            startCtx,
+          )
+          if (domRec.recovered) {
+            const reDecision = authorizeAction({
+              name: 'page_click',
+              item: domRec.item,
+              allowSubmit: Boolean(args.allowSubmit),
+              allowedOrigins: this.allowedOrigins,
+            })
+            if (!reDecision.allowed) {
+              return { ok: false, ...reDecision, error: reDecision.reason }
+            }
+            activeSelector = domRec.selector
+            activeItem = domRec.item
+            recovered = true
+            recoveryStrategy = domRec.strategy
+            result = await session.driver.click(activeSelector)
+          }
+        }
+
         const toUrl = session.driver.getUrl()
         this.memory?.recordAction({
           kind: 'click',
-          selector: resolved.selector,
-          text: resolved.item.text,
+          selector: activeSelector,
+          text: activeItem.text,
           fromUrl,
           toUrl,
           ok: result.ok,
         })
-        return { ...result, url: toUrl, title: session.driver.getTitle() }
+        return {
+          ...result,
+          url: toUrl,
+          title: session.driver.getTitle(),
+          ...(recovered
+            ? {
+                recovered: true,
+                recoveryStrategy,
+                ...(recoveredRef ? { recoveredRef } : {}),
+              }
+            : {}),
+        }
       }
 
       case 'page_fill': {
-        const resolved = session.elements.resolve(args.ref, ctx())
+        const startCtx = ctx()
+        const resolved = session.elements.resolve(args.ref, startCtx)
         if ('error' in resolved) return { ok: false, error: resolved.error }
         const decision = authorizeAction({
           name: 'page_fill',
@@ -679,20 +783,62 @@ export class BrowserManager {
         }
         const text = String(args.text ?? args.value ?? '')
         const clear = args.clear !== undefined ? Boolean(args.clear) : true
-        const result = await session.driver.fill(resolved.selector, text, clear)
+        let activeSelector = resolved.selector
+        let activeItem = resolved.item
+        let recovered = Boolean(resolved.recovered)
+        let recoveryStrategy = resolved.recoveryStrategy
+        const recoveredRef = resolved.recoveredRef
+
+        let result = await session.driver.fill(activeSelector, text, clear)
+        if (!result.ok) {
+          const domRec = await this.trySameEpochDomRecovery(
+            session,
+            String(args.ref ?? '').trim(),
+            activeItem,
+            activeSelector,
+            startCtx,
+          )
+          if (domRec.recovered) {
+            const reDecision = authorizeAction({
+              name: 'page_fill',
+              item: domRec.item,
+              allowedOrigins: this.allowedOrigins,
+            })
+            if (!reDecision.allowed) {
+              return { ok: false, ...reDecision, error: reDecision.reason }
+            }
+            activeSelector = domRec.selector
+            activeItem = domRec.item
+            recovered = true
+            recoveryStrategy = domRec.strategy
+            result = await session.driver.fill(activeSelector, text, clear)
+          }
+        }
+
         this.memory?.recordAction({
           kind: 'fill',
-          selector: resolved.selector,
-          text: resolved.item.text,
+          selector: activeSelector,
+          text: activeItem.text,
           fromUrl: session.driver.getUrl(),
           toUrl: session.driver.getUrl(),
           ok: result.ok,
         })
-        return { ...result, ref: args.ref }
+        return {
+          ...result,
+          ref: args.ref,
+          ...(recovered
+            ? {
+                recovered: true,
+                recoveryStrategy,
+                ...(recoveredRef ? { recoveredRef } : {}),
+              }
+            : {}),
+        }
       }
 
       case 'page_select': {
-        const resolved = session.elements.resolve(args.ref, ctx())
+        const startCtx = ctx()
+        const resolved = session.elements.resolve(args.ref, startCtx)
         if ('error' in resolved) return { ok: false, error: resolved.error }
         const decision = authorizeAction({
           name: 'page_select',
@@ -702,26 +848,132 @@ export class BrowserManager {
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
         }
-        const result = await session.driver.select(resolved.selector, String(args.value ?? ''))
-        return { ...result, ref: args.ref }
+        let activeSelector = resolved.selector
+        let activeItem = resolved.item
+        let recovered = Boolean(resolved.recovered)
+        let recoveryStrategy = resolved.recoveryStrategy
+        const recoveredRef = resolved.recoveredRef
+
+        let result = await session.driver.select(activeSelector, String(args.value ?? ''))
+        if (!result.ok) {
+          const domRec = await this.trySameEpochDomRecovery(
+            session,
+            String(args.ref ?? '').trim(),
+            activeItem,
+            activeSelector,
+            startCtx,
+          )
+          if (domRec.recovered) {
+            const reDecision = authorizeAction({
+              name: 'page_select',
+              item: domRec.item,
+              allowedOrigins: this.allowedOrigins,
+            })
+            if (!reDecision.allowed) {
+              return { ok: false, ...reDecision, error: reDecision.reason }
+            }
+            activeSelector = domRec.selector
+            activeItem = domRec.item
+            recovered = true
+            recoveryStrategy = domRec.strategy
+            result = await session.driver.select(activeSelector, String(args.value ?? ''))
+          }
+        }
+        return {
+          ...result,
+          ref: args.ref,
+          ...(recovered
+            ? {
+                recovered: true,
+                recoveryStrategy,
+                ...(recoveredRef ? { recoveredRef } : {}),
+              }
+            : {}),
+        }
       }
 
       case 'page_press': {
+        const startCtx = ctx()
         let selector: string | undefined
+        let activeItem: ElementDescriptor | undefined
+        let recovered = false
+        let recoveryStrategy: RefRecoveryStrategy | undefined
+        let recoveredRef: string | undefined
         if (args.ref) {
-          const resolved = session.elements.resolve(args.ref, ctx())
+          const resolved = session.elements.resolve(args.ref, startCtx)
           if ('error' in resolved) return { ok: false, error: resolved.error }
           selector = resolved.selector
+          activeItem = resolved.item
+          recovered = Boolean(resolved.recovered)
+          recoveryStrategy = resolved.recoveryStrategy
+          recoveredRef = resolved.recoveredRef
         }
-        const result = await session.driver.press(String(args.key ?? 'Enter'), selector)
-        return { ...result, key: args.key }
+        let result = await session.driver.press(String(args.key ?? 'Enter'), selector)
+        if (!result.ok && selector && activeItem && typeof result.error === 'string' && /not found/i.test(result.error)) {
+          const domRec = await this.trySameEpochDomRecovery(
+            session,
+            String(args.ref ?? '').trim(),
+            activeItem,
+            selector,
+            startCtx,
+          )
+          if (domRec.recovered) {
+            selector = domRec.selector
+            recovered = true
+            recoveryStrategy = domRec.strategy
+            result = await session.driver.press(String(args.key ?? 'Enter'), selector)
+          }
+        }
+        return {
+          ...result,
+          key: args.key,
+          ...(recovered
+            ? {
+                recovered: true,
+                recoveryStrategy,
+                ...(recoveredRef ? { recoveredRef } : {}),
+              }
+            : {}),
+        }
       }
 
       case 'page_hover': {
-        const resolved = session.elements.resolve(args.ref, ctx())
+        const startCtx = ctx()
+        const resolved = session.elements.resolve(args.ref, startCtx)
         if ('error' in resolved) return { ok: false, error: resolved.error }
-        const result = await session.driver.hover(resolved.selector)
-        return { ...result, ref: args.ref }
+        let activeSelector = resolved.selector
+        let activeItem = resolved.item
+        let recovered = Boolean(resolved.recovered)
+        let recoveryStrategy = resolved.recoveryStrategy
+        const recoveredRef = resolved.recoveredRef
+
+        let result = await session.driver.hover(activeSelector)
+        if (!result.ok) {
+          const domRec = await this.trySameEpochDomRecovery(
+            session,
+            String(args.ref ?? '').trim(),
+            activeItem,
+            activeSelector,
+            startCtx,
+          )
+          if (domRec.recovered) {
+            activeSelector = domRec.selector
+            recovered = true
+            recoveryStrategy = domRec.strategy
+            result = await session.driver.hover(activeSelector)
+          }
+        }
+        return {
+          ...result,
+          ref: args.ref,
+          ...(recovered
+            ? {
+                recovered: true,
+                recoveryStrategy,
+                ...(recoveredRef ? { recoveredRef } : {}),
+              }
+            : {}),
+        }
       }
 
       case 'page_scroll': {
