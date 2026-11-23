@@ -117,6 +117,8 @@ export interface BrowserManagerOptions {
   profileDir?: string
   cdpPort?: number
   remoteCdpPort?: number
+  cdpUrl?: string
+  cdpConnectTimeoutMs?: number
   memoryEnabled?: boolean
   chromeBin?: string
   trackerBlocking?: TrackerBlockingOptions
@@ -182,11 +184,14 @@ export class BrowserManager {
         downloads: downloadsOpts,
         dialogs: opts.dialogs,
       })
-    } else if (requested === 'chromium') {
+    } else if (requested === 'chromium' || opts.cdpUrl) {
+      // Explicit --engine chromium or explicit --cdp-url must fail loudly if unreachable
       engine = await ChromiumBrowserEngine.launch({
         chromeBin: opts.chromeBin,
         cdpPort: opts.cdpPort,
         remoteCdpPort: opts.remoteCdpPort,
+        cdpUrl: opts.cdpUrl,
+        cdpConnectTimeoutMs: opts.cdpConnectTimeoutMs,
         profileDir: path.join(profileDir, 'chrome-data'),
         trackerBlocking: opts.trackerBlocking,
         emulation: opts.emulation,

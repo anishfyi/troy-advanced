@@ -34,7 +34,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M27: Download interception & quarantine directory inside profile (blocks unsafe auto-downloads while letting user inspect filenames)
 - [x] M28: Dialog handling (`Page.javascriptDialogOpening`) — auto-dismiss/capture alert/confirm/prompt messages without hanging headless runs
 - [x] M29: Request/Response body inspection (`troy-advanced network --body <reqId>`) for debugging APIs from terminal
-- [ ] M30: Remote CDP proxy support (`--cdp-url ws://...` or `http://...`) for driving Chrome on another EC2 node or SSH tunnel
+- [x] M30: Remote CDP proxy support (`--cdp-url ws://...` or `http://...`) for driving Chrome on another EC2 node or SSH tunnel
 
 ## Track 3: Zero-Chrome Lite Engine Depth (Milestones 31–42)
 - [ ] M31: Persistent file-backed CookieJar (`cookies.json`, `0o600`) with domain/path/expiry/Secure/HttpOnly handling in Lite engine

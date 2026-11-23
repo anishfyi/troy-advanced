@@ -41,19 +41,22 @@ export async function createAgentSocket(
 
   async function handleRoute(pathname: string, body: Record<string, unknown>): Promise<{ status: number; payload: Record<string, unknown> }> {
     switch (pathname) {
-      case '/health':
+      case '/health': {
+        const remoteCdp = manager.engine.getRemoteCdpInfo ? manager.engine.getRemoteCdpInfo() : null
         return {
           status: 200,
           payload: {
             ok: true,
             engine: manager.engine.kind,
             cdpPort: manager.engine.cdpPort,
+            ...(remoteCdp ? { remoteCdp } : {}),
             tabs: manager.listTabs().length,
             crashRecovery: manager.getCrashRecoveryStats(),
             downloads: manager.getDownloadStats(),
             dialogs: manager.getDialogStats(),
           },
         }
+      }
       case '/tabs':
         return { status: 200, payload: { ok: true, tabs: manager.listTabs() } }
       case '/open': {

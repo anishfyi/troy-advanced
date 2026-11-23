@@ -35,6 +35,8 @@ import type {
   WaitResult,
 } from '../types.js'
 
+import type { RemoteCdpInfo } from './remote-cdp.js'
+
 export interface TabDriver {
   readonly id: number
   readonly engine: 'chromium' | 'lite'
@@ -78,6 +80,8 @@ export interface TabDriver {
 export interface BrowserEngine {
   readonly kind: 'chromium' | 'lite'
   readonly cdpPort: number
+  readonly remoteCdpUrl?: string
+  getRemoteCdpInfo?(): RemoteCdpInfo | null
   createTab(initialUrl?: string): Promise<TabDriver>
   getDefaultEmulation?(): EmulationProfile
   setDefaultEmulation?(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile

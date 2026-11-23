@@ -46,7 +46,8 @@ import type {
   WaitResult,
   WaitState,
 } from '../types.js'
-import { CdpClient } from './cdp-client.js'
+import { CdpClient, type CdpConnection } from './cdp-client.js'
+import { discoverRemoteCdp, type RemoteCdpInfo } from './remote-cdp.js'
 import {
   domainFilterMatches,
   filterCookies,
@@ -594,13 +595,14 @@ const MAX_DISCOVERED_FRAMES = 20
 interface ChromiumTabRecoveryHost {
   withRecovery<T>(fn: () => Promise<T>): Promise<T>
   onTabClosed(tab: ChromiumTab): void
+  closeTarget?: (targetId: string) => Promise<void>
 }
 
 export class ChromiumTab implements TabDriver {
   readonly id: number
   readonly engine = 'chromium' as const
   private targetId: string
-  private cdp: CdpClient
+  private cdp: CdpConnection
   private cdpPort: number
   private url = 'about:blank'
   private title = 'New Tab'
@@ -634,7 +636,7 @@ export class ChromiumTab implements TabDriver {
   constructor(
     id: number,
     targetId: string,
-    cdp: CdpClient,
+    cdp: CdpConnection,
     cdpPort: number,
     trackerBlocking?: TrackerBlockingOptions,
     initialEmulation?: EmulationProfile,
@@ -655,7 +657,7 @@ export class ChromiumTab implements TabDriver {
     this.bindCdpListeners()
   }
 
-  private createTrackerBlocker(cdp: CdpClient): CdpTrackerBlocker {
+  private createTrackerBlocker(cdp: CdpConnection): CdpTrackerBlocker {
     return new CdpTrackerBlocker(cdp, this.trackerBlocking, {
       onBlocked: (ev) => {
         this.blockedByFetch.set(ev.url, ev.reason)
@@ -967,7 +969,7 @@ export class ChromiumTab implements TabDriver {
    */
   async reattach(
     newTargetId: string,
-    newCdp: CdpClient,
+    newCdp: CdpConnection,
     newCdpPort: number,
     opts: { restoreUrl?: boolean } = {},
   ): Promise<boolean> {
@@ -2362,6 +2364,10 @@ export class ChromiumTab implements TabDriver {
   async close(): Promise<void> {
     this.recoveryHost?.onTabClosed(this)
     await this.cdp.close()
+    if (this.recoveryHost?.closeTarget) {
+      await this.recoveryHost.closeTarget(this.targetId).catch(() => {})
+      return
+    }
     try {
       await fetch(`http://127.0.0.1:${this.cdpPort}/json/close/${this.targetId}`)
     } catch {
@@ -2375,6 +2381,8 @@ export interface ChromiumLaunchOptions {
   cdpPort?: number
   profileDir?: string
   remoteCdpPort?: number
+  cdpUrl?: string
+  cdpConnectTimeoutMs?: number
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
@@ -2389,6 +2397,8 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   private chromeBin: string | null
   private profileDir: string | null
   private proc: ChildProcess | null
+  private browserCdp: CdpClient | null
+  private remoteCdpInfo: RemoteCdpInfo | null
   private nextTabId = 1
   private trackerBlocking?: TrackerBlockingOptions
   private defaultEmulation: EmulationProfile
@@ -2416,6 +2426,8 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     chromeBin: string | null
     profileDir: string | null
     proc: ChildProcess | null
+    browserCdp?: CdpClient | null
+    remoteCdpInfo?: RemoteCdpInfo | null
     trackerBlocking?: TrackerBlockingOptions
     defaultEmulation?: EmulationProfile
     crashRecovery?: CrashRecoveryOptions
@@ -2427,6 +2439,8 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     this.chromeBin = cfg.chromeBin
     this.profileDir = cfg.profileDir
     this.proc = cfg.proc
+    this.browserCdp = cfg.browserCdp ?? null
+    this.remoteCdpInfo = cfg.remoteCdpInfo ?? null
     this.trackerBlocking = cfg.trackerBlocking
     this.defaultEmulation = cfg.defaultEmulation ? cloneEmulationProfile(cfg.defaultEmulation) : defaultEmulationProfile()
     this.recoveryOpts = resolveCrashRecoveryOptions(cfg.crashRecovery)
@@ -2442,6 +2456,14 @@ export class ChromiumBrowserEngine implements BrowserEngine {
 
   get cdpPort(): number {
     return this._cdpPort
+  }
+
+  get remoteCdpUrl(): string | undefined {
+    return this.remoteCdpInfo?.displayUrl
+  }
+
+  getRemoteCdpInfo(): RemoteCdpInfo | null {
+    return this.remoteCdpInfo ? { ...this.remoteCdpInfo } : null
   }
 
   get canRecover(): boolean {
@@ -2592,6 +2614,51 @@ export class ChromiumBrowserEngine implements BrowserEngine {
 
   static async launch(opts: ChromiumLaunchOptions = {}): Promise<ChromiumBrowserEngine> {
     const initialEmulation = resolveEmulationProfile(opts.emulation)
+
+    if (opts.cdpUrl && opts.cdpUrl.trim()) {
+      const timeoutMs = opts.cdpConnectTimeoutMs ?? 10000
+      const discovered = await discoverRemoteCdp(opts.cdpUrl, { timeoutMs })
+      const browserCdp = await CdpClient.connect(discovered.browserWsUrl, timeoutMs)
+
+      let browserVersion = discovered.browserVersion
+      let protocolVersion = discovered.protocolVersion
+      if (!browserVersion) {
+        try {
+          const ver = await browserCdp.send<{ product?: string; protocolVersion?: string }>(
+            'Browser.getVersion',
+            {},
+            3000,
+          )
+          if (ver.product) browserVersion = ver.product
+          if (ver.protocolVersion) protocolVersion = ver.protocolVersion
+        } catch {
+          // Some minimal CDP proxies do not implement Browser.getVersion; ignore.
+        }
+      }
+
+      const remoteCdpInfo: RemoteCdpInfo = {
+        displayUrl: discovered.configured.displayUrl,
+        transport: discovered.configured.transport,
+        httpBaseUrl: discovered.httpBaseUrl,
+        browserWsUrl: discovered.browserWsUrl,
+        browserVersion,
+        protocolVersion,
+      }
+
+      return new ChromiumBrowserEngine({
+        cdpPort: discovered.configured.port,
+        chromeBin: null,
+        profileDir: null,
+        proc: null,
+        browserCdp,
+        remoteCdpInfo,
+        trackerBlocking: opts.trackerBlocking,
+        defaultEmulation: initialEmulation,
+        crashRecovery: { ...opts.crashRecovery, enabled: false },
+        downloads: opts.downloads,
+        dialogs: opts.dialogs,
+      })
+    }
 
     if (opts.remoteCdpPort && opts.remoteCdpPort > 0) {
       await waitForCdp(opts.remoteCdpPort, 5000)
@@ -2876,6 +2943,53 @@ export class ChromiumBrowserEngine implements BrowserEngine {
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
     const tab = await this.withRecovery(async () => {
+      if (this.browserCdp) {
+        if (this.browserCdp.isClosed()) {
+          throw new Error(`Remote CDP WebSocket connection (${this.remoteCdpInfo?.displayUrl ?? 'remote'}) is closed`)
+        }
+        const createdTarget = await this.browserCdp.send<{ targetId?: string }>('Target.createTarget', {
+          url: 'about:blank',
+        })
+        const targetId = createdTarget.targetId
+        if (!targetId) {
+          throw new Error('Remote CDP Target.createTarget did not return a targetId')
+        }
+        const attached = await this.browserCdp.send<{ sessionId?: string }>('Target.attachToTarget', {
+          targetId,
+          flatten: true,
+        })
+        const sessionId = attached.sessionId
+        if (!sessionId) {
+          await this.browserCdp.send('Target.closeTarget', { targetId }).catch(() => {})
+          throw new Error('Remote CDP Target.attachToTarget did not return a sessionId')
+        }
+        const sessionCdp = this.browserCdp.createSession(sessionId)
+        const created = new ChromiumTab(
+          this.nextTabId++,
+          targetId,
+          sessionCdp,
+          this._cdpPort,
+          this.trackerBlocking,
+          this.defaultEmulation,
+          {
+            withRecovery: (fn) => this.withRecovery(fn),
+            onTabClosed: (t) => {
+              this.liveTabs.delete(t)
+            },
+            closeTarget: async (tid) => {
+              if (this.browserCdp && !this.browserCdp.isClosed()) {
+                await this.browserCdp.send('Target.closeTarget', { targetId: tid }).catch(() => {})
+              }
+            },
+          },
+          this.downloads,
+          this.dialogs,
+        )
+        await created.init()
+        this.liveTabs.add(created)
+        return created
+      }
+
       const target = await this.openNewTarget(this._cdpPort)
       const cdp = await CdpClient.connect(target.webSocketDebuggerUrl)
       const created = new ChromiumTab(
@@ -2906,6 +3020,12 @@ export class ChromiumBrowserEngine implements BrowserEngine {
 
   private async withBrowserCdp<T>(fn: (cdp: CdpClient) => Promise<T>): Promise<T> {
     return this.withRecovery(async () => {
+      if (this.browserCdp) {
+        if (this.browserCdp.isClosed()) {
+          throw new Error(`Remote CDP WebSocket connection (${this.remoteCdpInfo?.displayUrl ?? 'remote'}) is closed`)
+        }
+        return await fn(this.browserCdp)
+      }
       const res = await fetch(`http://127.0.0.1:${this._cdpPort}/json/version`)
       if (!res.ok) {
         throw new Error(`Failed to query Chromium CDP version (HTTP ${res.status})`)
@@ -3005,6 +3125,16 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   async close(): Promise<void> {
     this.closing = true
     this.status = 'closed'
+    if (this.browserCdp) {
+      const tabsToClose = [...this.liveTabs]
+      this.liveTabs.clear()
+      for (const tab of tabsToClose) {
+        await tab.close().catch(() => {})
+      }
+      await this.browserCdp.close().catch(() => {})
+      this.browserCdp = null
+      return
+    }
     this.liveTabs.clear()
     if (this.proc && !this.proc.killed && this.proc.exitCode === null && this.proc.signalCode === null) {
       this.proc.kill('SIGTERM')

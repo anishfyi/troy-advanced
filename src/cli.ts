@@ -45,12 +45,15 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--compat-troy] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
-  browse [url] [--ascii] [--engine auto|chromium|lite]   Interactive ASCII terminal browser
-  mcp          [--engine auto|chromium|lite]             Model Context Protocol stdio server
-  pipe         [--json] [--engine auto|chromium|lite]    Streaming stdin/stdout AI REPL
+  browse [url] [--ascii] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
+                                                         Interactive ASCII terminal browser
+  mcp          [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
+                                                         Model Context Protocol stdio server
+  pipe         [--json] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
+                                                         Streaming stdin/stdout AI REPL
   doctor       [--json]                                  EC2 / Linux / Chrome environment check
   ec2 setup                                              Print EC2 systemd & SSH forwarding guide
 
@@ -102,7 +105,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --json  --ascii  --width <n>
+  --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -112,6 +115,7 @@ const VALUE_FLAGS = new Set([
   '--port',
   '--cdp-port',
   '--remote-cdp-port',
+  '--cdp-url',
   '--profile',
   '--url',
   '--width',
@@ -287,6 +291,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         }
       : undefined
 
+  const cdpUrlFlag =
+    typeof flags['cdp-url'] === 'string' && flags['cdp-url'].trim()
+      ? flags['cdp-url'].trim()
+      : process.env.TROY_CDP_URL?.trim() || undefined
+  const remoteCdpPortFlag = flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined
+
   if (cmd === 'doctor') {
     const report = runDoctor()
     console.log(flags.json ? JSON.stringify(report, null, 2) : formatDoctorAscii(report))
@@ -306,7 +316,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
    AGENT_PORT=$(jq -r .agentPort ~/.config/troy-advanced/agent-endpoint.json)
    ssh -L $AGENT_PORT:127.0.0.1:$AGENT_PORT ec2-user@<ec2-host>
 
-4. Or run AI agents directly on the EC2 host over SSH/tmux:
+4. Or drive Chrome on another EC2 node over an SSH tunnel using --cdp-url:
+   ssh -f -N -L 19222:127.0.0.1:9222 ec2-user@<chrome-node>
+   troy-advanced daemon start --cdp-url http://127.0.0.1:19222
+
+5. Or run AI agents directly on the EC2 host over SSH/tmux:
    troy-advanced daemon start --compat-troy
    troy-advanced open https://example.com
    troy-advanced ascii
@@ -322,7 +336,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       engine,
       port: flags.port ? Number(flags.port) : undefined,
       cdpPort: flags['cdp-port'] ? Number(flags['cdp-port']) : undefined,
-      remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      remoteCdpPort: remoteCdpPortFlag,
+      cdpUrl: cdpUrlFlag,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       endpointFile: endpointFlag,
       compatTroy: Boolean(flags['compat-troy']),
@@ -365,7 +380,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     const manager = await BrowserManager.create({
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
-      remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      remoteCdpPort: remoteCdpPortFlag,
+      cdpUrl: cdpUrlFlag,
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
@@ -387,7 +403,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     const manager = await BrowserManager.create({
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
-      remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      remoteCdpPort: remoteCdpPortFlag,
+      cdpUrl: cdpUrlFlag,
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
@@ -406,7 +423,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     const manager = await BrowserManager.create({
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
-      remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+      remoteCdpPort: remoteCdpPortFlag,
+      cdpUrl: cdpUrlFlag,
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
@@ -470,7 +488,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -549,7 +568,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -585,7 +605,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -637,7 +658,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -701,7 +723,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -795,7 +818,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -851,7 +875,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const manager = await BrowserManager.create({
           engine,
           profileDir: explicitProfile,
-          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          remoteCdpPort: remoteCdpPortFlag,
+          cdpUrl: cdpUrlFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -873,7 +898,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   // One-shot ASCII / Markdown / Visual fetch without needing a running daemon
   if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md') && positional[1] && !readLiveEndpoint(endpointFlag)) {
-    const manager = await BrowserManager.create({ engine, trackerBlocking, emulation: cliEmulation })
+    const manager = await BrowserManager.create({
+      engine,
+      remoteCdpPort: remoteCdpPortFlag,
+      cdpUrl: cdpUrlFlag,
+      trackerBlocking,
+      emulation: cliEmulation,
+    })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })
       if (!opened.ok) {

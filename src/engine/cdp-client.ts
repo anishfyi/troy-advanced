@@ -7,7 +7,25 @@ export interface CdpEvent {
   sessionId?: string
 }
 
-export class CdpClient {
+export interface CdpConnection {
+  on(method: string, handler: (params: Record<string, unknown>, sessionId?: string) => void): () => void
+  send<T extends Record<string, unknown> = Record<string, unknown>>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+    sessionId?: string,
+  ): Promise<T>
+  sendToSession<T extends Record<string, unknown> = Record<string, unknown>>(
+    sessionId: string | undefined,
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<T>
+  isClosed(): boolean
+  close(): Promise<void>
+}
+
+export class CdpClient implements CdpConnection {
   private ws: WebSocket
   private nextId = 1
   private pending = new Map<
@@ -145,6 +163,10 @@ export class CdpClient {
     return this.send<T>(method, params, timeoutMs, sessionId)
   }
 
+  createSession(sessionId: string): CdpSessionClient {
+    return new CdpSessionClient(this, sessionId)
+  }
+
   isClosed(): boolean {
     return this.closed
   }
@@ -156,6 +178,105 @@ export class CdpClient {
       this.ws.close()
     } catch {
       // ignore
+    }
+  }
+}
+
+/**
+ * Session-scoped CDP connection multiplexed over a shared Browser-level WebSocket.
+ * Presents the same `CdpConnection` contract as a dedicated per-target WebSocket:
+ * - Commands without an explicit sessionId target `rootSessionId` (except `Browser.*` commands).
+ * - Events on `rootSessionId` are delivered with `sessionId = undefined`.
+ * - Child OOPIF sessions attached under `rootSessionId` are tracked and delivered with their child `sessionId`.
+ * - Events belonging to sibling tabs on the same browser WebSocket are filtered out.
+ * - `close()` detaches listeners and this session without closing the shared browser WebSocket.
+ */
+export class CdpSessionClient implements CdpConnection {
+  private readonly parent: CdpClient
+  readonly sessionId: string
+  private readonly childSessions = new Set<string>()
+  private readonly unsubscribers = new Set<() => void>()
+  private closed = false
+
+  constructor(parent: CdpClient, sessionId: string) {
+    this.parent = parent
+    this.sessionId = sessionId
+
+    const offAttach = parent.on('Target.attachedToTarget', (params, eventSessionId) => {
+      if (eventSessionId === this.sessionId || (eventSessionId && this.childSessions.has(eventSessionId))) {
+        const childSid = typeof params.sessionId === 'string' ? params.sessionId : ''
+        if (childSid) this.childSessions.add(childSid)
+      }
+    })
+    const offDetach = parent.on('Target.detachedFromTarget', (params) => {
+      const detachedSid = typeof params.sessionId === 'string' ? params.sessionId : ''
+      if (detachedSid) this.childSessions.delete(detachedSid)
+    })
+    this.unsubscribers.add(offAttach)
+    this.unsubscribers.add(offDetach)
+  }
+
+  on(method: string, handler: (params: Record<string, unknown>, sessionId?: string) => void): () => void {
+    const off = this.parent.on(method, (params, eventSessionId) => {
+      if (this.closed) return
+      if (eventSessionId === this.sessionId) {
+        handler(params, undefined)
+      } else if (eventSessionId && this.childSessions.has(eventSessionId)) {
+        handler(params, eventSessionId)
+      } else if (!eventSessionId && method.startsWith('Browser.')) {
+        handler(params, undefined)
+      }
+    })
+    this.unsubscribers.add(off)
+    return () => {
+      off()
+      this.unsubscribers.delete(off)
+    }
+  }
+
+  send<T extends Record<string, unknown> = Record<string, unknown>>(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs = 15000,
+    sessionId?: string,
+  ): Promise<T> {
+    if (this.closed) return Promise.reject(new Error('CDP session is closed'))
+    if (sessionId) {
+      return this.parent.send<T>(method, params, timeoutMs, sessionId)
+    }
+    if (method.startsWith('Browser.')) {
+      return this.parent.send<T>(method, params, timeoutMs)
+    }
+    return this.parent.send<T>(method, params, timeoutMs, this.sessionId)
+  }
+
+  sendToSession<T extends Record<string, unknown> = Record<string, unknown>>(
+    sessionId: string | undefined,
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs = 15000,
+  ): Promise<T> {
+    return this.send<T>(method, params, timeoutMs, sessionId)
+  }
+
+  isClosed(): boolean {
+    return this.closed || this.parent.isClosed()
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    for (const off of this.unsubscribers) {
+      try {
+        off()
+      } catch {
+        // ignore
+      }
+    }
+    this.unsubscribers.clear()
+    this.childSessions.clear()
+    if (!this.parent.isClosed()) {
+      await this.parent.send('Target.detachFromTarget', { sessionId: this.sessionId }).catch(() => {})
     }
   }
 }

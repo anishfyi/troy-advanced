@@ -366,6 +366,7 @@ export interface EndpointDescriptor {
   port: number
   httpEndpoint: string
   webSocketDebuggerUrlHint: string
+  remoteCdpUrl?: string
   pid: number
   version: string
   startedAt: string

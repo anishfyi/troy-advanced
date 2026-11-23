@@ -27,6 +27,7 @@ export interface DaemonOptions {
   port?: number
   cdpPort?: number
   remoteCdpPort?: number
+  cdpUrl?: string
   profileDir?: string
   endpointFile?: string
   compatTroy?: boolean
@@ -44,6 +45,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     profileDir: opts.profileDir,
     cdpPort: opts.cdpPort,
     remoteCdpPort: opts.remoteCdpPort,
+    cdpUrl: opts.cdpUrl,
     trackerBlocking: opts.trackerBlocking,
     emulation: opts.emulation,
     crashRecovery: opts.crashRecovery,
@@ -60,18 +62,34 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
   const compatFile = opts.compatTroy ? troyCompatEndpointPath() : null
 
   const startedAt = new Date().toISOString()
-  const buildDescriptor = () => ({
-    port: manager.engine.cdpPort,
-    httpEndpoint: manager.engine.cdpPort ? `http://127.0.0.1:${manager.engine.cdpPort}` : '',
-    webSocketDebuggerUrlHint: manager.engine.cdpPort ? `http://127.0.0.1:${manager.engine.cdpPort}/json/list` : '',
-    pid: process.pid,
-    version: '0.1.0',
-    startedAt,
-    engine: manager.engine.kind,
-    agentPort: socket.port,
-    agentToken: socket.token,
-    profileDir: manager.profileDir,
-  })
+  const buildDescriptor = () => {
+    const remoteCdp = manager.engine.getRemoteCdpInfo ? manager.engine.getRemoteCdpInfo() : null
+    const httpEndpoint = remoteCdp
+      ? (remoteCdp.httpBaseUrl ?? '')
+      : manager.engine.cdpPort
+        ? `http://127.0.0.1:${manager.engine.cdpPort}`
+        : ''
+    const webSocketDebuggerUrlHint = remoteCdp
+      ? remoteCdp.httpBaseUrl
+        ? `${remoteCdp.httpBaseUrl}/json/list`
+        : remoteCdp.displayUrl
+      : manager.engine.cdpPort
+        ? `http://127.0.0.1:${manager.engine.cdpPort}/json/list`
+        : ''
+    return {
+      port: manager.engine.cdpPort,
+      httpEndpoint,
+      webSocketDebuggerUrlHint,
+      ...(remoteCdp ? { remoteCdpUrl: remoteCdp.displayUrl } : {}),
+      pid: process.pid,
+      version: '0.1.0',
+      startedAt,
+      engine: manager.engine.kind,
+      agentPort: socket.port,
+      agentToken: socket.token,
+      profileDir: manager.profileDir,
+    }
+  }
 
   const syncEndpoints = () => {
     const descriptor = buildDescriptor()
@@ -97,6 +115,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       engine: manager.engine.kind,
       agentPort: socket.port,
       cdpPort: manager.engine.cdpPort,
+      ...(manager.engine.remoteCdpUrl ? { remoteCdpUrl: manager.engine.remoteCdpUrl } : {}),
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
     }),
@@ -137,6 +156,7 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.port) args.push('--port', String(opts.port))
   if (opts.cdpPort) args.push('--cdp-port', String(opts.cdpPort))
   if (opts.remoteCdpPort) args.push('--remote-cdp-port', String(opts.remoteCdpPort))
+  if (opts.cdpUrl) args.push('--cdp-url', opts.cdpUrl)
   if (opts.profileDir) args.push('--profile', opts.profileDir)
   if (opts.endpointFile) args.push('--endpoint', opts.endpointFile)
   if (opts.compatTroy) args.push('--compat-troy')
