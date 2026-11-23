@@ -359,3 +359,67 @@ export interface EncryptedCookieBundle {
   ciphertext: string
   exportedAt: string
 }
+
+export type StorageArea = 'local' | 'session' | 'both'
+
+export interface OriginStorageSnapshot {
+  origin: string
+  localStorage: Record<string, string>
+  sessionStorage: Record<string, string>
+}
+
+export interface StorageExportOptions {
+  origin?: string
+  tabId?: number
+  area?: StorageArea
+  keyPrefix?: string
+}
+
+export interface StorageImportOptions {
+  tabId?: number
+  origin?: string
+  area?: StorageArea
+  clearBeforeImport?: boolean
+}
+
+export interface StorageImportResult {
+  importedOrigins: number
+  localKeys: number
+  sessionKeys: number
+  skipped: number
+  errors: string[]
+}
+
+export interface StorageClearOptions {
+  tabId?: number
+  origin?: string
+  area?: StorageArea
+  keys?: string[]
+}
+
+export interface StorageClearResult {
+  removedLocal: number
+  removedSession: number
+  origins: string[]
+}
+
+export interface StorageExportBundle {
+  version: 1
+  exportedAt: string
+  engine: 'chromium' | 'lite'
+  originCount: number
+  totalKeys: number
+  origins: OriginStorageSnapshot[]
+}
+
+export interface EncryptedStorageBundle {
+  version: 1
+  encrypted: true
+  kdf: 'scrypt'
+  cipher: 'aes-256-gcm'
+  salt: string
+  iv: string
+  authTag: string
+  ciphertext: string
+  exportedAt: string
+}

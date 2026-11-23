@@ -2,7 +2,7 @@
 
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import type { BrowserCookie, EngineKind, TrackerBlockingOptions, TrackerBlockMode } from './types.js'
+import type { BrowserCookie, EngineKind, OriginStorageSnapshot, TrackerBlockingOptions, TrackerBlockMode } from './types.js'
 import { BrowserManager } from './engine/manager.js'
 import {
   filterCookies,
@@ -11,6 +11,15 @@ import {
   serializeCookieBundle,
   writeCookieFile,
 } from './engine/cookies.js'
+import {
+  countStorageKeys,
+  filterStorageSnapshots,
+  normalizeStorageArea,
+  parseStorageBundle,
+  readStorageFile,
+  serializeStorageBundle,
+  writeStorageFile,
+} from './engine/storage.js'
 import { readLiveEndpoint } from './bridge/endpoint.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
 import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
@@ -62,6 +71,14 @@ Client Commands (talk to running daemon, or use --oneshot):
   cookies import [file|-] [--domain <host>] [--passphrase <pass>]
                                           Import plain or AES-256-GCM encrypted cookies into daemon or profile
   cookies clear [--domain <host>]         Clear cookies from daemon or profile
+  storage inspect [--origin <origin|host>] [--area local|session|both] [--prefix <str>] [--reveal] [--json]
+                                          Inspect localStorage/sessionStorage (redacted by default)
+  storage export [file] [--origin <origin|host>] [--area local|session|both] [--prefix <str>] [--encrypt] [--passphrase <pass>]
+                                          Export web storage (0600 file or stdout) for EC2 session hydration
+  storage import [file|-] [--origin <origin|host>] [--area local|session|both] [--clear] [--passphrase <pass>]
+                                          Import plain or AES-256-GCM encrypted web storage into daemon or profile
+  storage clear [--origin <origin|host>] [--area local|session|both] [--keys k1,k2]
+                                          Clear localStorage/sessionStorage from daemon or profile
 
 Global Flags:
   --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --json  --ascii  --width <n>
@@ -97,6 +114,9 @@ const VALUE_FLAGS = new Set([
   '--passphrase',
   '--out',
   '--in',
+  '--area',
+  '--prefix',
+  '--keys',
 ])
 
 async function readStdinUtf8(): Promise<string> {
@@ -453,6 +473,277 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         try {
           const removed = await manager.clearCookies({ domain: domainFilter })
           console.log(JSON.stringify({ ok: true, engine: manager.engine.kind, removed }, null, 2))
+        } finally {
+          await manager.close()
+        }
+      }
+      return
+    }
+  }
+
+  if (cmd === 'storage') {
+    const sub = positional[1]
+    if (sub !== 'inspect' && sub !== 'export' && sub !== 'import' && sub !== 'clear') {
+      console.error('Usage: troy-advanced storage <inspect|export|import|clear> [file] [flags]')
+      process.exit(1)
+    }
+
+    const explicitProfile = typeof flags.profile === 'string' ? flags.profile : undefined
+    const useDaemon = !explicitProfile && !flags.oneshot
+    const live = useDaemon ? readLiveEndpoint(endpointFlag) : null
+    const originFilter = typeof flags.origin === 'string' ? flags.origin : undefined
+    const area = typeof flags.area === 'string' ? normalizeStorageArea(flags.area) : undefined
+    const keyPrefix = typeof flags.prefix === 'string' ? flags.prefix : undefined
+    const tabId = flags.tab ? Number(flags.tab) : undefined
+
+    if (sub === 'inspect') {
+      const revealValues = Boolean(flags.reveal)
+      const width = flags.width ? Number(flags.width) : undefined
+      let result: Record<string, unknown>
+
+      if (live) {
+        result = await callDaemon(live.endpoint, '/storage/inspect', {
+          tabId,
+          origin: originFilter,
+          area,
+          keyPrefix,
+          revealValues,
+          width,
+        })
+        if (!result.ok) {
+          console.error(JSON.stringify(result, null, 2))
+          process.exit(1)
+        }
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          const inspected = await manager.inspectStorage({
+            tabId,
+            origin: originFilter,
+            area,
+            keyPrefix,
+            revealValues,
+            width,
+          })
+          result = { ok: true, ...inspected }
+        } finally {
+          await manager.close()
+        }
+      }
+
+      if (flags.json) {
+        console.log(JSON.stringify(result, null, 2))
+      } else {
+        process.stdout.write(`${String(result.ascii ?? '')}\n`)
+      }
+      return
+    }
+
+    if (sub === 'export') {
+      const passphrase =
+        typeof flags.passphrase === 'string'
+          ? flags.passphrase
+          : flags.encrypt
+            ? process.env.TROY_STORAGE_PASSPHRASE || process.env.TROY_COOKIE_PASSPHRASE
+            : undefined
+      if (flags.encrypt && !passphrase) {
+        console.error(
+          JSON.stringify(
+            { ok: false, error: '--encrypt requires --passphrase <pass> or TROY_STORAGE_PASSPHRASE env var' },
+            null,
+            2,
+          ),
+        )
+        process.exit(1)
+      }
+
+      let origins: OriginStorageSnapshot[]
+      let exportEngine: 'chromium' | 'lite'
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/storage/export', {
+          tabId,
+          origin: originFilter,
+          area,
+          keyPrefix,
+        })
+        if (!res.ok) {
+          console.error(JSON.stringify(res, null, 2))
+          process.exit(1)
+        }
+        origins = Array.isArray(res.origins) ? (res.origins as OriginStorageSnapshot[]) : []
+        exportEngine = res.engine === 'lite' ? 'lite' : 'chromium'
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          origins = await manager.exportStorage({
+            tabId,
+            origin: originFilter,
+            area,
+            keyPrefix,
+          })
+          exportEngine = manager.engine.kind
+        } finally {
+          await manager.close()
+        }
+      }
+
+      const serialized = serializeStorageBundle(origins, { engine: exportEngine, passphrase })
+      const counts = countStorageKeys(origins)
+      const outFile = typeof flags.out === 'string' ? flags.out : positional[2]
+      if (outFile && outFile !== '-') {
+        const written = writeStorageFile(outFile, serialized)
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              file: written.path,
+              bytes: written.bytes,
+              mode: written.mode,
+              engine: exportEngine,
+              originCount: origins.length,
+              localKeys: counts.localKeys,
+              sessionKeys: counts.sessionKeys,
+              totalKeys: counts.totalKeys,
+              encrypted: Boolean(passphrase),
+            },
+            null,
+            2,
+          ),
+        )
+      } else {
+        process.stdout.write(`${serialized}\n`)
+      }
+      return
+    }
+
+    if (sub === 'import') {
+      const inFile = typeof flags.in === 'string' ? flags.in : positional[2]
+      let rawJson: string
+      try {
+        rawJson = inFile && inFile !== '-' ? readStorageFile(inFile) : await readStdinUtf8()
+      } catch (err) {
+        console.error(JSON.stringify({ ok: false, error: `Failed to read storage input: ${(err as Error).message}` }, null, 2))
+        process.exit(1)
+      }
+
+      const passphrase =
+        typeof flags.passphrase === 'string'
+          ? flags.passphrase
+          : process.env.TROY_STORAGE_PASSPHRASE || process.env.TROY_COOKIE_PASSPHRASE
+
+      let parsed: { origins: OriginStorageSnapshot[]; encrypted: boolean; skipped: number }
+      try {
+        parsed = parseStorageBundle(rawJson, { passphrase })
+      } catch (err) {
+        console.error(JSON.stringify({ ok: false, error: (err as Error).message }, null, 2))
+        process.exit(1)
+      }
+
+      const originsToImport = filterStorageSnapshots(parsed.origins, {
+        origin: originFilter,
+        area,
+        keyPrefix,
+      })
+
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/storage/import', {
+          origins: originsToImport,
+          tabId,
+          origin: originFilter,
+          area,
+          clearBeforeImport: Boolean(flags.clear),
+        })
+        const merged = {
+          ...res,
+          skipped: Number(res.skipped ?? 0) + parsed.skipped,
+          encrypted: parsed.encrypted,
+        }
+        console.log(JSON.stringify(merged, null, 2))
+        if (!res.ok) process.exit(1)
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          const res = await manager.importStorage(originsToImport, {
+            tabId,
+            origin: originFilter,
+            area,
+            clearBeforeImport: Boolean(flags.clear),
+          })
+          console.log(
+            JSON.stringify(
+              {
+                ok: true,
+                engine: manager.engine.kind,
+                importedOrigins: res.importedOrigins,
+                localKeys: res.localKeys,
+                sessionKeys: res.sessionKeys,
+                skipped: res.skipped + parsed.skipped,
+                encrypted: parsed.encrypted,
+                errors: res.errors,
+              },
+              null,
+              2,
+            ),
+          )
+        } finally {
+          await manager.close()
+        }
+      }
+      return
+    }
+
+    if (sub === 'clear') {
+      const keys =
+        typeof flags.keys === 'string'
+          ? flags.keys
+              .split(',')
+              .map((k) => k.trim())
+              .filter(Boolean)
+          : undefined
+
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/storage/clear', {
+          tabId,
+          origin: originFilter,
+          area,
+          keys,
+        })
+        console.log(JSON.stringify(res, null, 2))
+        if (!res.ok) process.exit(1)
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          const res = await manager.clearStorage({
+            tabId,
+            origin: originFilter,
+            area,
+            keys,
+          })
+          console.log(JSON.stringify({ ok: true, engine: manager.engine.kind, ...res }, null, 2))
         } finally {
           await manager.close()
         }

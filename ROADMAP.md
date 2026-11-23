@@ -28,7 +28,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M21: Cross-frame `<iframe>` discovery and snapshot flattening so embedded forms and widgets get real `eN` refs
 - [x] M22: Deterministic stale-ref recovery (re-locate by `id`, `ariaLabel`, `name+tag`, `role+ariaLabel` when unique match exists on same epoch)
 - [x] M23: Cookie export/import commands (`troy-advanced cookies export|import`) for transferring signed-in sessions to an EC2 instance securely
-- [ ] M24: LocalStorage / SessionStorage inspection & transfer helpers for EC2 session hydration
+- [x] M24: LocalStorage / SessionStorage inspection & transfer helpers for EC2 session hydration
 - [ ] M25: Custom HTTP headers & User-Agent / viewport preset profiles (`desktop`, `mobile`, `terminal`, custom `WxH`)
 - [ ] M26: Automatic crash recovery: detect Chromium process exit and transparently relaunch with the same persistent profile
 - [ ] M27: Download interception & quarantine directory inside profile (blocks unsafe auto-downloads while letting user inspect filenames)

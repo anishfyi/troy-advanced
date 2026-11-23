@@ -12,9 +12,13 @@ import type {
   FrameSummary,
   InlineLink,
   NetworkEntry,
+  OriginStorageSnapshot,
   PageSnapshot,
   SettleOptions,
   SettleResult,
+  StorageArea,
+  StorageClearResult,
+  StorageImportResult,
   WaitConditionOptions,
   WaitResult,
   WaitState,
@@ -33,6 +37,14 @@ import {
 import { flattenFrameSnapshots, prefixFrameSelector, type ChildFrameSnapshotInput } from './frames.js'
 import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
+import {
+  filterStorageSnapshots,
+  normalizeOriginStorageSnapshot,
+  normalizeStorageArea,
+  normalizeStorageMap,
+  normalizeStorageOrigin,
+  originFilterMatches,
+} from './storage.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import {
   checkLiteSelectorState,
@@ -603,10 +615,17 @@ class LiteTab implements TabDriver {
   private consoleLogs: ConsoleEntry[] = []
   private networkLogs: NetworkEntry[] = []
   private cookies: Map<string, BrowserCookie>
+  private localStorageByOrigin: Map<string, Map<string, string>>
+  private sessionStorageByOrigin = new Map<string, Map<string, string>>()
 
-  constructor(id: number, cookies: Map<string, BrowserCookie>) {
+  constructor(
+    id: number,
+    cookies: Map<string, BrowserCookie>,
+    localStorageByOrigin: Map<string, Map<string, string>>,
+  ) {
     this.id = id
     this.cookies = cookies
+    this.localStorageByOrigin = localStorageByOrigin
   }
 
   getUrl(): string {
@@ -1024,8 +1043,101 @@ class LiteTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
+  async getStorage(opts: { area?: StorageArea; keyPrefix?: string } = {}): Promise<OriginStorageSnapshot> {
+    const origin = normalizeStorageOrigin(this.url)
+    if (!origin) return { origin: '', localStorage: {}, sessionStorage: {} }
+    const area = normalizeStorageArea(opts.area)
+    const keyPrefix = typeof opts.keyPrefix === 'string' ? opts.keyPrefix : ''
+
+    const readMap = (store?: Map<string, string>): Record<string, string> => {
+      if (!store) return {}
+      const out: Record<string, string> = {}
+      for (const [k, v] of store) {
+        if (!keyPrefix || k.startsWith(keyPrefix)) out[k] = v
+      }
+      return out
+    }
+
+    return {
+      origin,
+      localStorage: area === 'session' ? {} : readMap(this.localStorageByOrigin.get(origin)),
+      sessionStorage: area === 'local' ? {} : readMap(this.sessionStorageByOrigin.get(origin)),
+    }
+  }
+
+  async setStorage(
+    data: { localStorage?: Record<string, string>; sessionStorage?: Record<string, string> },
+    opts: { clearBeforeImport?: boolean } = {},
+  ): Promise<{ origin: string; localKeys: number; sessionKeys: number }> {
+    const origin = normalizeStorageOrigin(this.url)
+    if (!origin) {
+      throw new Error('Cannot set web storage on current tab (opaque origin)')
+    }
+    let localKeys = 0
+    let sessionKeys = 0
+
+    if (data.localStorage) {
+      const normalized = normalizeStorageMap(data.localStorage)
+      let store = this.localStorageByOrigin.get(origin)
+      if (!store) {
+        store = new Map<string, string>()
+        this.localStorageByOrigin.set(origin, store)
+      }
+      if (opts.clearBeforeImport) store.clear()
+      for (const [k, v] of Object.entries(normalized)) {
+        store.set(k, v)
+        localKeys++
+      }
+    }
+
+    if (data.sessionStorage) {
+      const normalized = normalizeStorageMap(data.sessionStorage)
+      let store = this.sessionStorageByOrigin.get(origin)
+      if (!store) {
+        store = new Map<string, string>()
+        this.sessionStorageByOrigin.set(origin, store)
+      }
+      if (opts.clearBeforeImport) store.clear()
+      for (const [k, v] of Object.entries(normalized)) {
+        store.set(k, v)
+        sessionKeys++
+      }
+    }
+
+    return { origin, localKeys, sessionKeys }
+  }
+
+  async clearStorage(opts: { area?: StorageArea; keys?: string[] } = {}): Promise<{
+    origin: string
+    removedLocal: number
+    removedSession: number
+  }> {
+    const origin = normalizeStorageOrigin(this.url)
+    if (!origin) return { origin: '', removedLocal: 0, removedSession: 0 }
+    const area = normalizeStorageArea(opts.area)
+    const keys = Array.isArray(opts.keys) && opts.keys.length > 0 ? opts.keys : null
+
+    const clearMap = (store?: Map<string, string>): number => {
+      if (!store) return 0
+      if (keys) {
+        let removed = 0
+        for (const k of keys) {
+          if (store.delete(k)) removed++
+        }
+        return removed
+      }
+      const size = store.size
+      store.clear()
+      return size
+    }
+
+    const removedLocal = area === 'session' ? 0 : clearMap(this.localStorageByOrigin.get(origin))
+    const removedSession = area === 'local' ? 0 : clearMap(this.sessionStorageByOrigin.get(origin))
+    return { origin, removedLocal, removedSession }
+  }
+
   async close(): Promise<void> {
-    // nothing to dispose
+    this.sessionStorageByOrigin.clear()
   }
 }
 
@@ -1034,9 +1146,10 @@ export class LiteBrowserEngine implements BrowserEngine {
   readonly cdpPort = 0
   private nextId = 1
   private cookies = new Map<string, BrowserCookie>()
+  private localStorageByOrigin = new Map<string, Map<string, string>>()
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
-    const tab = new LiteTab(this.nextId++, this.cookies)
+    const tab = new LiteTab(this.nextId++, this.cookies, this.localStorageByOrigin)
     if (initialUrl) {
       await tab.navigate(initialUrl)
     }
@@ -1089,7 +1202,87 @@ export class LiteBrowserEngine implements BrowserEngine {
     return removed
   }
 
+  getEngineStorage(opts: { origin?: string; area?: StorageArea; keyPrefix?: string } = {}): OriginStorageSnapshot[] {
+    const snapshots: OriginStorageSnapshot[] = []
+    for (const [origin, map] of this.localStorageByOrigin) {
+      snapshots.push({
+        origin,
+        localStorage: Object.fromEntries(map.entries()),
+        sessionStorage: {},
+      })
+    }
+    return filterStorageSnapshots(snapshots, opts)
+  }
+
+  importEngineStorage(
+    snapshots: OriginStorageSnapshot[],
+    opts: { area?: StorageArea; clearBeforeImport?: boolean } = {},
+  ): StorageImportResult {
+    const area = normalizeStorageArea(opts.area)
+    let importedOrigins = 0
+    let localKeys = 0
+    let skipped = 0
+    const errors: string[] = []
+
+    for (const raw of snapshots) {
+      const snap = normalizeOriginStorageSnapshot(raw)
+      if (!snap) {
+        skipped++
+        errors.push(`Invalid storage snapshot skipped: ${String((raw as { origin?: unknown })?.origin ?? '<unknown>')}`)
+        continue
+      }
+      if (area === 'session') continue
+
+      let store = this.localStorageByOrigin.get(snap.origin)
+      if (!store) {
+        store = new Map<string, string>()
+        this.localStorageByOrigin.set(snap.origin, store)
+      }
+      if (opts.clearBeforeImport) store.clear()
+      for (const [k, v] of Object.entries(snap.localStorage)) {
+        store.set(k, v)
+        localKeys++
+      }
+      importedOrigins++
+    }
+
+    return { importedOrigins, localKeys, sessionKeys: 0, skipped, errors }
+  }
+
+  clearEngineStorage(opts: { origin?: string; area?: StorageArea; keys?: string[] } = {}): StorageClearResult {
+    const area = normalizeStorageArea(opts.area)
+    if (area === 'session') {
+      return { removedLocal: 0, removedSession: 0, origins: [] }
+    }
+    const keys = Array.isArray(opts.keys) && opts.keys.length > 0 ? opts.keys : null
+    let removedLocal = 0
+    const origins: string[] = []
+
+    for (const [origin, store] of this.localStorageByOrigin) {
+      if (opts.origin && !originFilterMatches(origin, opts.origin)) continue
+      if (keys) {
+        let removedHere = 0
+        for (const k of keys) {
+          if (store.delete(k)) removedHere++
+        }
+        if (removedHere > 0) {
+          removedLocal += removedHere
+          origins.push(origin)
+        }
+      } else {
+        if (store.size > 0) {
+          removedLocal += store.size
+          origins.push(origin)
+        }
+        store.clear()
+      }
+    }
+
+    return { removedLocal, removedSession: 0, origins }
+  }
+
   async close(): Promise<void> {
     this.cookies.clear()
+    this.localStorageByOrigin.clear()
   }
 }

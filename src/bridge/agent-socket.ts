@@ -5,11 +5,12 @@
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { parseAsciiDensity } from '../ascii/layout.js'
-import type { BrowserCookie } from '../types.js'
+import type { BrowserCookie, OriginStorageSnapshot } from '../types.js'
+import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 
 const MAX_BODY = 128 * 1024
-const MAX_COOKIE_IMPORT_BODY = 1024 * 1024
+const MAX_IMPORT_BODY = 2 * 1024 * 1024
 
 export interface AgentSocketServer {
   port: number
@@ -206,6 +207,61 @@ export async function createAgentSocket(
         })
         return { status: 200, payload: { ok: true, removed } }
       }
+      case '/storage/inspect': {
+        const inspection = await manager.inspectStorage({
+          tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          origin: typeof body.origin === 'string' ? body.origin : undefined,
+          area: body.area !== undefined ? normalizeStorageArea(body.area) : undefined,
+          keyPrefix: typeof body.keyPrefix === 'string' ? body.keyPrefix : undefined,
+          revealValues: Boolean(body.revealValues),
+          width: body.width !== undefined ? Number(body.width) : undefined,
+        })
+        return {
+          status: 200,
+          payload: { ok: true, ...inspection },
+        }
+      }
+      case '/storage/export': {
+        const origins = await manager.exportStorage({
+          tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          origin: typeof body.origin === 'string' ? body.origin : undefined,
+          area: body.area !== undefined ? normalizeStorageArea(body.area) : undefined,
+          keyPrefix: typeof body.keyPrefix === 'string' ? body.keyPrefix : undefined,
+        })
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            engine: manager.engine.kind,
+            originCount: origins.length,
+            origins,
+          },
+        }
+      }
+      case '/storage/import': {
+        if (!Array.isArray(body.origins)) {
+          return { status: 400, payload: { ok: false, error: 'origins must be an array' } }
+        }
+        const result = await manager.importStorage(body.origins as OriginStorageSnapshot[], {
+          tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          origin: typeof body.origin === 'string' ? body.origin : undefined,
+          area: body.area !== undefined ? normalizeStorageArea(body.area) : undefined,
+          clearBeforeImport: Boolean(body.clearBeforeImport),
+        })
+        return {
+          status: 200,
+          payload: { ok: true, ...result },
+        }
+      }
+      case '/storage/clear': {
+        const result = await manager.clearStorage({
+          tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          origin: typeof body.origin === 'string' ? body.origin : undefined,
+          area: body.area !== undefined ? normalizeStorageArea(body.area) : undefined,
+          keys: Array.isArray(body.keys) ? body.keys.map((k) => String(k)) : undefined,
+        })
+        return { status: 200, payload: { ok: true, ...result } }
+      }
       default:
         return { status: 404, payload: { ok: false, error: `no route ${pathname}` } }
     }
@@ -255,7 +311,8 @@ export async function createAgentSocket(
       return respond(405, { ok: false, error: 'POST only' })
     }
 
-    const maxBody = url.pathname === '/cookies/import' ? MAX_COOKIE_IMPORT_BODY : MAX_BODY
+    const maxBody =
+      url.pathname === '/cookies/import' || url.pathname === '/storage/import' ? MAX_IMPORT_BODY : MAX_BODY
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer) => {

@@ -5,9 +5,13 @@ import type {
   CookieExportOptions,
   CookieImportResult,
   NetworkEntry,
+  OriginStorageSnapshot,
   PageSnapshot,
   SettleOptions,
   SettleResult,
+  StorageArea,
+  StorageClearResult,
+  StorageImportResult,
   WaitConditionOptions,
   WaitResult,
 } from '../types.js'
@@ -35,6 +39,16 @@ export interface TabDriver {
   getConsole(opts?: { clear?: boolean; level?: string; limit?: number }): ConsoleEntry[]
   getNetwork(opts?: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number }): NetworkEntry[]
   getBlockedTrackerStats?(): BlockedTrackerStats
+  getStorage(opts?: { area?: StorageArea; keyPrefix?: string }): Promise<OriginStorageSnapshot>
+  setStorage(
+    data: { localStorage?: Record<string, string>; sessionStorage?: Record<string, string> },
+    opts?: { clearBeforeImport?: boolean },
+  ): Promise<{ origin: string; localKeys: number; sessionKeys: number }>
+  clearStorage(opts?: { area?: StorageArea; keys?: string[] }): Promise<{
+    origin: string
+    removedLocal: number
+    removedSession: number
+  }>
   close(): Promise<void>
 }
 
@@ -45,5 +59,11 @@ export interface BrowserEngine {
   exportCookies(opts?: CookieExportOptions): Promise<BrowserCookie[]>
   importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult>
   clearCookies?(opts?: { domain?: string }): Promise<number>
+  getEngineStorage?(opts?: { origin?: string; area?: StorageArea; keyPrefix?: string }): OriginStorageSnapshot[]
+  importEngineStorage?(
+    snapshots: OriginStorageSnapshot[],
+    opts?: { area?: StorageArea; clearBeforeImport?: boolean },
+  ): StorageImportResult
+  clearEngineStorage?(opts?: { origin?: string; area?: StorageArea; keys?: string[] }): StorageClearResult
   close(): Promise<void>
 }

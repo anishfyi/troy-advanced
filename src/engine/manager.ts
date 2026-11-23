@@ -13,11 +13,17 @@ import type {
   ElementDescriptor,
   EngineKind,
   MarkdownRenderOptions,
+  OriginStorageSnapshot,
   PageSnapshot,
   PixelAsciiOptions,
   Rect,
   SettleOptions,
   SettleResult,
+  StorageClearOptions,
+  StorageClearResult,
+  StorageExportOptions,
+  StorageImportOptions,
+  StorageImportResult,
   TabSummary,
   TrackerBlockingOptions,
 } from '../types.js'
@@ -43,6 +49,16 @@ import {
 import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
+import {
+  countStorageKeys,
+  filterStorageSnapshots,
+  formatStorageAscii,
+  normalizeOriginStorageSnapshot,
+  normalizeStorageArea,
+  normalizeStorageOrigin,
+  originFilterMatches,
+  redactStorageSnapshots,
+} from './storage.js'
 import { LiteBrowserEngine } from './lite.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import { parseWaitState } from './wait.js'
@@ -1178,6 +1194,251 @@ export class BrowserManager {
     const removed = await this.engine.clearCookies(opts)
     this.emit({ type: 'cookies_cleared', removed, domain: opts.domain })
     return removed
+  }
+
+  async exportStorage(opts: StorageExportOptions = {}): Promise<OriginStorageSnapshot[]> {
+    const collected: OriginStorageSnapshot[] = []
+    if (opts.tabId !== undefined) {
+      const session = this.resolveSession(opts.tabId)
+      if (!session) throw new Error(`Tab ${opts.tabId} not found`)
+      const snap = await session.driver.getStorage({ area: opts.area, keyPrefix: opts.keyPrefix })
+      if (snap.origin) collected.push(snap)
+    } else {
+      if (this.engine.getEngineStorage) {
+        collected.push(
+          ...this.engine.getEngineStorage({
+            origin: opts.origin,
+            area: opts.area,
+            keyPrefix: opts.keyPrefix,
+          }),
+        )
+      }
+      for (const session of this.tabs.values()) {
+        const snap = await session.driver.getStorage({ area: opts.area, keyPrefix: opts.keyPrefix })
+        if (snap.origin) collected.push(snap)
+      }
+    }
+
+    const filtered = filterStorageSnapshots(collected, {
+      origin: opts.origin,
+      area: opts.area,
+      keyPrefix: opts.keyPrefix,
+    })
+    const counts = countStorageKeys(filtered)
+    this.emit({ type: 'storage_exported', origins: filtered.length, totalKeys: counts.totalKeys })
+    return filtered
+  }
+
+  async inspectStorage(
+    opts: StorageExportOptions & { revealValues?: boolean; width?: number } = {},
+  ): Promise<{
+    engine: 'chromium' | 'lite'
+    origins: OriginStorageSnapshot[]
+    counts: { localKeys: number; sessionKeys: number; totalKeys: number }
+    ascii: string
+  }> {
+    const rawOrigins = await this.exportStorage(opts)
+    const counts = countStorageKeys(rawOrigins)
+    const displayOrigins = redactStorageSnapshots(rawOrigins, { revealValues: Boolean(opts.revealValues) })
+    const ascii = formatStorageAscii(rawOrigins, {
+      revealValues: Boolean(opts.revealValues),
+      width: opts.width,
+    })
+    return {
+      engine: this.engine.kind,
+      origins: displayOrigins,
+      counts,
+      ascii,
+    }
+  }
+
+  async importStorage(
+    snapshots: OriginStorageSnapshot[],
+    opts: StorageImportOptions = {},
+  ): Promise<StorageImportResult> {
+    const area = normalizeStorageArea(opts.area)
+    const importedOriginSet = new Set<string>()
+    let localKeys = 0
+    let sessionKeys = 0
+    let skipped = 0
+    const errors: string[] = []
+
+    const normalized: OriginStorageSnapshot[] = []
+    for (const raw of snapshots) {
+      const snap = normalizeOriginStorageSnapshot(raw)
+      if (!snap) {
+        skipped++
+        errors.push(`Invalid storage snapshot skipped: ${String((raw as { origin?: unknown })?.origin ?? '<unknown>')}`)
+        continue
+      }
+      if (opts.origin && !originFilterMatches(snap.origin, opts.origin)) {
+        skipped++
+        continue
+      }
+      normalized.push(snap)
+    }
+
+    for (const snap of normalized) {
+      const localData = area === 'session' ? undefined : snap.localStorage
+      const sessionData = area === 'local' ? undefined : snap.sessionStorage
+
+      if (this.engine.importEngineStorage) {
+        let touched = false
+        if (localData !== undefined) {
+          const engRes = this.engine.importEngineStorage([snap], {
+            area: 'local',
+            clearBeforeImport: opts.clearBeforeImport,
+          })
+          localKeys += engRes.localKeys
+          errors.push(...engRes.errors)
+          if (engRes.importedOrigins > 0) touched = true
+        }
+        if (sessionData !== undefined) {
+          const targetTabs: TabSession[] = []
+          if (opts.tabId !== undefined) {
+            const found = this.resolveSession(opts.tabId)
+            if (!found) {
+              errors.push(`Tab ${opts.tabId} not found`)
+            } else {
+              targetTabs.push(found)
+            }
+          } else {
+            for (const s of this.tabs.values()) {
+              if (normalizeStorageOrigin(s.driver.getUrl()) === snap.origin) {
+                targetTabs.push(s)
+              }
+            }
+          }
+          for (const tab of targetTabs) {
+            if (normalizeStorageOrigin(tab.driver.getUrl()) === snap.origin) {
+              const tabRes = await tab.driver.setStorage(
+                { sessionStorage: sessionData },
+                { clearBeforeImport: opts.clearBeforeImport },
+              )
+              sessionKeys += tabRes.sessionKeys
+              touched = true
+            }
+          }
+        }
+        if (touched) importedOriginSet.add(snap.origin)
+        else skipped++
+        continue
+      }
+
+      // Chromium (or tab-backed engine) hydration path
+      try {
+        if (opts.tabId !== undefined) {
+          const session = this.resolveSession(opts.tabId)
+          if (!session) {
+            skipped++
+            errors.push(`Tab ${opts.tabId} not found`)
+            continue
+          }
+          const currentOrigin = normalizeStorageOrigin(session.driver.getUrl())
+          if (!currentOrigin) {
+            await session.driver.navigate(snap.origin)
+          } else if (currentOrigin !== snap.origin) {
+            skipped++
+            errors.push(`Tab ${opts.tabId} is on ${currentOrigin}, expected ${snap.origin}`)
+            continue
+          }
+          const res = await session.driver.setStorage(
+            { localStorage: localData, sessionStorage: sessionData },
+            { clearBeforeImport: opts.clearBeforeImport },
+          )
+          localKeys += res.localKeys
+          sessionKeys += res.sessionKeys
+          importedOriginSet.add(snap.origin)
+        } else {
+          const existing = [...this.tabs.values()].find(
+            (s) => normalizeStorageOrigin(s.driver.getUrl()) === snap.origin,
+          )
+          if (existing) {
+            const res = await existing.driver.setStorage(
+              { localStorage: localData, sessionStorage: sessionData },
+              { clearBeforeImport: opts.clearBeforeImport },
+            )
+            localKeys += res.localKeys
+            sessionKeys += res.sessionKeys
+            importedOriginSet.add(snap.origin)
+          } else {
+            const tempTab = await this.engine.createTab(snap.origin)
+            try {
+              const res = await tempTab.setStorage(
+                { localStorage: localData, sessionStorage: sessionData },
+                { clearBeforeImport: opts.clearBeforeImport },
+              )
+              localKeys += res.localKeys
+              sessionKeys += res.sessionKeys
+              importedOriginSet.add(snap.origin)
+            } finally {
+              await tempTab.close().catch(() => {})
+            }
+          }
+        }
+      } catch (err) {
+        skipped++
+        errors.push(`${snap.origin}: ${String((err as Error)?.message ?? err)}`)
+      }
+    }
+
+    const result: StorageImportResult = {
+      importedOrigins: importedOriginSet.size,
+      localKeys,
+      sessionKeys,
+      skipped,
+      errors,
+    }
+    this.emit({ type: 'storage_imported', ...result })
+    return result
+  }
+
+  async clearStorage(opts: StorageClearOptions = {}): Promise<StorageClearResult> {
+    const area = normalizeStorageArea(opts.area)
+    let removedLocal = 0
+    let removedSession = 0
+    const origins = new Set<string>()
+
+    if (opts.tabId !== undefined) {
+      const session = this.resolveSession(opts.tabId)
+      if (!session) throw new Error(`Tab ${opts.tabId} not found`)
+      const res = await session.driver.clearStorage({ area, keys: opts.keys })
+      removedLocal += res.removedLocal
+      removedSession += res.removedSession
+      if (res.origin && (res.removedLocal > 0 || res.removedSession > 0)) {
+        origins.add(res.origin)
+      }
+    } else {
+      for (const session of this.tabs.values()) {
+        const tabOrigin = normalizeStorageOrigin(session.driver.getUrl())
+        if (!tabOrigin) continue
+        if (opts.origin && !originFilterMatches(tabOrigin, opts.origin)) continue
+        const res = await session.driver.clearStorage({ area, keys: opts.keys })
+        removedLocal += res.removedLocal
+        removedSession += res.removedSession
+        if (res.origin && (res.removedLocal > 0 || res.removedSession > 0)) {
+          origins.add(res.origin)
+        }
+      }
+      if (this.engine.clearEngineStorage) {
+        const engRes = this.engine.clearEngineStorage({
+          origin: opts.origin,
+          area,
+          keys: opts.keys,
+        })
+        removedLocal += engRes.removedLocal
+        removedSession += engRes.removedSession
+        for (const o of engRes.origins) origins.add(o)
+      }
+    }
+
+    const result: StorageClearResult = {
+      removedLocal,
+      removedSession,
+      origins: [...origins].sort(),
+    }
+    this.emit({ type: 'storage_cleared', ...result })
+    return result
   }
 
   async close(): Promise<void> {

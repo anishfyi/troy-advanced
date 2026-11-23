@@ -15,9 +15,11 @@ import type {
   CookieImportResult,
   ElementDescriptor,
   NetworkEntry,
+  OriginStorageSnapshot,
   PageSnapshot,
   SettleOptions,
   SettleResult,
+  StorageArea,
   TrackerBlockingOptions,
   WaitConditionOptions,
   WaitResult,
@@ -43,6 +45,7 @@ import {
   type RawFrameSnapshot,
 } from './frames.js'
 import { dispatchKeyChord } from './keyboard.js'
+import { normalizeStorageArea, normalizeStorageMap, normalizeStorageOrigin } from './storage.js'
 import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
 import { SHADOW_DOM_QUERY_HELPER } from './shadow-dom.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
@@ -1807,6 +1810,134 @@ class ChromiumTab implements TabDriver {
 
   getBlockedTrackerStats(): BlockedTrackerStats {
     return this.trackerBlocker.getStats()
+  }
+
+  async getStorage(opts: { area?: StorageArea; keyPrefix?: string } = {}): Promise<OriginStorageSnapshot> {
+    const area = normalizeStorageArea(opts.area)
+    const keyPrefix = typeof opts.keyPrefix === 'string' ? opts.keyPrefix : ''
+    const payload = JSON.stringify({ area, keyPrefix })
+    const raw = (await this.evalJson(`(() => {
+      const cfg = ${payload};
+      const origin = typeof window.location?.origin === 'string' ? window.location.origin : '';
+      const readArea = (store) => {
+        const out = {};
+        if (!store) return out;
+        try {
+          for (let i = 0; i < store.length; i++) {
+            const k = store.key(i);
+            if (typeof k !== 'string') continue;
+            if (cfg.keyPrefix && !k.startsWith(cfg.keyPrefix)) continue;
+            const v = store.getItem(k);
+            if (typeof v === 'string') out[k] = v;
+          }
+        } catch {}
+        return out;
+      };
+      return {
+        origin,
+        localStorage: cfg.area === 'session' ? {} : readArea(window.localStorage),
+        sessionStorage: cfg.area === 'local' ? {} : readArea(window.sessionStorage),
+      };
+    })()`)) as { origin?: string; localStorage?: Record<string, string>; sessionStorage?: Record<string, string> } | null
+
+    const origin = normalizeStorageOrigin(raw?.origin ?? this.url) ?? ''
+    if (!origin) {
+      return { origin: '', localStorage: {}, sessionStorage: {} }
+    }
+    return {
+      origin,
+      localStorage: normalizeStorageMap(raw?.localStorage),
+      sessionStorage: normalizeStorageMap(raw?.sessionStorage),
+    }
+  }
+
+  async setStorage(
+    data: { localStorage?: Record<string, string>; sessionStorage?: Record<string, string> },
+    opts: { clearBeforeImport?: boolean } = {},
+  ): Promise<{ origin: string; localKeys: number; sessionKeys: number }> {
+    const payload = JSON.stringify({
+      localStorage: data.localStorage ? normalizeStorageMap(data.localStorage) : null,
+      sessionStorage: data.sessionStorage ? normalizeStorageMap(data.sessionStorage) : null,
+      clearBeforeImport: Boolean(opts.clearBeforeImport),
+    })
+    const res = (await this.evalJson(`(() => {
+      const cfg = ${payload};
+      const origin = typeof window.location?.origin === 'string' ? window.location.origin : '';
+      if (!origin || origin === 'null') {
+        return { origin: '', localKeys: 0, sessionKeys: 0, error: 'opaque origin' };
+      }
+      let localKeys = 0;
+      let sessionKeys = 0;
+      if (cfg.localStorage !== null) {
+        if (cfg.clearBeforeImport) window.localStorage.clear();
+        for (const [k, v] of Object.entries(cfg.localStorage)) {
+          window.localStorage.setItem(k, String(v));
+          localKeys++;
+        }
+      }
+      if (cfg.sessionStorage !== null) {
+        if (cfg.clearBeforeImport) window.sessionStorage.clear();
+        for (const [k, v] of Object.entries(cfg.sessionStorage)) {
+          window.sessionStorage.setItem(k, String(v));
+          sessionKeys++;
+        }
+      }
+      return { origin, localKeys, sessionKeys };
+    })()`)) as { origin?: string; localKeys?: number; sessionKeys?: number; error?: string } | null
+
+    if (res?.error) {
+      throw new Error(`Cannot set web storage on current tab (${res.error})`)
+    }
+    return {
+      origin: normalizeStorageOrigin(res?.origin ?? this.url) ?? '',
+      localKeys: Number(res?.localKeys ?? 0),
+      sessionKeys: Number(res?.sessionKeys ?? 0),
+    }
+  }
+
+  async clearStorage(opts: { area?: StorageArea; keys?: string[] } = {}): Promise<{
+    origin: string
+    removedLocal: number
+    removedSession: number
+  }> {
+    const area = normalizeStorageArea(opts.area)
+    const keys = Array.isArray(opts.keys) && opts.keys.length > 0 ? opts.keys : null
+    const payload = JSON.stringify({ area, keys })
+    const res = (await this.evalJson(`(() => {
+      const cfg = ${payload};
+      const origin = typeof window.location?.origin === 'string' ? window.location.origin : '';
+      if (!origin || origin === 'null') {
+        return { origin: '', removedLocal: 0, removedSession: 0 };
+      }
+      const clearStore = (store) => {
+        let removed = 0;
+        try {
+          if (cfg.keys) {
+            for (const k of cfg.keys) {
+              if (store.getItem(k) !== null) {
+                store.removeItem(k);
+                removed++;
+              }
+            }
+          } else {
+            removed = store.length;
+            store.clear();
+          }
+        } catch {}
+        return removed;
+      };
+      return {
+        origin,
+        removedLocal: cfg.area === 'session' ? 0 : clearStore(window.localStorage),
+        removedSession: cfg.area === 'local' ? 0 : clearStore(window.sessionStorage),
+      };
+    })()`)) as { origin?: string; removedLocal?: number; removedSession?: number } | null
+
+    return {
+      origin: normalizeStorageOrigin(res?.origin ?? this.url) ?? '',
+      removedLocal: Number(res?.removedLocal ?? 0),
+      removedSession: Number(res?.removedSession ?? 0),
+    }
   }
 
   async close(): Promise<void> {
