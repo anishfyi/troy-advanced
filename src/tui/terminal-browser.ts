@@ -8,6 +8,14 @@ import { formatRefTooltip, renderPageAsciiWithMetrics } from '../ascii/layout.js
 import type { BrowserManager } from '../engine/manager.js'
 import type { ElementDescriptor, PageSnapshot } from '../types.js'
 import {
+  cloneFormModalState,
+  createFormModalState,
+  isFormModalElement,
+  overlayModalOnFrame,
+  renderFormModalBox,
+  type FormModalState,
+} from './form-modal.js'
+import {
   composeSplitPaneFrame,
   computeSplitPaneWidths,
   cycleInspectorTab,
@@ -18,7 +26,7 @@ import {
   type InspectorTab,
 } from './inspector.js'
 
-export type TuiMode = 'normal' | 'search' | 'command'
+export type TuiMode = 'normal' | 'search' | 'command' | 'modal'
 
 export interface TuiKeyEvent {
   name?: string
@@ -89,6 +97,7 @@ export interface TuiState {
   activePane: ActivePane
   inspectorScrollOffset: number
   inspectorMaxScrollOffset: number
+  formModal: FormModalState | null
   exited: boolean
 }
 
@@ -122,6 +131,7 @@ export class TerminalBrowserController {
   private inspectorScrollOffset = 0
   private inspectorMaxScrollOffset = 0
   private inspectorViewportRows = 12
+  private formModal: FormModalState | null = null
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -168,6 +178,7 @@ export class TerminalBrowserController {
       activePane: this.activePane,
       inspectorScrollOffset: this.inspectorScrollOffset,
       inspectorMaxScrollOffset: this.inspectorMaxScrollOffset,
+      formModal: cloneFormModalState(this.formModal),
       exited: this.exited,
     }
   }
@@ -271,6 +282,10 @@ export class TerminalBrowserController {
   }
 
   private buildStatusLine(): string {
+    if (this.mode === 'modal' && this.formModal) {
+      const action = this.formModal.kind === 'select' ? 'Select' : 'Edit'
+      return `MODAL ${action} [${this.formModal.ref}] <${this.formModal.tag}> | Enter: submit | Esc: cancel`
+    }
     if (this.mode === 'search') {
       return `SEARCH /${this.inputBuffer}`
     }
@@ -412,6 +427,16 @@ export class TerminalBrowserController {
       this.inspectorMaxScrollOffset = 0
     }
 
+    if (this.mode === 'modal' && this.formModal) {
+      const modalLines = renderFormModalBox(this.formModal, {
+        maxWidth: width,
+        maxHeight: height,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+      })
+      frame = overlayModalOnFrame(frame, modalLines, { asciiOnly: this.asciiOnly })
+    }
+
     if (this.output.isTTY) {
       this.output.write('\x1b[2J\x1b[H')
     }
@@ -456,14 +481,34 @@ export class TerminalBrowserController {
     this.statusMessage = this.getFocusedTooltip() ?? 'No interactive refs on page'
   }
 
-  private async activateFocusedRef(): Promise<void> {
+  private async activateFocusedRef(): Promise<{ refresh: boolean }> {
     if (!this.focusedRef) {
       this.statusMessage = 'No focused ref (press Tab to focus a ref)'
-      return
+      return { refresh: false }
     }
     const ref = this.focusedRef
     const prevUrl = this.lastSnapshot?.url
     const el = this.findElementByRef(ref)
+
+    const modalKind = isFormModalElement(el)
+    if (modalKind && el) {
+      if (el.disabled) {
+        this.statusMessage = `Cannot edit ${ref}: field is disabled`
+        return { refresh: false }
+      }
+      if (el.readOnly) {
+        this.statusMessage = `Cannot edit ${ref}: field is read-only`
+        return { refresh: false }
+      }
+      this.formModal = createFormModalState(ref, el)
+      this.mode = 'modal'
+      this.statusMessage =
+        modalKind === 'select'
+          ? `Select option for ${ref} (Enter confirm, Esc cancel)`
+          : `Editing ${ref} (Enter submit, Esc cancel)`
+      return { refresh: false }
+    }
+
     const res = await this.manager.runTool(undefined, 'page_click', { ref })
     if (res.ok) {
       const nextUrl = typeof res.url === 'string' ? res.url : undefined
@@ -472,14 +517,174 @@ export class TerminalBrowserController {
         this.focusedRef = null
         this.focusedRefIndex = -1
       }
-      const inputHint =
-        el && (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select')
-          ? ` (use :fill ${ref} <text> to edit)`
-          : ''
-      this.statusMessage = `Activated ${ref}${nextUrl ? ` -> ${nextUrl}` : ''}${inputHint}`
-    } else {
-      this.statusMessage = `Refused ${ref}: ${res.error}`
+      this.statusMessage = `Activated ${ref}${nextUrl ? ` -> ${nextUrl}` : ''}`
+      return { refresh: true }
     }
+    this.statusMessage = `Refused ${ref}: ${res.error}`
+    return { refresh: false }
+  }
+
+  private async submitFormModal(): Promise<{ refresh: boolean }> {
+    const modal = this.formModal
+    this.formModal = null
+    this.mode = 'normal'
+    if (!modal) {
+      return { refresh: false }
+    }
+
+    if (modal.kind === 'select') {
+      const chosen = modal.options[modal.selectedIndex]
+      const value = chosen ? chosen.value : modal.value
+      const displayLabel = chosen ? chosen.label : value
+      const res = await this.manager.runTool(undefined, 'page_select', {
+        ref: modal.ref,
+        value,
+      })
+      if (res.ok) {
+        this.statusMessage = `Selected ${modal.ref} = ${displayLabel}`
+        return { refresh: true }
+      }
+      this.statusMessage = `Refused ${modal.ref}: ${res.error}`
+      return { refresh: false }
+    }
+
+    const res = await this.manager.runTool(undefined, 'page_fill', {
+      ref: modal.ref,
+      text: modal.value,
+      clear: true,
+    })
+    if (res.ok) {
+      const preview = modal.masked
+        ? ' (masked)'
+        : ` = "${modal.value.length > 32 ? `${modal.value.slice(0, 29)}...` : modal.value}"`
+      this.statusMessage = `Filled ${modal.ref}${preview}`
+      return { refresh: true }
+    }
+    this.statusMessage = `Refused ${modal.ref}: ${res.error}`
+    return { refresh: false }
+  }
+
+  private async handleModalKeypress(
+    seq: string,
+    k: TuiKeyEvent,
+  ): Promise<{ shouldExit: boolean; drawn: boolean }> {
+    const modal = this.formModal
+    if (!modal) {
+      this.mode = 'normal'
+      return { shouldExit: false, drawn: false }
+    }
+    const name = k.name ?? ''
+
+    if (name === 'escape') {
+      const ref = modal.ref
+      this.formModal = null
+      this.mode = 'normal'
+      this.statusMessage = `Cancelled editing ${ref}`
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'return' || name === 'enter') {
+      const { refresh } = await this.submitFormModal()
+      await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
+    }
+
+    // Select picker modal with parsed <option> list
+    if (modal.kind === 'select' && modal.options.length > 0) {
+      const len = modal.options.length
+      if ((!k.ctrl && !k.meta && seq === 'j') || name === 'down') {
+        modal.selectedIndex = (modal.selectedIndex + 1) % len
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if ((!k.ctrl && !k.meta && seq === 'k') || name === 'up') {
+        modal.selectedIndex = (modal.selectedIndex - 1 + len) % len
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if ((!k.ctrl && !k.meta && !k.shift && seq === 'g') || name === 'home') {
+        modal.selectedIndex = 0
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if ((!k.ctrl && !k.meta && (seq === 'G' || (k.shift && name === 'g'))) || name === 'end') {
+        modal.selectedIndex = len - 1
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if (!k.ctrl && !k.meta && /^[1-9]$/.test(seq)) {
+        const idx = Number(seq) - 1
+        if (idx < len) {
+          modal.selectedIndex = idx
+          await this.draw()
+          return { shouldExit: false, drawn: true }
+        }
+      }
+      return { shouldExit: false, drawn: false }
+    }
+
+    // Text input modal editing (<input>, <textarea>, or <select> with empty options)
+    if (name === 'left') {
+      modal.cursor = Math.max(0, modal.cursor - 1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+    if (name === 'right') {
+      modal.cursor = Math.min(modal.value.length, modal.cursor + 1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+    if (name === 'home' || (k.ctrl && name === 'a')) {
+      modal.cursor = 0
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+    if (name === 'end' || (k.ctrl && name === 'e')) {
+      modal.cursor = modal.value.length
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+    if (k.ctrl && name === 'u') {
+      modal.value = ''
+      modal.cursor = 0
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+    if (k.ctrl && name === 'w') {
+      const before = modal.value.slice(0, modal.cursor)
+      const after = modal.value.slice(modal.cursor)
+      const trimmed = before.replace(/\S+\s*$/, '')
+      modal.value = trimmed + after
+      modal.cursor = trimmed.length
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+    if (name === 'backspace') {
+      if (modal.cursor > 0) {
+        modal.value = modal.value.slice(0, modal.cursor - 1) + modal.value.slice(modal.cursor)
+        modal.cursor -= 1
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      return { shouldExit: false, drawn: false }
+    }
+    if (name === 'delete') {
+      if (modal.cursor < modal.value.length) {
+        modal.value = modal.value.slice(0, modal.cursor) + modal.value.slice(modal.cursor + 1)
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      return { shouldExit: false, drawn: false }
+    }
+    if (!k.ctrl && !k.meta && seq.length > 0 && seq >= ' ' && seq !== '\x7f') {
+      modal.value = modal.value.slice(0, modal.cursor) + seq + modal.value.slice(modal.cursor)
+      modal.cursor += seq.length
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    return { shouldExit: false, drawn: false }
   }
 
   private async runSearch(query: string): Promise<void> {
@@ -691,6 +896,11 @@ export class TerminalBrowserController {
       return { shouldExit: true, drawn: false }
     }
 
+    // Inline form-filling modal mode
+    if (this.mode === 'modal') {
+      return this.handleModalKeypress(seq, k)
+    }
+
     // Search or Command input mode
     if (this.mode === 'search' || this.mode === 'command') {
       if (name === 'escape') {
@@ -894,9 +1104,8 @@ export class TerminalBrowserController {
     }
 
     if (name === 'return' || name === 'enter') {
-      const hadFocus = Boolean(this.focusedRef)
-      await this.activateFocusedRef()
-      await this.draw({ refresh: hadFocus })
+      const { refresh } = await this.activateFocusedRef()
+      await this.draw({ refresh })
       return { shouldExit: false, drawn: true }
     }
 
