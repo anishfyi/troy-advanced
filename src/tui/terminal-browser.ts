@@ -27,6 +27,15 @@ import {
   type FormModalState,
 } from './form-modal.js'
 import {
+  cloneHelpOverlayState,
+  createHelpOverlayState,
+  formatHelpOverlayStatus,
+  renderHelpOverlayBox,
+  scrollHelpOverlay,
+  type HelpOverlayRenderResult,
+  type HelpOverlayState,
+} from './help-overlay.js'
+import {
   composeSplitPaneFrame,
   computeSplitPaneWidths,
   cycleInspectorTab,
@@ -100,7 +109,7 @@ import {
   type TuiTtyCapabilities,
 } from './tty-fallback.js'
 
-export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint' | 'palette' | 'sidebar'
+export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint' | 'palette' | 'sidebar' | 'help'
 
 export interface TuiKeyEvent {
   name?: string
@@ -205,6 +214,7 @@ export interface TuiState {
   formModal: FormModalState | null
   linkHint: LinkHintState | null
   palette: CommandPaletteState | null
+  helpOverlay: HelpOverlayState | null
   sidebarOpen: boolean
   sidebarTab: SidebarTab
   sidebar: SidebarState | null
@@ -255,6 +265,7 @@ export class TerminalBrowserController {
   private formModal: FormModalState | null = null
   private linkHint: LinkHintState | null = null
   private palette: CommandPaletteState | null = null
+  private helpOverlay: HelpOverlayState | null = null
   private sidebar: SidebarState | null = null
   private sidebarViewportRows = 12
   private lastRecordedUrlByTab = new Map<number, string>()
@@ -309,8 +320,8 @@ export class TerminalBrowserController {
       this.mode = 'sidebar'
     }
     this.statusMessage = this.isRawModeEnabled()
-      ? 'Keys: j/k scroll | v view | 1-9/t/w tabs | b/H library | f jump | Ctrl+P palette | / search | : cmd | Tab focus | i inspector | q quit'
-      : 'Type a command (open <url>, view, bookmarks, history, newtab, close, tabs, palette, click e1, split, quit)'
+      ? 'Keys: j/k scroll | v view | 1-9/t/w tabs | b/H library | f jump | Ctrl+P palette | / search | : cmd | ? help | q quit'
+      : 'Type a command (open <url>, view, bookmarks, history, newtab, close, tabs, palette, click e1, split, help, quit)'
   }
 
   getLibrary(): BookmarkHistoryStore {
@@ -357,6 +368,7 @@ export class TerminalBrowserController {
       formModal: cloneFormModalState(this.formModal),
       linkHint: cloneLinkHintState(this.linkHint),
       palette: cloneCommandPaletteState(this.palette),
+      helpOverlay: cloneHelpOverlayState(this.helpOverlay),
       sidebarOpen: this.sidebar !== null,
       sidebarTab: this.sidebar?.tab ?? 'bookmarks',
       sidebar: cloneSidebarState(this.sidebar),
@@ -564,6 +576,9 @@ export class TerminalBrowserController {
   }
 
   private buildStatusLine(): string {
+    if (this.mode === 'help' && this.helpOverlay) {
+      return formatHelpOverlayStatus(this.helpOverlay, { asciiOnly: this.asciiOnly })
+    }
     if (this.mode === 'palette' && this.palette) {
       return formatCommandPaletteStatus(this.palette, { asciiOnly: this.asciiOnly })
     }
@@ -679,6 +694,23 @@ export class TerminalBrowserController {
     let leftFrame: string
 
     const effectiveFocusedRef = this.mode === 'hint' ? undefined : (this.focusedRef ?? undefined)
+
+    let helpRendered: HelpOverlayRenderResult | null = null
+    if (this.mode === 'help' && this.helpOverlay) {
+      helpRendered = renderHelpOverlayBox(this.helpOverlay, {
+        maxWidth: width,
+        maxHeight: height,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+      })
+      this.helpOverlay = {
+        ...this.helpOverlay,
+        scrollOffset: helpRendered.scrollOffset,
+        maxScrollOffset: helpRendered.maxScrollOffset,
+        totalLines: helpRendered.totalLines,
+        viewportRows: helpRendered.viewportRows,
+      }
+    }
 
     if (isPixelViewMode(this.viewMode)) {
       if (shouldRefresh || !this.lastSnapshot) {
@@ -899,6 +931,8 @@ export class TerminalBrowserController {
         color: this.color,
       })
       frame = overlayModalOnFrame(frame, paletteLines, { asciiOnly: this.asciiOnly })
+    } else if (this.mode === 'help' && helpRendered) {
+      frame = overlayModalOnFrame(frame, helpRendered.lines, { asciiOnly: this.asciiOnly })
     }
 
     const outputFrame = !this.color ? sanitizeNonTtyOutput(frame) : frame
@@ -1711,6 +1745,9 @@ export class TerminalBrowserController {
       case 'toggle-bookmark':
         this.toggleCurrentPageBookmark()
         return { shouldExit: false, refresh: false }
+      case 'open-help':
+        this.openHelpOverlay()
+        return { shouldExit: false, refresh: false }
       case 'prompt':
         this.mode = 'command'
         this.inputBuffer = cmd.action.prefix
@@ -1835,6 +1872,82 @@ export class TerminalBrowserController {
     if (!k.ctrl && !k.meta && seq.length > 0 && seq >= ' ' && seq !== '\x7f') {
       const nextQuery = palette.query.slice(0, palette.cursor) + seq + palette.query.slice(palette.cursor)
       this.palette = updateCommandPaletteQuery(palette, nextQuery, palette.cursor + seq.length)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    return { shouldExit: false, drawn: false }
+  }
+
+  private openHelpOverlay(): void {
+    this.helpOverlay = createHelpOverlayState()
+    this.mode = 'help'
+    this.inputBuffer = ''
+    this.statusMessage = formatHelpOverlayStatus(this.helpOverlay, { asciiOnly: this.asciiOnly })
+  }
+
+  private closeHelpOverlay(message?: string): void {
+    this.helpOverlay = null
+    this.mode = 'normal'
+    this.statusMessage = message ?? 'Help closed'
+  }
+
+  private async handleHelpKeypress(
+    seq: string,
+    k: TuiKeyEvent,
+  ): Promise<{ shouldExit: boolean; drawn: boolean }> {
+    const help = this.helpOverlay
+    if (!help) {
+      this.mode = 'normal'
+      return { shouldExit: false, drawn: false }
+    }
+    const name = k.name ?? ''
+
+    if (
+      name === 'escape' ||
+      name === 'return' ||
+      name === 'enter' ||
+      (!k.ctrl && !k.meta && (seq === '?' || seq === 'q'))
+    ) {
+      this.closeHelpOverlay('Help closed')
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && seq === 'j') || name === 'down') {
+      this.helpOverlay = scrollHelpOverlay(help, 1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && seq === 'k') || name === 'up') {
+      this.helpOverlay = scrollHelpOverlay(help, -1)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'pagedown' || (k.ctrl && name === 'd') || (!k.ctrl && !k.meta && seq === ' ')) {
+      const step = Math.max(4, Math.floor((help.viewportRows || 10) / 2))
+      this.helpOverlay = scrollHelpOverlay(help, step)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'pageup' || (k.ctrl && name === 'u')) {
+      const step = Math.max(4, Math.floor((help.viewportRows || 10) / 2))
+      this.helpOverlay = scrollHelpOverlay(help, -step)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && !k.shift && seq === 'g') || name === 'home') {
+      this.helpOverlay = { ...help, scrollOffset: 0 }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && (seq === 'G' || (k.shift && name === 'g'))) || name === 'end') {
+      this.helpOverlay = { ...help, scrollOffset: help.maxScrollOffset }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
@@ -2201,8 +2314,12 @@ export class TerminalBrowserController {
         await this.handleResize({ source: 'manual', force: true })
         return { shouldExit: false, skipDraw: true }
       } else if (cmd === 'help' || cmd === '?') {
-        this.statusMessage =
-          'Keys: j/k g/G v/V 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | save <file.{txt|md|json}> | view | bookmarks | history | newtab | close | tabs | palette | split | quit'
+        if (this.isRawModeEnabled()) {
+          this.openHelpOverlay()
+        } else {
+          this.statusMessage =
+            'Keys: j/k g/G v/V 1-9/t/w b/H/B Ctrl+P f / : ? Tab Enter i [/] I q | Cmds: open <url> | save <file.{txt|md|json}> | view | bookmarks | history | newtab | close | tabs | palette | split | quit'
+        }
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`
@@ -2229,6 +2346,11 @@ export class TerminalBrowserController {
     if (k.ctrl && name === 'c') {
       this.exited = true
       return { shouldExit: true, drawn: false }
+    }
+
+    // Help overlay mode (?)
+    if (this.mode === 'help') {
+      return this.handleHelpKeypress(seq, k)
     }
 
     // Command palette mode (Ctrl+P)
@@ -2312,6 +2434,12 @@ export class TerminalBrowserController {
 
     if (k.ctrl && name === 'l') {
       await this.handleResize({ source: 'manual', force: true })
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && seq === '?') {
+      this.openHelpOverlay()
+      await this.draw()
       return { shouldExit: false, drawn: true }
     }
 

@@ -62,7 +62,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M51: Non-TTY / piped fallback detection so TUI never corrupts output when stdin/stdout is redirected
 - [x] M52: Live pixel-preview toggle (`v` cycles Layout ASCII -> Pixel ASCII -> Braille -> Halfblock)
 - [x] M53: Export current page view to `.txt`, `.md`, or `.json` directly from TUI (`:save <file>`)
-- [ ] M54: Built-in TUI help overlay (`?`) listing all keybindings in an ASCII modal box
+- [x] M54: Built-in TUI help overlay (`?`) listing all keybindings in an ASCII modal box
 - [ ] M55: Headless PTY / simulated stream unit tests covering every TUI interaction
 
 ## Track 5: Deep AI Agent & Protocol Integration (Milestones 56–70)

@@ -18,6 +18,7 @@ export type PaletteAction =
   | { type: 'clear-focus' }
   | { type: 'open-sidebar'; tab: 'bookmarks' | 'history' }
   | { type: 'toggle-bookmark' }
+  | { type: 'open-help' }
   | { type: 'quit' }
 
 export interface PaletteCommand {
@@ -408,6 +409,15 @@ export function buildPaletteCommands(ctx: CommandPaletteContext): PaletteCommand
       description: 'Render Sobel edge-detected wireframe screenshot',
       keywords: ['screenshot', 'sobel', 'wireframe'],
       action: { type: 'command', command: 'visual edge' },
+    },
+    {
+      id: 'session.help',
+      label: 'Keyboard Shortcuts & Help',
+      category: 'Session',
+      shortcut: '?',
+      description: 'Open the built-in TUI keybindings help overlay',
+      keywords: ['help', 'keys', 'keybindings', 'shortcuts', 'cheatsheet', '?'],
+      action: { type: 'open-help' },
     },
     {
       id: 'session.quit',
