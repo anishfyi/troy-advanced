@@ -23,6 +23,7 @@ import type {
 import { CdpClient } from './cdp-client.js'
 import { dispatchKeyChord } from './keyboard.js'
 import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
+import { SHADOW_DOM_QUERY_HELPER } from './shadow-dom.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import { describeWaitCondition, matchesText, matchesUrlPattern, pollUntil } from './wait.js'
@@ -46,11 +47,11 @@ const SNAPSHOT_SCRIPT = `(() => {
     return String(str).replace(/([ !"#$%&'()*+,./:;<=>?@[\\\\\\]^\`{|}~])/g, '\\\\$1');
   }
 
-  function selectorFor(el) {
+  function localSelectorInRoot(el, root) {
     if (el.id) {
       const candidate = '#' + cssEscape(el.id);
       try {
-        if (document.querySelectorAll(candidate).length === 1) return candidate;
+        if (root.querySelectorAll(candidate).length === 1) return candidate;
       } catch {}
     }
     const parts = [];
@@ -65,16 +66,37 @@ const SNAPSHOT_SCRIPT = `(() => {
       const name = cur.getAttribute && cur.getAttribute('name');
       if (name && (part === 'input' || part === 'textarea' || part === 'select' || part === 'button')) {
         part += '[name="' + name.replace(/"/g, '\\\\"') + '"]';
-      } else if (cur.parentElement) {
-        const siblings = Array.from(cur.parentElement.children).filter((s) => s.tagName === cur.tagName);
-        if (siblings.length > 1) {
-          part += ':nth-of-type(' + (siblings.indexOf(cur) + 1) + ')';
+      } else {
+        const parent = cur.parentElement || (cur.parentNode && cur.parentNode.nodeType === 11 ? cur.parentNode : null);
+        if (parent && parent.children) {
+          const siblings = Array.from(parent.children).filter((s) => s.tagName === cur.tagName);
+          if (siblings.length > 1) {
+            part += ':nth-of-type(' + (siblings.indexOf(cur) + 1) + ')';
+          }
         }
       }
       parts.unshift(part);
       cur = cur.parentElement;
     }
     return parts.join(' > ');
+  }
+
+  function selectorFor(el) {
+    const segments = [];
+    let cur = el;
+    let guard = 0;
+    while (cur && guard < 12) {
+      guard += 1;
+      const root = cur.getRootNode ? cur.getRootNode() : document;
+      const queryRoot = root && typeof root.querySelectorAll === 'function' ? root : document;
+      segments.unshift(localSelectorInRoot(cur, queryRoot));
+      if (root && root !== document && root.host) {
+        cur = root.host;
+      } else {
+        break;
+      }
+    }
+    return segments.join(' >>> ');
   }
 
   function isVisible(el) {
@@ -93,7 +115,12 @@ const SNAPSHOT_SCRIPT = `(() => {
     if (aria) return aria.trim();
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) {
-      const t = labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.textContent?.trim() || '').filter(Boolean).join(' ');
+      const root = el.getRootNode ? el.getRootNode() : document;
+      const t = labelledBy
+        .split(/\\s+/)
+        .map((id) => ((root && typeof root.getElementById === 'function' ? root.getElementById(id) : null) || document.getElementById(id))?.textContent?.trim() || '')
+        .filter(Boolean)
+        .join(' ');
       if (t) return t;
     }
     return el.getAttribute('placeholder') || el.getAttribute('name') || '';
@@ -168,7 +195,12 @@ const SNAPSHOT_SCRIPT = `(() => {
       if (!title) {
         const labelledBy = form.getAttribute('aria-labelledby');
         if (labelledBy) {
-          title = labelledBy.split(/\\s+/).map((refId) => document.getElementById(refId)?.textContent?.trim() || '').filter(Boolean).join(' ');
+          const root = form.getRootNode ? form.getRootNode() : document;
+          title = labelledBy
+            .split(/\\s+/)
+            .map((refId) => ((root && typeof root.getElementById === 'function' ? root.getElementById(refId) : null) || document.getElementById(refId))?.textContent?.trim() || '')
+            .filter(Boolean)
+            .join(' ');
         }
       }
       if (!title) title = (form.getAttribute('title') || '').trim();
@@ -198,8 +230,25 @@ const SNAPSHOT_SCRIPT = `(() => {
   const blockSel = 'h1, h2, h3, h4, h5, h6, p, a[href], button, input:not([type="hidden"]), textarea, select, li, pre, tr, img, canvas, hr';
   let capturedCanvasCount = 0;
   const body = document.body || document.documentElement;
+  const blockNodes = [];
   if (body) {
-    for (const el of body.querySelectorAll(blockSel)) {
+    const visitBlocks = (root) => {
+      const kids = root.children || [];
+      for (let i = 0; i < kids.length; i++) {
+        const child = kids[i];
+        if (child.matches && child.matches(blockSel)) {
+          blockNodes.push(child);
+        }
+        if (child.shadowRoot) {
+          visitBlocks(child.shadowRoot);
+        }
+        if (child.children && child.children.length > 0) {
+          visitBlocks(child);
+        }
+      }
+    };
+    visitBlocks(body);
+    for (const el of blockNodes) {
       if (blocks.length >= 300) break;
       if (!isVisible(el)) continue;
       const tag = el.tagName.toLowerCase();
@@ -696,7 +745,13 @@ class ChromiumTab implements TabDriver {
   async click(selector: string): Promise<{ ok: boolean; note?: string }> {
     const res = await this.evalJson<{ ok: boolean; x?: number; y?: number; note?: string }>(
       `(() => {
-        const el = document.querySelector(${JSON.stringify(selector)});
+        ${SHADOW_DOM_QUERY_HELPER}
+        let el;
+        try {
+          el = querySelectorDeep(${JSON.stringify(selector)});
+        } catch (err) {
+          return { ok: false, note: 'invalid selector: ' + String((err && err.message) || err) };
+        }
         if (!el) return { ok: false, note: 'element not found' };
         el.scrollIntoView({ block: 'center', inline: 'center' });
         const r = el.getBoundingClientRect();
@@ -723,16 +778,30 @@ class ChromiumTab implements TabDriver {
   async fill(selector: string, text: string, clear = true): Promise<{ ok: boolean; value?: string }> {
     const res = await this.evalJson<{ ok: boolean; value?: string }>(
       `(() => {
-        const el = document.querySelector(${JSON.stringify(selector)});
+        ${SHADOW_DOM_QUERY_HELPER}
+        let el;
+        try {
+          el = querySelectorDeep(${JSON.stringify(selector)});
+        } catch {
+          return { ok: false };
+        }
         if (!el) return { ok: false };
-        el.focus();
+        if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
+        if (typeof el.focus === 'function') el.focus();
+        if (el.isContentEditable) {
+          const nextVal = ${clear ? '""' : 'String(el.textContent ?? "")'} + ${JSON.stringify(text)};
+          el.textContent = nextVal;
+          el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          return { ok: true, value: String(el.textContent ?? '') };
+        }
         const nextVal = ${clear ? '""' : 'String(el.value ?? "")'} + ${JSON.stringify(text)};
         const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
         if (setter) setter.call(el, nextVal);
         else el.value = nextVal;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
         return { ok: true, value: String(el.value ?? '') };
       })()`,
     )
@@ -742,14 +811,20 @@ class ChromiumTab implements TabDriver {
   async select(selector: string, value: string): Promise<{ ok: boolean; value?: string }> {
     const res = await this.evalJson<{ ok: boolean; value?: string }>(
       `(() => {
-        const el = document.querySelector(${JSON.stringify(selector)});
+        ${SHADOW_DOM_QUERY_HELPER}
+        let el;
+        try {
+          el = querySelectorDeep(${JSON.stringify(selector)});
+        } catch {
+          return { ok: false };
+        }
         if (!el || el.tagName !== 'SELECT') return { ok: false };
         const target = ${JSON.stringify(value)}.toLowerCase();
         const opt = Array.from(el.options).find((o) => o.value.toLowerCase() === target || (o.text || '').trim().toLowerCase() === target);
         if (!opt) return { ok: false };
         el.value = opt.value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
         return { ok: true, value: opt.text || opt.value };
       })()`,
     )
@@ -758,7 +833,24 @@ class ChromiumTab implements TabDriver {
 
   async press(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }> {
     if (selector) {
-      await this.evalJson(`document.querySelector(${JSON.stringify(selector)})?.focus()`)
+      const focusRes = await this.evalJson<{ ok: boolean; error?: string }>(
+        `(() => {
+          ${SHADOW_DOM_QUERY_HELPER}
+          let el;
+          try {
+            el = querySelectorDeep(${JSON.stringify(selector)});
+          } catch (err) {
+            return { ok: false, error: 'invalid selector: ' + String((err && err.message) || err) };
+          }
+          if (!el) return { ok: false, error: 'element not found' };
+          if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
+          if (typeof el.focus === 'function') el.focus();
+          return { ok: true };
+        })()`,
+      )
+      if (!focusRes?.ok) {
+        return { ok: false, error: focusRes?.error ?? 'element not found' }
+      }
     }
     try {
       const { chord } = await dispatchKeyChord((method, params) => this.cdp.send(method, params), key)
@@ -772,8 +864,15 @@ class ChromiumTab implements TabDriver {
   async hover(selector: string): Promise<{ ok: boolean }> {
     const res = await this.evalJson<{ ok: boolean; x?: number; y?: number }>(
       `(() => {
-        const el = document.querySelector(${JSON.stringify(selector)});
+        ${SHADOW_DOM_QUERY_HELPER}
+        let el;
+        try {
+          el = querySelectorDeep(${JSON.stringify(selector)});
+        } catch {
+          return { ok: false };
+        }
         if (!el) return { ok: false };
+        if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
         const r = el.getBoundingClientRect();
         return { ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2 };
       })()`,
@@ -885,9 +984,10 @@ class ChromiumTab implements TabDriver {
               const selector = ${JSON.stringify(options.selector ?? '')};
               const targetState = ${JSON.stringify(state)};
               if (selector) {
+                ${SHADOW_DOM_QUERY_HELPER}
                 let els;
                 try {
-                  els = Array.from(document.querySelectorAll(selector));
+                  els = querySelectorAllDeep(selector);
                 } catch (err) {
                   out.selectorError = String((err && err.message) || err);
                   return out;
