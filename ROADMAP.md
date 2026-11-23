@@ -59,7 +59,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M48: Tab bar switching (`1`-`9`, `t` new tab, `w` close tab) and command palette (`Ctrl+P`)
 - [x] M49: Bookmark & History sidebar panel inside TUI (`b` bookmarks, `H` history)
 - [x] M50: Terminal resize (`SIGWINCH`) live reflow handler so TUI adapts smoothly inside tmux/screen panes
-- [ ] M51: Non-TTY / piped fallback detection so TUI never corrupts output when stdin/stdout is redirected
+- [x] M51: Non-TTY / piped fallback detection so TUI never corrupts output when stdin/stdout is redirected
 - [ ] M52: Live pixel-preview toggle (`v` cycles Layout ASCII -> Pixel ASCII -> Braille -> Halfblock)
 - [ ] M53: Export current page view to `.txt`, `.md`, or `.json` directly from TUI (`:save <file>`)
 - [ ] M54: Built-in TUI help overlay (`?`) listing all keybindings in an ASCII modal box

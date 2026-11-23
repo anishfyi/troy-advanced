@@ -72,6 +72,17 @@ import {
   type SidebarState,
   type SidebarTab,
 } from './sidebar.js'
+import {
+  detectTtyCapabilities,
+  formatFallbackNotice,
+  isBrokenPipeError,
+  safeWriteStream,
+  sanitizeNonTtyOutput,
+  type NonTtyPolicy,
+  type TuiRuntimeMode,
+  type TuiStderrStream,
+  type TuiTtyCapabilities,
+} from './tty-fallback.js'
 
 export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint' | 'palette' | 'sidebar'
 
@@ -128,6 +139,14 @@ export interface TuiOptions {
   resizeDebounceMs?: number
   /** Optional custom SIGWINCH signal emitter (defaults to `process` for stdout on POSIX). */
   resizeSignalSource?: ResizeSignalSource | null
+  /** Injectable stderr stream for non-TTY diagnostic notices. Pass null to silence; defaults to process.stderr when output is not overridden. */
+  stderr?: TuiStderrStream | null
+  /** Injectable environment variables (defaults to process.env) for TERM/NO_COLOR/FORCE_COLOR detection. */
+  env?: Record<string, string | undefined>
+  /** Non-TTY fallback policy: auto (default), snapshot (one-shot dump), batch (line commands), or interactive. */
+  nonTtyMode?: NonTtyPolicy
+  /** Suppress the one-line diagnostic notice written to stderr when non-TTY fallback activates. */
+  suppressFallbackNotice?: boolean
 }
 
 export interface TuiSearchMatch {
@@ -172,6 +191,8 @@ export interface TuiState {
   bookmarkCount: number
   historyCount: number
   currentPageBookmarked: boolean
+  runtimeMode: TuiRuntimeMode
+  ttyCapabilities: TuiTtyCapabilities
   exited: boolean
 }
 
@@ -179,6 +200,8 @@ export class TerminalBrowserController {
   private readonly manager: BrowserManager
   private readonly input: TuiInputStream
   private readonly output: TuiOutputStream
+  private readonly stderr: TuiStderrStream | null
+  private readonly ttyCapabilities: TuiTtyCapabilities
   private readonly opts: TuiOptions
   private readonly scrollStep: number
   private readonly library: BookmarkHistoryStore
@@ -216,6 +239,7 @@ export class TerminalBrowserController {
   private resizeCount = 0
   private sidebarSuspendedByWidth = false
   private splitPaneSuspendedByWidth = false
+  private fallbackNoticeEmitted = false
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -223,10 +247,24 @@ export class TerminalBrowserController {
     this.opts = opts
     this.input = opts.input ?? (process.stdin as TuiInputStream)
     this.output = opts.output ?? (process.stdout as TuiOutputStream)
+    this.stderr = opts.stderr === undefined ? (opts.output ? null : (process.stderr as TuiStderrStream)) : opts.stderr
+    this.ttyCapabilities = detectTtyCapabilities({
+      input: this.input,
+      output: this.output,
+      stderr: this.stderr,
+      env: opts.env,
+      rawMode: opts.rawMode,
+      asciiOnly: opts.asciiOnly,
+      color: opts.color,
+      nonTtyMode: opts.nonTtyMode,
+    })
     this.lastViewportDimensions = this.resolveDimensions()
     this.scrollStep = Math.max(1, opts.scrollStep ?? 1)
-    this.asciiOnly = opts.asciiOnly ?? false
-    this.color = this.asciiOnly ? false : (opts.color ?? Boolean(this.output.isTTY))
+    this.color = this.ttyCapabilities.allowColor
+    this.asciiOnly =
+      typeof opts.asciiOnly === 'boolean'
+        ? opts.asciiOnly
+        : this.ttyCapabilities.isDumbTerm || (!this.ttyCapabilities.stdoutIsTTY && !this.ttyCapabilities.allowColor)
     this.splitPane = Boolean(opts.splitPane)
     this.inspectorTab = opts.inspectorTab ?? 'console'
     const defaultLibraryPath = manager.profileDir ? path.join(manager.profileDir, 'tui-library.json') : null
@@ -249,9 +287,12 @@ export class TerminalBrowserController {
     return this.library
   }
 
+  getTtyCapabilities(): TuiTtyCapabilities {
+    return { ...this.ttyCapabilities }
+  }
+
   isRawModeEnabled(): boolean {
-    if (typeof this.opts.rawMode === 'boolean') return this.opts.rawMode
-    return Boolean(this.input.isTTY)
+    return this.ttyCapabilities.allowRawMode
   }
 
   getState(): TuiState {
@@ -292,6 +333,8 @@ export class TerminalBrowserController {
       bookmarkCount: this.library.getCounts().bookmarks,
       historyCount: this.library.getCounts().history,
       currentPageBookmarked: Boolean(this.lastSnapshot?.url && this.library.isBookmarked(this.lastSnapshot.url)),
+      runtimeMode: this.ttyCapabilities.mode,
+      ttyCapabilities: { ...this.ttyCapabilities },
       exited: this.exited,
     }
   }
@@ -744,24 +787,36 @@ export class TerminalBrowserController {
       frame = overlayModalOnFrame(frame, paletteLines, { asciiOnly: this.asciiOnly })
     }
 
-    if (this.output.isTTY) {
-      this.output.write('\x1b[2J\x1b[H')
-    }
-    this.output.write(`${frame}\n`)
+    const outputFrame = !this.color ? sanitizeNonTtyOutput(frame) : frame
 
-    if (this.isRawModeEnabled()) {
+    if (this.ttyCapabilities.allowAnsiClear) {
+      if (!safeWriteStream(this.output, '\x1b[2J\x1b[H')) {
+        this.exited = true
+        return outputFrame
+      }
+    }
+    if (!safeWriteStream(this.output, `${outputFrame}\n`)) {
+      this.exited = true
+      return outputFrame
+    }
+
+    if (this.isRawModeEnabled() && this.ttyCapabilities.stdoutIsTTY) {
+      let promptSuffix = ''
       if (this.mode === 'search') {
-        this.output.write(`/${this.inputBuffer}`)
+        promptSuffix = `/${this.inputBuffer}`
       } else if (this.mode === 'command') {
-        this.output.write(`:${this.inputBuffer}`)
+        promptSuffix = `:${this.inputBuffer}`
       } else if (this.mode === 'hint' && this.linkHint) {
-        this.output.write(`f:${this.linkHint.digits}`)
+        promptSuffix = `f:${this.linkHint.digits}`
       } else if (this.mode === 'sidebar' && this.sidebar?.filtering) {
-        this.output.write(`/${this.sidebar.filterQuery}`)
+        promptSuffix = `/${this.sidebar.filterQuery}`
+      }
+      if (promptSuffix && !safeWriteStream(this.output, promptSuffix)) {
+        this.exited = true
       }
     }
 
-    return frame
+    return outputFrame
   }
 
   private focusRefByName(ref: string): void {
@@ -1750,7 +1805,7 @@ export class TerminalBrowserController {
         this.statusMessage = `Bottom of page (line ${this.scrollOffset})`
       } else if (cmd === 'ascii') {
         this.asciiOnly = !this.asciiOnly
-        this.color = !this.asciiOnly && Boolean(this.output.isTTY)
+        this.color = !this.asciiOnly && this.ttyCapabilities.allowColor
         this.statusMessage = `Mode: ${this.asciiOnly ? 'strict 7-bit ASCII' : 'Unicode/ANSI'}`
       } else if (cmd === 'open' || cmd === 'go' || cmd === 'o') {
         const res = await this.manager.openTab(arg, { activate: true })
@@ -1884,7 +1939,11 @@ export class TerminalBrowserController {
           annotate: true,
         })
         if (res.ok && typeof res.ascii === 'string') {
-          this.output.write(`\n${res.ascii}\n`)
+          const payload = !this.color ? sanitizeNonTtyOutput(res.ascii) : res.ascii
+          if (!safeWriteStream(this.output, `\n${payload}\n`)) {
+            this.exited = true
+            return { shouldExit: true, skipDraw: true }
+          }
           return { shouldExit: false, skipDraw: true }
         }
         this.statusMessage = `Visual error: ${res.error}`
@@ -2257,12 +2316,35 @@ export class TerminalBrowserController {
     return { shouldExit: false, drawn: false }
   }
 
+  private emitFallbackNoticeOnce(): void {
+    if (this.fallbackNoticeEmitted || this.opts.suppressFallbackNotice || !this.stderr) return
+    const notice = formatFallbackNotice(this.ttyCapabilities)
+    if (!notice) return
+    this.fallbackNoticeEmitted = true
+    safeWriteStream(this.stderr, notice)
+  }
+
   async run(): Promise<void> {
-    await this.init()
-    if (this.isRawModeEnabled()) {
-      await this.runRawLoop()
-    } else {
-      await this.runLineLoop()
+    const onOutputError = (err: Error) => {
+      if (isBrokenPipeError(err)) {
+        this.exited = true
+      }
+    }
+    this.output.on('error', onOutputError)
+    try {
+      this.emitFallbackNoticeOnce()
+      await this.init()
+      if (this.exited || this.ttyCapabilities.oneShotSnapshot) {
+        this.exited = true
+        return
+      }
+      if (this.isRawModeEnabled()) {
+        await this.runRawLoop()
+      } else {
+        await this.runLineLoop()
+      }
+    } finally {
+      this.output.off('error', onOutputError)
     }
   }
 
@@ -2341,11 +2423,18 @@ export class TerminalBrowserController {
   }
 
   private async runLineLoop(): Promise<void> {
-    const rl = readline.createInterface({
-      input: this.input,
-      output: this.output,
-      prompt: 'troy-adv> ',
-    })
+    const useInteractivePrompt = this.ttyCapabilities.allowPromptEcho
+    const rl = useInteractivePrompt
+      ? readline.createInterface({
+          input: this.input,
+          output: this.output,
+          prompt: 'troy-adv> ',
+          terminal: !this.ttyCapabilities.isDumbTerm,
+        })
+      : readline.createInterface({
+          input: this.input,
+          terminal: false,
+        })
 
     let lineResizeQueue: Promise<void> = Promise.resolve()
     const resizeWatcher = new TerminalResizeWatcher({
@@ -2359,7 +2448,7 @@ export class TerminalBrowserController {
           .then(async () => {
             if (this.exited) return
             const redrawn = await this.handleResize({ source: event.source, event })
-            if (redrawn && !this.exited) {
+            if (redrawn && !this.exited && useInteractivePrompt) {
               rl.prompt(true)
             }
           })
@@ -2372,26 +2461,44 @@ export class TerminalBrowserController {
       resizeWatcher.start()
     }
 
-    rl.prompt()
+    if (useInteractivePrompt) {
+      rl.prompt()
+    }
 
     try {
       for await (const raw of rl) {
+        if (this.exited) {
+          rl.close()
+          return
+        }
         const line = raw.trim()
         if (!line) {
           await this.draw()
-          rl.prompt()
+          if (this.exited) {
+            rl.close()
+            return
+          }
+          if (useInteractivePrompt) {
+            rl.prompt()
+          }
           continue
         }
 
         const result = await this.executeCommand(line)
-        if (result.shouldExit) {
+        if (result.shouldExit || this.exited) {
           rl.close()
           return
         }
         if (!result.skipDraw) {
           await this.draw({ refresh: result.refresh })
+          if (this.exited) {
+            rl.close()
+            return
+          }
         }
-        rl.prompt()
+        if (useInteractivePrompt) {
+          rl.prompt()
+        }
       }
     } finally {
       resizeWatcher.stop()
