@@ -46,6 +46,13 @@ import {
   type LinkHintState,
 } from './link-hints.js'
 import {
+  exportPageViewToFile,
+  formatExportStatusMessage,
+  parseSaveCommandArgs,
+  type PageExportResult,
+  type TuiExportSummary,
+} from './page-export.js'
+import {
   cycleViewMode,
   formatViewModeLabel,
   isPixelViewMode,
@@ -158,6 +165,8 @@ export interface TuiOptions {
   suppressFallbackNotice?: boolean
   /** Initial view mode: layout (default), pixel-ascii, braille, or halfblock. */
   viewMode?: TuiViewMode
+  /** Base working directory for relative `:save <file>` paths (defaults to process.cwd()). */
+  exportDir?: string
 }
 
 export interface TuiSearchMatch {
@@ -206,6 +215,7 @@ export interface TuiState {
   ttyCapabilities: TuiTtyCapabilities
   viewMode: TuiViewMode
   pixelPreviewSource: PixelPreviewSource | null
+  lastExport: TuiExportSummary | null
   exited: boolean
 }
 
@@ -256,6 +266,8 @@ export class TerminalBrowserController {
   private viewMode: TuiViewMode
   private pixelPreviewSource: PixelPreviewSource | null = null
   private cachedScreenshot: { tabId: number; epoch: number; png: Buffer | null } | null = null
+  private readonly exportDir: string
+  private lastExport: TuiExportSummary | null = null
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -284,6 +296,7 @@ export class TerminalBrowserController {
     this.splitPane = Boolean(opts.splitPane)
     this.inspectorTab = opts.inspectorTab ?? 'console'
     this.viewMode = opts.viewMode ?? 'layout'
+    this.exportDir = opts.exportDir ?? process.cwd()
     const defaultLibraryPath = manager.profileDir ? path.join(manager.profileDir, 'tui-library.json') : null
     const libraryPath = opts.libraryPath === undefined ? defaultLibraryPath : opts.libraryPath
     this.library = new BookmarkHistoryStore({
@@ -354,6 +367,7 @@ export class TerminalBrowserController {
       ttyCapabilities: { ...this.ttyCapabilities },
       viewMode: this.viewMode,
       pixelPreviewSource: this.pixelPreviewSource,
+      lastExport: this.lastExport ? { ...this.lastExport } : null,
       exited: this.exited,
     }
   }
@@ -1876,6 +1890,73 @@ export class TerminalBrowserController {
     this.statusMessage = `Match ${this.searchMatchIndex + 1}/${len} for "${this.searchQuery}": [${match.ref}] ${match.text}`
   }
 
+  async saveCurrentPage(rawArgs: string): Promise<PageExportResult | null> {
+    const parsed = parseSaveCommandArgs(rawArgs)
+    if (!parsed.ok || !parsed.filePath) {
+      this.statusMessage = parsed.error ?? 'Usage: :save <file.{txt|md|json}>'
+      return null
+    }
+
+    if (!this.lastSnapshot) {
+      const dims = this.resolveDimensions()
+      const res = await this.manager.renderAscii(undefined, {
+        width: dims.width,
+        height: dims.height,
+        asciiOnly: this.asciiOnly,
+        color: false,
+        scrollOffset: this.scrollOffset,
+      })
+      if (res.ok && res.snapshot) {
+        this.syncSnapshotRefs(res.snapshot)
+      }
+    }
+
+    if (!this.lastSnapshot) {
+      this.statusMessage = 'Nothing to save: no active page snapshot'
+      return null
+    }
+
+    const pngBuffer = isPixelViewMode(this.viewMode)
+      ? await this.captureCachedScreenshot(false)
+      : null
+    const dims = this.resolveDimensions()
+    const tabs = this.manager.listTabs()
+    const activeTab = tabs.find((t) => t.active)
+
+    const result = exportPageViewToFile({
+      snapshot: this.lastSnapshot,
+      rawFilePath: parsed.filePath,
+      explicitFormat: parsed.format,
+      cwd: this.exportDir,
+      viewMode: this.viewMode,
+      pngBuffer,
+      width: parsed.width ?? dims.width,
+      height: dims.height,
+      scrollOffset: this.scrollOffset,
+      asciiOnly: parsed.forceAscii || this.asciiOnly,
+      tabs,
+      activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
+      frontmatter: parsed.frontmatter,
+      showRefs: parsed.showRefs,
+      viewportOnly: parsed.viewportOnly,
+      preserveAnsi: parsed.preserveAnsi,
+      compact: parsed.compact,
+    })
+
+    if (result.ok) {
+      this.lastExport = {
+        format: result.format,
+        filePath: result.filePath,
+        bytes: result.bytes,
+        lines: result.lines,
+        viewMode: result.viewMode,
+        exportedAt: result.exportedAt,
+      }
+    }
+    this.statusMessage = formatExportStatusMessage(result)
+    return result
+  }
+
   async executeCommand(rawLine: string): Promise<{ shouldExit: boolean; skipDraw?: boolean; refresh?: boolean }> {
     const line = rawLine.trim()
     if (!line) {
@@ -2113,12 +2194,15 @@ export class TerminalBrowserController {
             refresh = activated.refresh
           }
         }
+      } else if (cmd === 'save' || cmd === 'export') {
+        const rawArgs = line.slice((cmdRaw ?? '').length).trim()
+        await this.saveCurrentPage(rawArgs)
       } else if (cmd === 'reflow' || cmd === 'redraw' || cmd === 'resize') {
         await this.handleResize({ source: 'manual', force: true })
         return { shouldExit: false, skipDraw: true }
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
-          'Keys: j/k g/G v/V 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | view | bookmarks | history | newtab | close | tabs | palette | split | quit'
+          'Keys: j/k g/G v/V 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | save <file.{txt|md|json}> | view | bookmarks | history | newtab | close | tabs | palette | split | quit'
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`

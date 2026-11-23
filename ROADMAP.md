@@ -61,7 +61,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M50: Terminal resize (`SIGWINCH`) live reflow handler so TUI adapts smoothly inside tmux/screen panes
 - [x] M51: Non-TTY / piped fallback detection so TUI never corrupts output when stdin/stdout is redirected
 - [x] M52: Live pixel-preview toggle (`v` cycles Layout ASCII -> Pixel ASCII -> Braille -> Halfblock)
-- [ ] M53: Export current page view to `.txt`, `.md`, or `.json` directly from TUI (`:save <file>`)
+- [x] M53: Export current page view to `.txt`, `.md`, or `.json` directly from TUI (`:save <file>`)
 - [ ] M54: Built-in TUI help overlay (`?`) listing all keybindings in an ASCII modal box
 - [ ] M55: Headless PTY / simulated stream unit tests covering every TUI interaction
 
