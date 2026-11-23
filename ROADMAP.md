@@ -51,7 +51,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M42: Comprehensive Lite engine fuzz & malformed-HTML resilience test suite
 
 ## Track 4: Interactive Terminal Browser TUI (Milestones 43–55)
-- [ ] M43: Raw-mode keypress navigation in `terminal-browser.ts` (single-key `j/k` scroll, `g/G` top/bottom, `/` search, `:` command bar, `Tab` focus next ref, `Enter` activate focused ref)
+- [x] M43: Raw-mode keypress navigation in `terminal-browser.ts` (single-key `j/k` scroll, `g/G` top/bottom, `/` search, `:` command bar, `Tab` focus next ref, `Enter` activate focused ref)
 - [ ] M44: Highlighted active element focus cursor in ASCII/ANSI TUI with live ref tooltip in status bar
 - [ ] M45: Split-pane TUI mode: left pane ASCII page viewport, right pane live Console / Network / Refs / Agent Activity inspector
 - [ ] M46: Inline form-filling modal prompt in TUI when pressing `Enter` on an `<input>` or `<select>` ref

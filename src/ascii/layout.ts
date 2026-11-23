@@ -1368,7 +1368,22 @@ export function cropPageSnapshot(snapshot: PageSnapshot, crop: Rect): PageSnapsh
   }
 }
 
+export interface AsciiRenderMetrics {
+  ascii: string
+  totalLines: number
+  viewportRows: number
+  scrollOffset: number
+  maxScrollOffset: number
+}
+
 export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
+  return renderPageAsciiWithMetrics(rawSnapshot, options).ascii
+}
+
+export function renderPageAsciiWithMetrics(
+  rawSnapshot: PageSnapshot,
+  options: AsciiRenderOptions = {},
+): AsciiRenderMetrics {
   const activeCrop = options.crop && options.crop.width > 0 && options.crop.height > 0 ? options.crop : undefined
   const snapshot = activeCrop ? cropPageSnapshot(rawSnapshot, activeCrop) : rawSnapshot
   const profile = resolveDensityProfile(options.density)
@@ -1567,7 +1582,14 @@ export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderO
     output.push(botBorder)
   }
 
-  return asciiOnly ? output.map((line) => sanitizeAscii(line)).join('\n') : output.join('\n')
+  const ascii = asciiOnly ? output.map((line) => sanitizeAscii(line)).join('\n') : output.join('\n')
+  return {
+    ascii,
+    totalLines: bodyLines.length,
+    viewportRows,
+    scrollOffset: start,
+    maxScrollOffset: maxOffset,
+  }
 }
 
 export function renderCompactRefsAscii(snapshot: PageSnapshot, limit = 60): string {

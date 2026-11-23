@@ -59,6 +59,7 @@ import {
   renderDeltaAscii,
   renderMediaSummaryAscii,
   renderPageAscii,
+  renderPageAsciiWithMetrics,
 } from '../ascii/layout.js'
 import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
@@ -503,6 +504,12 @@ export class BrowserManager {
     crop?: Rect
     cropRef?: string
     mode?: 'full' | 'delta'
+    scroll?: {
+      offset: number
+      maxOffset: number
+      totalLines: number
+      viewportRows: number
+    }
     error?: string
   }> {
     const session = this.resolveSession(tabId)
@@ -526,7 +533,7 @@ export class BrowserManager {
       return { ok: true, mode: 'delta', ascii, snapshot: snap, delta, ...(settleRes ? { settle: settleRes } : {}) }
     }
     const { crop: _rawCrop, ref: _rawRef, since: _since, settle: _settle, ...renderOpts } = opts
-    const ascii = renderPageAscii(snap, {
+    const rendered = renderPageAsciiWithMetrics(snap, {
       ...renderOpts,
       crop: cropRes.crop,
       cropLabel: cropRes.cropRef ?? opts.cropLabel,
@@ -536,8 +543,14 @@ export class BrowserManager {
     return {
       ok: true,
       mode: 'full',
-      ascii,
+      ascii: rendered.ascii,
       snapshot: snap,
+      scroll: {
+        offset: rendered.scrollOffset,
+        maxOffset: rendered.maxScrollOffset,
+        totalLines: rendered.totalLines,
+        viewportRows: rendered.viewportRows,
+      },
       ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
       ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
