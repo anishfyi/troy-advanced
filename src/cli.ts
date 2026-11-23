@@ -362,6 +362,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         showMediaSummary: Boolean(flags.media),
         since: Boolean(flags.since),
+        settle: Boolean(flags.settle),
         asciiOnly: true,
       })
       break
@@ -376,6 +377,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         includeUrls: !flags['no-urls'],
         crop: typeof flags.crop === 'string' ? flags.crop : undefined,
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+        settle: Boolean(flags.settle),
       })
       break
     case 'visual':
@@ -405,6 +407,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           crop: typeof flags.crop === 'string' ? flags.crop : undefined,
           ref: typeof flags.ref === 'string' ? flags.ref : undefined,
           showMediaSummary: Boolean(flags.media),
+          settle: Boolean(flags.settle),
         },
       })
       break
@@ -460,6 +463,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           ...(typeof flags.selector === 'string' ? { selector: flags.selector } : {}),
           ...(typeof flags.url === 'string' ? { url: flags.url } : {}),
           ...(typeof flags.state === 'string' ? { state: flags.state } : {}),
+          ...(flags.settle ? { settle: true } : {}),
+          ...(flags['network-idle-ms'] !== undefined ? { networkIdleMs: Number(flags['network-idle-ms']) } : {}),
+          ...(flags['dom-quiet-ms'] !== undefined ? { domQuietMs: Number(flags['dom-quiet-ms']) } : {}),
           ...(flags.timeout !== undefined ? { timeout: Number(flags.timeout) } : {}),
         },
       })

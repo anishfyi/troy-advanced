@@ -89,6 +89,7 @@ export async function createAgentSocket(
           crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           since: Boolean(body.since),
+          settle: body.settle as boolean | Record<string, unknown> | undefined,
         })
         return {
           status: 200,
@@ -100,6 +101,7 @@ export async function createAgentSocket(
                 url: res.snapshot?.url,
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
+                ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),
                 ...(res.delta ? { delta: res.delta } : {}),
@@ -126,6 +128,7 @@ export async function createAgentSocket(
                 : undefined,
           crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
           ref: typeof body.ref === 'string' ? body.ref : undefined,
+          settle: body.settle as boolean | Record<string, unknown> | undefined,
         })
         return {
           status: 200,
@@ -136,6 +139,7 @@ export async function createAgentSocket(
                 url: res.snapshot?.url,
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
+                ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),
               }

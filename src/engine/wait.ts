@@ -62,6 +62,9 @@ export function describeWaitCondition(opts: WaitConditionOptions): string {
   if (opts.url) {
     parts.push(`url "${opts.url}"`)
   }
+  if (opts.settle) {
+    parts.push('page settle')
+  }
   return parts.length > 0 ? parts.join(' and ') : 'condition'
 }
 

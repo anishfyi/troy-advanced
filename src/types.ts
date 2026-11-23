@@ -201,12 +201,48 @@ export type PolicyDecision =
 
 export type WaitState = 'visible' | 'hidden' | 'attached'
 
+export interface SettleOptions {
+  /** Maximum total time to wait for page settle in ms (default: 3000, max: 30000). */
+  timeoutMs?: number
+  /** Network quiet window with <= maxInflightRequests in ms (default: 250). */
+  networkIdleMs?: number
+  /** DOM mutation quiet window in ms (default: 200). */
+  domQuietMs?: number
+  /** Maximum inflight network requests still considered idle (default: 0). */
+  maxInflightRequests?: number
+  /** Wait for network idle (default: true). */
+  waitForNetworkIdle?: boolean
+  /** Wait for DOM mutations to settle (default: true). */
+  waitForDomQuiet?: boolean
+  /** Requests older than this threshold are ignored as stale/long-poll in ms (default: 5000). */
+  staleRequestMs?: number
+  /** Polling interval in ms (default: 40). */
+  pollIntervalMs?: number
+}
+
+export interface SettleResult {
+  ok: boolean
+  settled: boolean
+  timedOut: boolean
+  waitedMs: number
+  networkIdle: boolean
+  domQuiet: boolean
+  inflightCount: number
+  mutationCount: number
+  reason: 'settled' | 'timeout' | 'skipped' | 'error'
+  error?: string
+}
+
 export interface WaitConditionOptions {
   ms?: number
   text?: string
   selector?: string
   url?: string
   state?: WaitState
+  settle?: boolean
+  networkIdleMs?: number
+  domQuietMs?: number
+  maxInflightRequests?: number
   timeout?: number
   pollIntervalMs?: number
 }
@@ -221,7 +257,9 @@ export interface WaitResult {
     url?: boolean
     state?: WaitState
     currentUrl?: string
+    settled?: boolean
   }
+  settle?: SettleResult
   error?: string
 }
 
@@ -238,6 +276,9 @@ export interface ActStep {
   selector?: string
   url?: string
   state?: WaitState
+  settle?: boolean
+  networkIdleMs?: number
+  domQuietMs?: number
   timeout?: number
   allowSubmit?: boolean
 }

@@ -9,12 +9,15 @@ import type {
   InlineLink,
   NetworkEntry,
   PageSnapshot,
+  SettleOptions,
+  SettleResult,
   WaitConditionOptions,
   WaitResult,
   WaitState,
 } from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
+import { waitForPageSettle } from './settle.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import {
   checkLiteSelectorState,
@@ -779,20 +782,60 @@ class LiteTab implements TabDriver {
     return { scrollX: 0, scrollY: this.scrollY }
   }
 
+  async waitForSettle(options: SettleOptions = {}): Promise<SettleResult> {
+    return waitForPageSettle(
+      {
+        checkNetwork: () => ({
+          idle: !this.loading,
+          inflightCount: this.loading ? 1 : 0,
+        }),
+        checkDom: () => ({
+          quiet: !this.loading,
+          mutationCount: 0,
+          quietForMs: this.loading ? 0 : options.domQuietMs ?? 200,
+          readyState: this.loading ? 'loading' : 'complete',
+        }),
+      },
+      options,
+    )
+  }
+
   async waitFor(options: WaitConditionOptions): Promise<WaitResult> {
     const hasCondition = Boolean(options.text || options.selector || options.url)
-    if (!hasCondition) {
+    const wantSettle = Boolean(options.settle)
+
+    if (!hasCondition && !wantSettle) {
       const ms = Math.max(0, Math.min(30000, Number(options.ms ?? 300)))
       await new Promise((r) => setTimeout(r, ms))
       return { ok: true, waitedMs: ms }
     }
 
-    const state: WaitState = options.state ?? 'visible'
     const timeoutMs = options.timeout !== undefined ? Number(options.timeout) : 5000
     const pollIntervalMs = options.pollIntervalMs !== undefined ? Number(options.pollIntervalMs) : 50
-    const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
 
-    return pollUntil(
+    if (!hasCondition && wantSettle) {
+      const settle = await this.waitForSettle({
+        timeoutMs,
+        networkIdleMs: options.networkIdleMs,
+        domQuietMs: options.domQuietMs,
+        maxInflightRequests: options.maxInflightRequests,
+        pollIntervalMs,
+      })
+      return {
+        ok: settle.ok,
+        waitedMs: settle.waitedMs,
+        timedOut: settle.timedOut || undefined,
+        matched: { settled: settle.settled, currentUrl: this.url },
+        settle,
+        ...(settle.error ? { error: settle.error } : {}),
+      }
+    }
+
+    const state: WaitState = options.state ?? 'visible'
+    const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
+    const startedAt = Date.now()
+
+    const condRes = await pollUntil(
       () => {
         const urlOk = options.url ? matchesUrlPattern(this.url, options.url) : true
         const pageText = `${this.doc.text}\n${this.title}\n${extractLitePageText(this.rawHtml)}`
@@ -816,6 +859,27 @@ class LiteTab implements TabDriver {
       },
       { timeoutMs, pollIntervalMs, description },
     )
+
+    if (!condRes.ok || !wantSettle) {
+      return condRes
+    }
+
+    const remainingTimeout = Math.max(0, timeoutMs - (Date.now() - startedAt))
+    const settle = await this.waitForSettle({
+      timeoutMs: remainingTimeout,
+      networkIdleMs: options.networkIdleMs,
+      domQuietMs: options.domQuietMs,
+      maxInflightRequests: options.maxInflightRequests,
+      pollIntervalMs,
+    })
+    return {
+      ok: settle.ok,
+      waitedMs: Date.now() - startedAt,
+      timedOut: settle.timedOut || undefined,
+      matched: { ...condRes.matched, settled: settle.settled },
+      settle,
+      ...(settle.error ? { error: settle.error } : {}),
+    }
   }
 
   async evaluate(_expression: string): Promise<unknown> {

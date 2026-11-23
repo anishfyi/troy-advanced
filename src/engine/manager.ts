@@ -12,6 +12,8 @@ import type {
   PageSnapshot,
   PixelAsciiOptions,
   Rect,
+  SettleOptions,
+  SettleResult,
   TabSummary,
   TrackerBlockingOptions,
 } from '../types.js'
@@ -303,14 +305,58 @@ export class BrowserManager {
     return {}
   }
 
+  private extractSettleOptions(args: Record<string, unknown>): SettleOptions | undefined {
+    const raw = args.settle
+    if (!raw) return undefined
+    const base: SettleOptions = typeof raw === 'object' && raw !== null ? { ...(raw as SettleOptions) } : {}
+    if (typeof args.settleTimeout === 'number' && Number.isFinite(args.settleTimeout)) {
+      base.timeoutMs = args.settleTimeout
+    }
+    if (typeof args.networkIdleMs === 'number' && Number.isFinite(args.networkIdleMs)) {
+      base.networkIdleMs = args.networkIdleMs
+    }
+    if (typeof args.domQuietMs === 'number' && Number.isFinite(args.domQuietMs)) {
+      base.domQuietMs = args.domQuietMs
+    }
+    if (typeof args.maxInflightRequests === 'number' && Number.isFinite(args.maxInflightRequests)) {
+      base.maxInflightRequests = args.maxInflightRequests
+    }
+    return base
+  }
+
+  async waitForSettle(tabId?: number, opts: SettleOptions = {}): Promise<SettleResult> {
+    const session = this.resolveSession(tabId)
+    if (!session) {
+      return {
+        ok: false,
+        settled: false,
+        timedOut: false,
+        waitedMs: 0,
+        networkIdle: false,
+        domQuiet: false,
+        inflightCount: 0,
+        mutationCount: 0,
+        reason: 'error',
+        error: 'no open tab',
+      }
+    }
+    return session.driver.waitForSettle(opts)
+  }
+
   async renderAscii(
     tabId?: number,
-    opts: Omit<AsciiRenderOptions, 'crop'> & { since?: boolean; crop?: Rect | string; ref?: string } = {},
+    opts: Omit<AsciiRenderOptions, 'crop'> & {
+      since?: boolean
+      crop?: Rect | string
+      ref?: string
+      settle?: boolean | SettleOptions
+    } = {},
   ): Promise<{
     ok: boolean
     ascii?: string
     snapshot?: PageSnapshot
     delta?: PageDelta
+    settle?: SettleResult
     crop?: Rect
     cropRef?: string
     mode?: 'full' | 'delta'
@@ -318,6 +364,8 @@ export class BrowserManager {
   }> {
     const session = this.resolveSession(tabId)
     if (!session) return { ok: false, error: 'no open tab' }
+    const settleOpts = this.extractSettleOptions(opts as Record<string, unknown>)
+    const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
     const cropRes = this.resolveCropArgs(session, { crop: opts.crop, ref: opts.ref })
     if ('error' in cropRes) return { ok: false, error: cropRes.error }
     const prev = session.lastSnapshot
@@ -332,9 +380,9 @@ export class BrowserManager {
         showChrome: opts.showChrome,
         density: opts.density,
       })
-      return { ok: true, mode: 'delta', ascii, snapshot: snap, delta }
+      return { ok: true, mode: 'delta', ascii, snapshot: snap, delta, ...(settleRes ? { settle: settleRes } : {}) }
     }
-    const { crop: _rawCrop, ref: _rawRef, since: _since, ...renderOpts } = opts
+    const { crop: _rawCrop, ref: _rawRef, since: _since, settle: _settle, ...renderOpts } = opts
     const ascii = renderPageAscii(snap, {
       ...renderOpts,
       crop: cropRes.crop,
@@ -347,6 +395,7 @@ export class BrowserManager {
       mode: 'full',
       ascii,
       snapshot: snap,
+      ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
       ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
     }
@@ -354,22 +403,29 @@ export class BrowserManager {
 
   async renderMarkdown(
     tabId?: number,
-    opts: Omit<MarkdownRenderOptions, 'crop'> & { crop?: Rect | string; ref?: string } = {},
+    opts: Omit<MarkdownRenderOptions, 'crop'> & {
+      crop?: Rect | string
+      ref?: string
+      settle?: boolean | SettleOptions
+    } = {},
   ): Promise<{
     ok: boolean
     markdown?: string
     snapshot?: PageSnapshot
+    settle?: SettleResult
     crop?: Rect
     cropRef?: string
     error?: string
   }> {
     const session = this.resolveSession(tabId)
     if (!session) return { ok: false, error: 'no open tab' }
+    const settleOpts = this.extractSettleOptions(opts as Record<string, unknown>)
+    const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
     const cropRes = this.resolveCropArgs(session, { crop: opts.crop, ref: opts.ref })
     if ('error' in cropRes) return { ok: false, error: cropRes.error }
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
-    const { crop: _rawCrop, ref: _rawRef, ...renderOpts } = opts
+    const { crop: _rawCrop, ref: _rawRef, settle: _settle, ...renderOpts } = opts
     const markdown = renderPageMarkdown(snap, {
       ...renderOpts,
       crop: cropRes.crop,
@@ -379,6 +435,7 @@ export class BrowserManager {
       ok: true,
       markdown,
       snapshot: snap,
+      ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
       ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
     }
@@ -394,6 +451,9 @@ export class BrowserManager {
       case 'page_read':
       case 'page_read_visual':
       case 'page_read_ascii': {
+        const settleOpts = this.extractSettleOptions(args)
+        const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
+
         const cropRes = this.resolveCropArgs(session, { crop: args.crop, ref: args.ref })
         if ('error' in cropRes) return { ok: false, error: cropRes.error }
 
@@ -415,6 +475,7 @@ export class BrowserManager {
             mode: 'delta',
             ...delta,
             ascii,
+            ...(settleRes ? { settle: settleRes } : {}),
             ...(name === 'page_read_ascii' ? { content: ascii } : {}),
           })
         }
@@ -474,6 +535,7 @@ export class BrowserManager {
           compactRefs: renderCompactRefsAscii(snap),
           ...(media.length > 0 ? { media, mediaSummaryAscii } : {}),
           ...(pixelAscii ? { pixelAscii } : {}),
+          ...(settleRes ? { settle: settleRes } : {}),
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
           ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
           content: name === 'page_read_ascii' ? ascii : snap.text,
@@ -481,6 +543,8 @@ export class BrowserManager {
       }
 
       case 'page_read_markdown': {
+        const settleOpts = this.extractSettleOptions(args)
+        const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
         const cropRes = this.resolveCropArgs(session, { crop: args.crop, ref: args.ref })
         if ('error' in cropRes) return { ok: false, error: cropRes.error }
         const snap = await this.takeIndexedSnapshot(session)
@@ -515,6 +579,7 @@ export class BrowserManager {
           elementCount: snap.elements.length,
           markdown,
           content: markdown,
+          ...(settleRes ? { settle: settleRes } : {}),
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
           ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
         })
@@ -674,13 +739,14 @@ export class BrowserManager {
         const text = typeof args.text === 'string' && args.text.length > 0 ? args.text : undefined
         const selector = typeof args.selector === 'string' && args.selector.length > 0 ? args.selector : undefined
         const url = typeof args.url === 'string' && args.url.length > 0 ? args.url : undefined
+        const settle = Boolean(args.settle)
         const state = stateParsed
 
         if (state && !selector) {
           return { ok: false, error: 'wait state requires a selector' }
         }
 
-        const hasCondition = Boolean(text || selector || url)
+        const hasCondition = Boolean(text || selector || url || settle)
         if (!hasCondition) {
           const ms = Math.max(0, Math.min(30000, Number(args.ms ?? 300)))
           await new Promise((r) => setTimeout(r, ms))
@@ -695,6 +761,18 @@ export class BrowserManager {
           args.pollIntervalMs !== undefined && Number.isFinite(Number(args.pollIntervalMs))
             ? Math.max(10, Math.min(1000, Number(args.pollIntervalMs)))
             : 50
+        const networkIdleMs =
+          args.networkIdleMs !== undefined && Number.isFinite(Number(args.networkIdleMs))
+            ? Number(args.networkIdleMs)
+            : undefined
+        const domQuietMs =
+          args.domQuietMs !== undefined && Number.isFinite(Number(args.domQuietMs))
+            ? Number(args.domQuietMs)
+            : undefined
+        const maxInflightRequests =
+          args.maxInflightRequests !== undefined && Number.isFinite(Number(args.maxInflightRequests))
+            ? Number(args.maxInflightRequests)
+            : undefined
 
         const prevUrl = session.driver.getUrl()
         const result = await session.driver.waitFor({
@@ -702,6 +780,10 @@ export class BrowserManager {
           selector,
           url,
           state: state ?? (selector ? 'visible' : undefined),
+          settle: settle || undefined,
+          networkIdleMs,
+          domQuietMs,
+          maxInflightRequests,
           timeout,
           pollIntervalMs,
         })

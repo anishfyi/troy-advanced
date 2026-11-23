@@ -255,6 +255,11 @@ export async function executePipeCommand(
         else if (tok.startsWith('--state=')) waitArgs.state = tok.slice('--state='.length)
         else if (tok === '--timeout' && tokens[i + 1] !== undefined) waitArgs.timeout = Number(tokens[++i])
         else if (tok.startsWith('--timeout=')) waitArgs.timeout = Number(tok.slice('--timeout='.length))
+        else if (tok === '--settle') waitArgs.settle = true
+        else if (tok === '--network-idle-ms' && tokens[i + 1] !== undefined) waitArgs.networkIdleMs = Number(tokens[++i])
+        else if (tok.startsWith('--network-idle-ms=')) waitArgs.networkIdleMs = Number(tok.slice('--network-idle-ms='.length))
+        else if (tok === '--dom-quiet-ms' && tokens[i + 1] !== undefined) waitArgs.domQuietMs = Number(tokens[++i])
+        else if (tok.startsWith('--dom-quiet-ms=')) waitArgs.domQuietMs = Number(tok.slice('--dom-quiet-ms='.length))
         else if (tok === '--ms' && tokens[i + 1] !== undefined) waitArgs.ms = Number(tokens[++i])
         else if (tok.startsWith('--ms=')) waitArgs.ms = Number(tok.slice('--ms='.length))
         else if (/^\d+$/.test(tok) && waitArgs.ms === undefined) waitArgs.ms = Number(tok)

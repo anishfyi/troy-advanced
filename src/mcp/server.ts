@@ -102,7 +102,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'troy_wait',
-    description: 'Wait for a page condition (text, CSS selector with state visible|hidden|attached, or URL pattern) or a fixed delay in milliseconds.',
+    description: 'Wait for a page condition (text, CSS selector with state visible|hidden|attached, URL pattern, or network+DOM settle) or a fixed delay in milliseconds.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -112,6 +112,9 @@ const MCP_TOOLS = [
         selector: { type: 'string', description: 'Wait until CSS selector matches the target state' },
         url: { type: 'string', description: 'Wait until tab URL matches this substring, glob (*), or /regex/' },
         state: { type: 'string', enum: ['visible', 'hidden', 'attached'], description: 'Target state for selector (default visible)' },
+        settle: { type: 'boolean', description: 'Wait for network idle and DOM mutations to settle (SPA hydration)' },
+        networkIdleMs: { type: 'number', description: 'Network quiet window in ms for settle (default 250)' },
+        domQuietMs: { type: 'number', description: 'DOM mutation quiet window in ms for settle (default 200)' },
         timeout: { type: 'number', description: 'Maximum wait time in milliseconds (default 5000)' },
       },
     },
@@ -199,6 +202,7 @@ export async function handleMcpRequest(
           ref: args.ref,
           showMediaSummary: args.showMediaSummary,
           since: args.since,
+          settle: args.settle,
           asciiOnly: true,
         })
         break
@@ -211,6 +215,7 @@ export async function handleMcpRequest(
           asciiOnly: args.asciiOnly,
           crop: args.crop,
           ref: args.ref,
+          settle: args.settle,
         })
         break
       case 'troy_screenshot_ascii':
@@ -241,6 +246,9 @@ export async function handleMcpRequest(
           selector: args.selector,
           url: args.url,
           state: args.state,
+          settle: args.settle,
+          networkIdleMs: args.networkIdleMs,
+          domQuietMs: args.domQuietMs,
           timeout: args.timeout,
         })
         break

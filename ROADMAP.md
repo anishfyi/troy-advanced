@@ -22,7 +22,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 ## Track 2: Chromium CDP Engine Depth (Milestones 16–30)
 - [x] M16: Automatic CDP tracker & ad-beacon request interception (`Fetch.enable` / `Network.setBlockedURLs`) matching `omnibox.ts` tracker list
 - [x] M17: Real `page_wait` conditions in Chromium & Lite: wait for `--text`, `--selector`, `--url`, `--state visible|hidden|attached`, and `--timeout`
-- [ ] M18: Network idle + DOM mutation settle detector (`waitForPageSettle`) so SPAs finish hydrating before snapshots
+- [x] M18: Network idle + DOM mutation settle detector (`waitForPageSettle`) so SPAs finish hydrating before snapshots
 - [ ] M19: Full keyboard chord support (`Control+A`, `Shift+Tab`, `Escape`, `ArrowDown`, `Meta+K`) with proper CDP modifier bitmasks and Windows virtual key codes
 - [ ] M20: Shadow DOM deep selector traversal in `click`, `fill`, `select`, `hover`, and `press` (not just `document.querySelector`)
 - [ ] M21: Cross-frame `<iframe>` discovery and snapshot flattening so embedded forms and widgets get real `eN` refs

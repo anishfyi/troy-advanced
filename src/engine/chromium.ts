@@ -13,12 +13,15 @@ import type {
   ElementDescriptor,
   NetworkEntry,
   PageSnapshot,
+  SettleOptions,
+  SettleResult,
   TrackerBlockingOptions,
   WaitConditionOptions,
   WaitResult,
   WaitState,
 } from '../types.js'
 import { CdpClient } from './cdp-client.js'
+import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import { describeWaitCondition, matchesText, matchesUrlPattern, pollUntil } from './wait.js'
@@ -446,6 +449,7 @@ class ChromiumTab implements TabDriver {
   private networkLogs: NetworkEntry[] = []
   private reqStart = new Map<string, { url: string; method: string; ts: number }>()
   private blockedByFetch = new Map<string, string>()
+  private networkIdle = new NetworkIdleTracker()
   private trackerBlocker: CdpTrackerBlocker
 
   constructor(
@@ -474,6 +478,7 @@ class ChromiumTab implements TabDriver {
       if (frame && !frame.parentId && frame.url) {
         this.url = frame.url
         this.epoch += 1
+        this.networkIdle.onNavigationReset()
       }
     })
     this.cdp.on('Page.loadEventFired', () => {
@@ -495,6 +500,19 @@ class ChromiumTab implements TabDriver {
       const req = params.request as { url?: string; method?: string } | undefined
       if (idStr && req?.url) {
         this.reqStart.set(idStr, { url: req.url, method: req.method ?? 'GET', ts: Date.now() })
+        this.networkIdle.onRequestStart(idStr, req.url, params.type ? String(params.type) : undefined)
+      }
+    })
+    this.cdp.on('Network.loadingFinished', (params) => {
+      const idStr = String(params.requestId ?? '')
+      if (idStr) {
+        this.networkIdle.onRequestFinish(idStr)
+      }
+    })
+    this.cdp.on('Network.requestServedFromCache', (params) => {
+      const idStr = String(params.requestId ?? '')
+      if (idStr) {
+        this.networkIdle.onRequestFinish(idStr)
       }
     })
     this.cdp.on('Network.responseReceived', (params) => {
@@ -516,6 +534,9 @@ class ChromiumTab implements TabDriver {
     })
     this.cdp.on('Network.loadingFailed', (params) => {
       const idStr = String(params.requestId ?? '')
+      if (idStr) {
+        this.networkIdle.onRequestFinish(idStr)
+      }
       const started = this.reqStart.get(idStr)
       this.reqStart.delete(idStr)
       const url = started?.url ?? ''
@@ -616,8 +637,8 @@ class ChromiumTab implements TabDriver {
       throw new Error(`Navigation failed: ${nav.errorText}`)
     }
     await loadPromise
-    // Small settle delay for initial SPA render
-    await new Promise((r) => setTimeout(r, 150))
+    // Wait for initial SPA hydration (network idle + DOM mutation settle)
+    await this.waitForSettle({ timeoutMs: 1500, networkIdleMs: 200, domQuietMs: 150 })
     const meta = await this.evalJson<{ url: string; title: string }>('({ url: location.href, title: document.title || "" })')
     this.url = meta?.url || url
     this.title = meta?.title || this.url
@@ -774,20 +795,71 @@ class ChromiumTab implements TabDriver {
     )
   }
 
+  async waitForSettle(options: SettleOptions = {}): Promise<SettleResult> {
+    return waitForPageSettle(
+      {
+        checkNetwork: (now, opts) => {
+          const status = this.networkIdle.getStatus({
+            quietMs: opts.networkIdleMs,
+            maxInflight: opts.maxInflightRequests,
+            staleRequestMs: opts.staleRequestMs,
+            now,
+          })
+          return { idle: status.idle, inflightCount: status.inflightCount }
+        },
+        checkDom: async (_now, opts) => {
+          const dom = await this.evalJson<{ readyState: string; mutationCount: number; quietForMs: number }>(
+            DOM_SETTLE_PROBE_SCRIPT,
+          )
+          const ready = dom.readyState !== 'loading'
+          return {
+            quiet: ready && dom.quietForMs >= opts.domQuietMs,
+            mutationCount: dom.mutationCount,
+            quietForMs: dom.quietForMs,
+            readyState: dom.readyState,
+          }
+        },
+      },
+      options,
+    )
+  }
+
   async waitFor(options: WaitConditionOptions): Promise<WaitResult> {
     const hasCondition = Boolean(options.text || options.selector || options.url)
-    if (!hasCondition) {
+    const wantSettle = Boolean(options.settle)
+
+    if (!hasCondition && !wantSettle) {
       const ms = Math.max(0, Math.min(30000, Number(options.ms ?? 300)))
       await new Promise((r) => setTimeout(r, ms))
       return { ok: true, waitedMs: ms }
     }
 
-    const state: WaitState = options.state ?? 'visible'
     const timeoutMs = options.timeout !== undefined ? Number(options.timeout) : 5000
     const pollIntervalMs = options.pollIntervalMs !== undefined ? Number(options.pollIntervalMs) : 50
-    const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
 
-    return pollUntil(
+    if (!hasCondition && wantSettle) {
+      const settle = await this.waitForSettle({
+        timeoutMs,
+        networkIdleMs: options.networkIdleMs,
+        domQuietMs: options.domQuietMs,
+        maxInflightRequests: options.maxInflightRequests,
+        pollIntervalMs,
+      })
+      return {
+        ok: settle.ok,
+        waitedMs: settle.waitedMs,
+        timedOut: settle.timedOut || undefined,
+        matched: { settled: settle.settled, currentUrl: this.url },
+        settle,
+        ...(settle.error ? { error: settle.error } : {}),
+      }
+    }
+
+    const state: WaitState = options.state ?? 'visible'
+    const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
+    const startedAt = Date.now()
+
+    const condRes = await pollUntil(
       async () => {
         let probe: {
           url: string
@@ -868,6 +940,27 @@ class ChromiumTab implements TabDriver {
       },
       { timeoutMs, pollIntervalMs, description },
     )
+
+    if (!condRes.ok || !wantSettle) {
+      return condRes
+    }
+
+    const remainingTimeout = Math.max(0, timeoutMs - (Date.now() - startedAt))
+    const settle = await this.waitForSettle({
+      timeoutMs: remainingTimeout,
+      networkIdleMs: options.networkIdleMs,
+      domQuietMs: options.domQuietMs,
+      maxInflightRequests: options.maxInflightRequests,
+      pollIntervalMs,
+    })
+    return {
+      ok: settle.ok,
+      waitedMs: Date.now() - startedAt,
+      timedOut: settle.timedOut || undefined,
+      matched: { ...condRes.matched, settled: settle.settled },
+      settle,
+      ...(settle.error ? { error: settle.error } : {}),
+    }
   }
 
   async evaluate(expression: string): Promise<unknown> {
