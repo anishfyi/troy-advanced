@@ -39,6 +39,8 @@ export interface ElementDescriptor {
   checked?: boolean
   href?: string
   formAction?: string
+  formMethod?: string
+  formEnctype?: string
   box?: Rect
   options?: Array<{ value: string; label: string; selected?: boolean }>
   signature?: string

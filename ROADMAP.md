@@ -41,7 +41,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M32: Proper HTML entity decoding table (named HTML5 entities + numeric decimal/hex)
 - [x] M33: Nested `<label><input .../></label>` implicit label association in Lite HTML parser
 - [x] M34: Support `<meta http-equiv="refresh">` and `<base href="...">` resolution in Lite engine
-- [ ] M35: Support `multipart/form-data` and hidden `<input type="hidden">` form fields (CSRF tokens!) in Lite form submissions
+- [x] M35: Support `multipart/form-data` and hidden `<input type="hidden">` form fields (CSRF tokens!) in Lite form submissions
 - [ ] M36: Support `fieldset`/`legend`, `<details>`/`<summary>`, `<dialog>`, and ARIA `role="button"`/`role="link"` in Lite parser
 - [ ] M37: JSON & XML pretty-formatter views in Lite engine with collapsible path navigation
 - [ ] M38: RSS / Atom feed auto-detection and structured ASCII feed reader rendering

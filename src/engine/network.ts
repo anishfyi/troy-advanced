@@ -81,6 +81,7 @@ export function isTextMimeType(mimeType?: string): boolean {
     mt === 'application/x-javascript' ||
     mt === 'application/ecmascript' ||
     mt === 'application/x-www-form-urlencoded' ||
+    mt === 'multipart/form-data' ||
     mt === 'application/graphql' ||
     mt === 'application/graphql+json' ||
     mt === 'application/sql' ||

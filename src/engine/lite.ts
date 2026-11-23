@@ -2,6 +2,7 @@
 // Runs anywhere Node.js runs — even tiny 512MB EC2 t4g.nano instances, Alpine containers,
 // or offline tests without Chromium installed.
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type {
@@ -59,6 +60,15 @@ import {
 } from './downloads.js'
 import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import { flattenFrameSnapshots, prefixFrameSelector, type ChildFrameSnapshotInput } from './frames.js'
+import {
+  encodeMultipartFormData,
+  encodeTextPlainFormData,
+  encodeUrlEncodedFormData,
+  guessMimeTypeFromFilename,
+  normalizeFormEnctype,
+  type FormDataEntry,
+  type FormEnctype,
+} from './form-encoding.js'
 import { decodeHtmlEntities } from './html-entities.js'
 import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
@@ -286,6 +296,26 @@ export function extractMetaRefresh(html: string, baseUrl: string): MetaRefreshDi
   return undefined
 }
 
+export interface LiteHiddenField {
+  name: string
+  value: string
+  disabled?: boolean
+}
+
+export type LiteFormFieldRef =
+  | { kind: 'element'; selector: string }
+  | { kind: 'hidden'; name: string; value: string; disabled?: boolean }
+
+export interface LiteFormMeta {
+  action: string
+  method: string
+  enctype: FormEnctype
+  fieldSelectors: string[]
+  hiddenFields: LiteHiddenField[]
+  fieldOrder?: LiteFormFieldRef[]
+  title?: string
+}
+
 export interface ParsedDoc {
   title: string
   baseUrl?: string
@@ -294,7 +324,7 @@ export interface ParsedDoc {
   elements: ElementDescriptor[]
   frames?: FrameSummary[]
   text: string
-  forms: Map<string, { action: string; method: string; fieldSelectors: string[] }>
+  forms: Map<string, LiteFormMeta>
 }
 
 export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc {
@@ -351,10 +381,57 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
 
   const blocks: ContentBlock[] = []
   const elements: ElementDescriptor[] = []
-  const forms = new Map<string, { action: string; method: string; fieldSelectors: string[]; title?: string }>()
+  const forms = new Map<string, LiteFormMeta>()
+  const formIdsByHtmlId = new Map<string, string>()
   const usedSelectors = new Set<string>()
   let elIndex = 0
   let currentFormId = ''
+
+  const resolveTargetFormId = (formAttr?: string): string => {
+    const trimmed = formAttr?.trim()
+    if (trimmed) {
+      return formIdsByHtmlId.get(trimmed) ?? ''
+    }
+    return currentFormId
+  }
+
+  const recordFormElement = (targetFormId: string, selector: string): void => {
+    if (!targetFormId) return
+    const formMeta = forms.get(targetFormId)
+    if (!formMeta) return
+    formMeta.fieldSelectors.push(selector)
+    formMeta.fieldOrder?.push({ kind: 'element', selector })
+  }
+
+  const recordHiddenInput = (targetFormId: string, attrs: Record<string, string>): void => {
+    if (!targetFormId) return
+    const formMeta = forms.get(targetFormId)
+    if (!formMeta) return
+    const name = attrs.name
+    if (!name) return
+    const disabled = 'disabled' in attrs ? true : undefined
+    const hidden: LiteHiddenField = {
+      name,
+      value: attrs.value ?? '',
+      ...(disabled ? { disabled } : {}),
+    }
+    formMeta.hiddenFields.push(hidden)
+    formMeta.fieldOrder?.push({ kind: 'hidden', ...hidden })
+  }
+
+  const extractHiddenInputsFromFragment = (fragment: string): void => {
+    if (!/<input\b/i.test(fragment)) return
+    const hiddenInputRe = /<input\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+    let hm: RegExpExecArray | null
+    while ((hm = hiddenInputRe.exec(fragment)) !== null) {
+      const attrs = parseAttrs(hm[1] ?? '')
+      if ((attrs.type || 'text').toLowerCase() !== 'hidden') continue
+      const targetFormId = resolveTargetFormId(attrs.form)
+      if (targetFormId) {
+        recordHiddenInput(targetFormId, attrs)
+      }
+    }
+  }
 
   const claimSelector = (primary: string, fallbackTag: string, attrs?: Record<string, string>): string => {
     if (!usedSelectors.has(primary)) {
@@ -397,6 +474,9 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     if (/^<form\b/i.test(full)) {
       const attrs = parseAttrs(m[1] ?? '')
       currentFormId = `form-${forms.size + 1}`
+      if (attrs.id?.trim()) {
+        formIdsByHtmlId.set(attrs.id.trim(), currentFormId)
+      }
       const formTitle =
         attrs['aria-label']?.trim() ||
         attrs.title?.trim() ||
@@ -404,7 +484,10 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       forms.set(currentFormId, {
         action: attrs.action?.trim() ? (resolveHref(attrs.action.trim(), effectiveBaseUrl) ?? documentUrl) : documentUrl,
         method: (attrs.method ?? 'GET').toUpperCase(),
+        enctype: normalizeFormEnctype(attrs.enctype),
         fieldSelectors: [],
+        hiddenFields: [],
+        fieldOrder: [],
         title: formTitle,
       })
       continue
@@ -443,6 +526,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         linearRe.lastIndex = m.index + Math.max(1, openTagLen)
         continue
       }
+      extractHiddenInputsFromFragment(inner)
       // Otherwise capture inline <a> links in place so they render inline as [eN: link text]
       const inlineLinks: InlineLink[] = []
       const innerLinkRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi
@@ -541,7 +625,14 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         'button',
         attrs,
       )
-      const formAction = currentFormId ? forms.get(currentFormId)?.action : undefined
+      const targetFormId = resolveTargetFormId(attrs.form)
+      const formAction = attrs.formaction?.trim()
+        ? resolveHref(attrs.formaction.trim(), effectiveBaseUrl)
+        : targetFormId
+          ? forms.get(targetFormId)?.action
+          : undefined
+      const formMethod = attrs.formmethod?.trim() ? attrs.formmethod.trim().toUpperCase() : undefined
+      const formEnctype = attrs.formenctype?.trim() ? normalizeFormEnctype(attrs.formenctype) : undefined
       elements.push({
         selector,
         tag: 'button',
@@ -552,12 +643,15 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         text,
         ...(associatedLabel ? { label: associatedLabel } : {}),
         ariaLabel: attrs['aria-label'],
+        ...('value' in attrs ? { value: attrs.value } : {}),
         disabled: 'disabled' in attrs,
-        defaultSubmit: type === 'submit' && Boolean(currentFormId),
+        defaultSubmit: type === 'submit' && Boolean(targetFormId),
         formAction,
+        ...(formMethod ? { formMethod } : {}),
+        ...(formEnctype ? { formEnctype } : {}),
       })
       pushBlock({ kind: 'button', text, tag: 'button' })
-      if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
+      recordFormElement(targetFormId, selector)
       continue
     }
 
@@ -565,7 +659,11 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       // <input>
       const attrs = parseAttrs(m[11])
       const type = (attrs.type || 'text').toLowerCase()
-      if (type === 'hidden') continue
+      const targetFormId = resolveTargetFormId(attrs.form)
+      if (type === 'hidden') {
+        recordHiddenInput(targetFormId, attrs)
+        continue
+      }
       const selector = claimSelector(
         attrs.id
           ? `#${attrs.id}`
@@ -581,7 +679,13 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       const isBtn = type === 'submit' || type === 'button' || type === 'reset'
       const isPassword = type === 'password'
       const value = isPassword ? '' : (attrs.value ?? '')
-      const formAction = currentFormId ? forms.get(currentFormId)?.action : undefined
+      const formAction = attrs.formaction?.trim()
+        ? resolveHref(attrs.formaction.trim(), effectiveBaseUrl)
+        : targetFormId
+          ? forms.get(targetFormId)?.action
+          : undefined
+      const formMethod = attrs.formmethod?.trim() ? attrs.formmethod.trim().toUpperCase() : undefined
+      const formEnctype = attrs.formenctype?.trim() ? normalizeFormEnctype(attrs.formenctype) : undefined
       elements.push({
         selector,
         tag: 'input',
@@ -602,6 +706,8 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         checked: 'checked' in attrs,
         defaultSubmit: type === 'submit',
         formAction,
+        ...(formMethod ? { formMethod } : {}),
+        ...(formEnctype ? { formEnctype } : {}),
       })
       if (isBtn) {
         pushBlock({ kind: 'button', text: attrs.value || label, tag: 'input' })
@@ -615,13 +721,14 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
           tag: type === 'checkbox' || type === 'radio' ? type : 'input',
         })
       }
-      if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
+      recordFormElement(targetFormId, selector)
       continue
     }
 
     if (m[13] !== undefined) {
       // <textarea>
       const attrs = parseAttrs(m[12] ?? '')
+      const targetFormId = resolveTargetFormId(attrs.form)
       const selector = claimSelector(
         attrs.id
           ? `#${attrs.id}`
@@ -652,13 +759,14 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         editable: true,
       })
       pushBlock({ kind: 'input', text: label, placeholder: attrs.placeholder, value, tag: 'textarea' })
-      if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
+      recordFormElement(targetFormId, selector)
       continue
     }
 
     if (m[15] !== undefined) {
       // <select>
       const attrs = parseAttrs(m[14] ?? '')
+      const targetFormId = resolveTargetFormId(attrs.form)
       const selector = claimSelector(
         attrs.id
           ? `#${attrs.id}`
@@ -695,10 +803,11 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         label,
         ariaLabel: attrs['aria-label'],
         value: selected?.label ?? selected?.value ?? '',
+        disabled: 'disabled' in attrs,
         options,
       })
       pushBlock({ kind: 'select', text: label, value: selected?.label ?? selected?.value ?? '', tag: 'select' })
-      if (currentFormId) forms.get(currentFormId)?.fieldSelectors.push(selector)
+      recordFormElement(targetFormId, selector)
       continue
     }
 
@@ -710,6 +819,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         linearRe.lastIndex = m.index + Math.max(1, openTagLen)
         continue
       }
+      extractHiddenInputsFromFragment(inner)
       const text = stripTags(inner)
       if (text) pushBlock({ kind: 'list-item', text, tag: 'li' })
       continue
@@ -724,6 +834,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
 
     if (m[21] !== undefined) {
       // <tr>
+      extractHiddenInputsFromFragment(m[21])
       const cells: string[] = []
       let thCount = 0
       const cellRe = /<(t[hd])\b[^>]*>([\s\S]*?)<\/\1>/gi
@@ -816,7 +927,15 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         forms.set(`f${iframeCount}-${fId}`, {
           action: fMeta.action,
           method: fMeta.method,
+          enctype: fMeta.enctype,
           fieldSelectors: fMeta.fieldSelectors.map((s) => prefixFrameSelector([frameSeg], s)),
+          hiddenFields: fMeta.hiddenFields.map((h) => ({ ...h })),
+          fieldOrder: fMeta.fieldOrder?.map((item) =>
+            item.kind === 'element'
+              ? { kind: 'element', selector: prefixFrameSelector([frameSeg], item.selector) }
+              : { ...item },
+          ),
+          ...(fMeta.title ? { title: fMeta.title } : {}),
         })
       }
       childInputs.push({
@@ -1265,6 +1384,120 @@ class LiteTab implements TabDriver {
     }
   }
 
+  private buildFormSubmissionEntries(
+    form: LiteFormMeta,
+    submitter: ElementDescriptor | undefined,
+    enctype: FormEnctype,
+  ): FormDataEntry[] {
+    const entries: FormDataEntry[] = []
+    const order: LiteFormFieldRef[] =
+      form.fieldOrder && form.fieldOrder.length > 0
+        ? form.fieldOrder
+        : [
+            ...form.hiddenFields.map((h): LiteFormFieldRef => ({ kind: 'hidden', ...h })),
+            ...form.fieldSelectors.map((selector): LiteFormFieldRef => ({ kind: 'element', selector })),
+          ]
+
+    for (const item of order) {
+      if (item.kind === 'hidden') {
+        if (item.disabled || !item.name) continue
+        entries.push({ name: item.name, value: item.value })
+        continue
+      }
+      const field = this.doc.elements.find((e) => e.selector === item.selector)
+      if (!field || field.disabled || !field.name) continue
+      const isButtonLike =
+        field.tag === 'button' || field.type === 'submit' || field.type === 'button' || field.type === 'reset'
+      if (isButtonLike) {
+        if (submitter && field.selector === submitter.selector && field.type !== 'button' && field.type !== 'reset') {
+          entries.push({ name: field.name, value: field.value ?? '' })
+        }
+        continue
+      }
+      if ((field.type === 'checkbox' || field.type === 'radio') && !field.checked) continue
+      if (field.type === 'file') {
+        const rawPath = (field.value ?? '').trim()
+        if (enctype === 'multipart/form-data') {
+          if (rawPath) {
+            const filename = path.basename(rawPath)
+            let data: Buffer = Buffer.alloc(0)
+            let contentType = 'application/octet-stream'
+            try {
+              if (fs.statSync(rawPath).isFile()) {
+                data = fs.readFileSync(rawPath)
+                contentType = guessMimeTypeFromFilename(filename)
+              }
+            } catch {
+              // File path not readable on disk; send empty file part with filename
+            }
+            entries.push({ name: field.name, value: data, filename, contentType })
+          } else {
+            entries.push({
+              name: field.name,
+              value: Buffer.alloc(0),
+              filename: '',
+              contentType: 'application/octet-stream',
+            })
+          }
+        } else {
+          entries.push({ name: field.name, value: rawPath ? path.basename(rawPath) : '' })
+        }
+        continue
+      }
+      entries.push({ name: field.name, value: field.value ?? '' })
+    }
+    return entries
+  }
+
+  private async submitForm(form: LiteFormMeta, submitter?: ElementDescriptor): Promise<void> {
+    const action = submitter?.formAction || form.action
+    const method = (submitter?.formMethod || form.method || 'GET').toUpperCase()
+    const enctype = normalizeFormEnctype(submitter?.formEnctype || form.enctype)
+    const entries = this.buildFormSubmissionEntries(form, submitter, enctype)
+
+    if (method === 'POST') {
+      if (enctype === 'multipart/form-data') {
+        const encoded = encodeMultipartFormData(entries)
+        await this.fetchPage(
+          action,
+          {
+            method: 'POST',
+            headers: { 'content-type': encoded.contentType },
+            body: new Uint8Array(encoded.body),
+          },
+          true,
+        )
+      } else if (enctype === 'text/plain') {
+        const body = encodeTextPlainFormData(entries)
+        await this.fetchPage(
+          action,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'text/plain' },
+            body,
+          },
+          true,
+        )
+      } else {
+        const body = encodeUrlEncodedFormData(entries)
+        await this.fetchPage(
+          action,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body,
+          },
+          true,
+        )
+      }
+    } else {
+      const target = new URL(action)
+      const query = encodeUrlEncodedFormData(entries)
+      target.search = query
+      await this.fetchPage(target.toString(), undefined, true)
+    }
+  }
+
   async click(selector: string): Promise<{ ok: boolean; note?: string }> {
     const el = this.doc.elements.find((e) => e.selector === selector)
     if (!el) return { ok: false, note: `element ${selector} not found` }
@@ -1273,37 +1506,34 @@ class LiteTab implements TabDriver {
       await this.navigate(el.href)
       return { ok: true, note: `navigated to ${this.url}` }
     }
-    if (el.tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) {
+    if (el.tag === 'input' && el.type === 'checkbox') {
       el.checked = !el.checked
       this.syncBlockForElement(el)
       return { ok: true, note: `checked=${el.checked}` }
     }
-    // Check if button/submit belongs to a form
-    for (const form of this.doc.forms.values()) {
-      if (form.fieldSelectors.includes(selector) && (el.defaultSubmit || el.tag === 'button')) {
-        const params = new URLSearchParams()
-        for (const fSel of form.fieldSelectors) {
-          const field = this.doc.elements.find((e) => e.selector === fSel)
-          if (field?.name) {
-            if ((field.type === 'checkbox' || field.type === 'radio') && !field.checked) continue
-            params.append(field.name, field.value ?? '')
+    if (el.tag === 'input' && el.type === 'radio') {
+      if (el.name) {
+        const ownerForm = [...this.doc.forms.values()].find((f) => f.fieldSelectors.includes(selector))
+        const candidates = ownerForm
+          ? ownerForm.fieldSelectors
+              .map((s) => this.doc.elements.find((e) => e.selector === s))
+              .filter((e): e is ElementDescriptor => Boolean(e))
+          : this.doc.elements
+        for (const other of candidates) {
+          if (other !== el && other.tag === 'input' && other.type === 'radio' && other.name === el.name && other.checked) {
+            other.checked = false
+            this.syncBlockForElement(other)
           }
         }
-        if (form.method === 'POST') {
-          await this.fetchPage(
-            form.action,
-            {
-              method: 'POST',
-              headers: { 'content-type': 'application/x-www-form-urlencoded' },
-              body: params.toString(),
-            },
-            true,
-          )
-        } else {
-          const target = new URL(form.action)
-          for (const [k, v] of params) target.searchParams.set(k, v)
-          await this.fetchPage(target.toString(), undefined, true)
-        }
+      }
+      el.checked = true
+      this.syncBlockForElement(el)
+      return { ok: true, note: `checked=${el.checked}` }
+    }
+    // Check if submit button belongs to a form
+    for (const form of this.doc.forms.values()) {
+      if (form.fieldSelectors.includes(selector) && (el.defaultSubmit || (el.tag === 'button' && el.type === 'submit'))) {
+        await this.submitForm(form, el)
         return { ok: true, note: `submitted form to ${this.url}` }
       }
     }
@@ -1357,11 +1587,13 @@ class LiteTab implements TabDriver {
         if (form.fieldSelectors.includes(selector)) {
           const submitBtn = form.fieldSelectors
             .map((s) => this.doc.elements.find((e) => e.selector === s))
-            .find((e) => e && (e.defaultSubmit || e.tag === 'button'))
+            .find((e) => e && !e.disabled && (e.defaultSubmit || (e.tag === 'button' && e.type === 'submit')))
           if (submitBtn) {
             await this.click(submitBtn.selector)
-            return { ok: true, normalized: chord.normalized, modifiers: chord.modifiersBitmask }
+          } else {
+            await this.submitForm(form)
           }
+          return { ok: true, normalized: chord.normalized, modifiers: chord.modifiersBitmask }
         }
       }
     }
