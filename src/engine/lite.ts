@@ -90,6 +90,54 @@ function stripTags(html: string): string {
     .trim()
 }
 
+/**
+ * Extract the accessible label text from inside a `<label>...</label>` element,
+ * excluding embedded form controls (such as `<select><option>...</option></select>`,
+ * `<textarea>default</textarea>`, `<button>...</button>`, `<input .../>`, etc.)
+ * so option labels and default values never pollute the label text.
+ */
+export function extractLabelText(innerHtml: string): string {
+  const withoutControls = innerHtml
+    .replace(/<select\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/select>/gi, ' ')
+    .replace(/<textarea\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/textarea>/gi, ' ')
+    .replace(/<button\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/button>/gi, ' ')
+    .replace(/<meter\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/meter>/gi, ' ')
+    .replace(/<output\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/output>/gi, ' ')
+    .replace(/<progress\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/progress>/gi, ' ')
+    .replace(/<input\b(?:"[^"]*"|'[^']*'|[^>])*\/?>/gi, ' ')
+  return stripTags(withoutControls)
+}
+
+interface ImplicitLabelSpan {
+  start: number
+  end: number
+  text: string
+  consumed: boolean
+}
+
+function resolveImplicitLabel(controlOffset: number, spans: ImplicitLabelSpan[]): string | undefined {
+  for (const span of spans) {
+    if (controlOffset > span.start && controlOffset < span.end) {
+      if (span.consumed) return undefined
+      span.consumed = true
+      return span.text
+    }
+    if (span.start > controlOffset) break
+  }
+  return undefined
+}
+
+function containsVisibleFormControl(innerHtml: string): boolean {
+  if (/<(?:textarea|select|button)\b/i.test(innerHtml)) return true
+  const inputRe = /<input\b([^>]*)\/?>/gi
+  let im: RegExpExecArray | null
+  while ((im = inputRe.exec(innerHtml)) !== null) {
+    const attrs = parseAttrs(im[1] ?? '')
+    if ((attrs.type || 'text').toLowerCase() !== 'hidden') return true
+  }
+  return false
+}
+
 function parseAttrs(attrString: string): Record<string, string> {
   const attrs: Record<string, string> = {}
   const regex = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g
@@ -117,7 +165,7 @@ function resolveHref(href: string | undefined, baseUrl: string): string | undefi
   }
 }
 
-interface ParsedDoc {
+export interface ParsedDoc {
   title: string
   blocks: Array<ContentBlock & { selector?: string }>
   elements: ElementDescriptor[]
@@ -126,7 +174,7 @@ interface ParsedDoc {
   forms: Map<string, { action: string; method: string; fieldSelectors: string[] }>
 }
 
-function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc {
+export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc {
   // Remove scripts, styles, noscript, comments
   const cleaned = html
     .replace(/<!--[\s\S]*?-->/g, '')
@@ -151,21 +199,56 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
     })
   }
 
-  // Extract <label for="..."> map
+  // Extract explicit `<label for="...">` associations AND implicit `<label><input .../></label>` spans.
+  // Per HTML5 (4.10.4):
+  // - If `for` is present and non-empty, the label associates explicitly with the element having that `id`.
+  // - Otherwise, the label associates implicitly with its first labelable descendant (`<input>` except
+  //   `type="hidden"`, `<textarea>`, `<select>`, `<button>`).
   const labelsByFor = new Map<string, string>()
-  const labelRe = /<label\b([^>]*)>([\s\S]*?)<\/label>/gi
+  const implicitLabelSpans: ImplicitLabelSpan[] = []
+  const labelRe = /<label\b((?:"[^"]*"|'[^']*'|[^>])*)>([\s\S]*?)<\/label>/gi
   let lm: RegExpExecArray | null
   while ((lm = labelRe.exec(bodyHtml)) !== null) {
     const attrs = parseAttrs(lm[1] ?? '')
-    const text = stripTags(lm[2] ?? '')
-    if (attrs.for && text) labelsByFor.set(attrs.for, text)
+    const text = extractLabelText(lm[2] ?? '')
+    if (!text) continue
+    const forId = attrs.for?.trim()
+    if (forId) {
+      const existing = labelsByFor.get(forId)
+      labelsByFor.set(forId, existing && existing !== text ? `${existing} ${text}` : text)
+    } else {
+      implicitLabelSpans.push({
+        start: lm.index,
+        end: lm.index + lm[0].length,
+        text,
+        consumed: false,
+      })
+    }
   }
 
   const blocks: ContentBlock[] = []
   const elements: ElementDescriptor[] = []
   const forms = new Map<string, { action: string; method: string; fieldSelectors: string[]; title?: string }>()
+  const usedSelectors = new Set<string>()
   let elIndex = 0
   let currentFormId = ''
+
+  const claimSelector = (primary: string, fallbackTag: string, attrs?: Record<string, string>): string => {
+    if (!usedSelectors.has(primary)) {
+      usedSelectors.add(primary)
+      return primary
+    }
+    if (attrs?.name && attrs.value) {
+      const byValue = `${fallbackTag}[name="${attrs.name}"][value="${attrs.value}"]`
+      if (!usedSelectors.has(byValue)) {
+        usedSelectors.add(byValue)
+        return byValue
+      }
+    }
+    const disambiguated = `${fallbackTag}:nth-of-type(${++elIndex})`
+    usedSelectors.add(disambiguated)
+    return disambiguated
+  }
 
   const pushBlock = (block: ContentBlock) => {
     if (currentFormId) {
@@ -229,8 +312,15 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
     }
 
     if (m[6] !== undefined) {
-      // Paragraph <p>: capture inline <a> links in place so they render inline as [eN: link text]
+      // Paragraph <p>: if it wraps visible form controls (e.g. `<p><label>Email <input .../></label></p>`),
+      // descend into its inner HTML so controls and implicit <label> spans are parsed at their real offsets.
       const inner = m[6]
+      if (containsVisibleFormControl(inner)) {
+        const openTagLen = full.length - inner.length - 4 // '</p>'.length
+        linearRe.lastIndex = m.index + Math.max(1, openTagLen)
+        continue
+      }
+      // Otherwise capture inline <a> links in place so they render inline as [eN: link text]
       const inlineLinks: InlineLink[] = []
       const innerLinkRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi
       let textParts = ''
@@ -318,9 +408,16 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
     if (m[10] !== undefined) {
       // <button>
       const attrs = parseAttrs(m[9] ?? '')
-      const text = stripTags(m[10]) || attrs['aria-label'] || attrs.value || 'Button'
+      const explicitLabel = attrs.id ? labelsByFor.get(attrs.id) : undefined
+      const implicitLabel = resolveImplicitLabel(m.index, implicitLabelSpans)
+      const associatedLabel = explicitLabel || implicitLabel
+      const text = stripTags(m[10]) || attrs['aria-label'] || associatedLabel || attrs.value || 'Button'
       const type = (attrs.type || 'submit').toLowerCase()
-      const selector = attrs.id ? `#${attrs.id}` : `button:nth-of-type(${++elIndex})`
+      const selector = claimSelector(
+        attrs.id ? `#${attrs.id}` : `button:nth-of-type(${++elIndex})`,
+        'button',
+        attrs,
+      )
       const formAction = currentFormId ? forms.get(currentFormId)?.action : undefined
       elements.push({
         selector,
@@ -330,6 +427,7 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
         name: attrs.name,
         role: attrs.role || 'button',
         text,
+        ...(associatedLabel ? { label: associatedLabel } : {}),
         ariaLabel: attrs['aria-label'],
         disabled: 'disabled' in attrs,
         defaultSubmit: type === 'submit' && Boolean(currentFormId),
@@ -345,12 +443,18 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
       const attrs = parseAttrs(m[11])
       const type = (attrs.type || 'text').toLowerCase()
       if (type === 'hidden') continue
-      const selector = attrs.id
-        ? `#${attrs.id}`
-        : attrs.name
-          ? `input[name="${attrs.name}"]`
-          : `input:nth-of-type(${++elIndex})`
-      const label = (attrs.id && labelsByFor.get(attrs.id)) || attrs['aria-label'] || attrs.placeholder || attrs.name || type
+      const selector = claimSelector(
+        attrs.id
+          ? `#${attrs.id}`
+          : attrs.name
+            ? `input[name="${attrs.name}"]`
+            : `input:nth-of-type(${++elIndex})`,
+        'input',
+        attrs,
+      )
+      const explicitLabel = attrs.id ? labelsByFor.get(attrs.id) : undefined
+      const implicitLabel = resolveImplicitLabel(m.index, implicitLabelSpans)
+      const label = explicitLabel || implicitLabel || attrs['aria-label'] || attrs.placeholder || attrs.name || type
       const isBtn = type === 'submit' || type === 'button' || type === 'reset'
       const isPassword = type === 'password'
       const value = isPassword ? '' : (attrs.value ?? '')
@@ -395,12 +499,18 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
     if (m[13] !== undefined) {
       // <textarea>
       const attrs = parseAttrs(m[12] ?? '')
-      const selector = attrs.id
-        ? `#${attrs.id}`
-        : attrs.name
-          ? `textarea[name="${attrs.name}"]`
-          : `textarea:nth-of-type(${++elIndex})`
-      const label = (attrs.id && labelsByFor.get(attrs.id)) || attrs['aria-label'] || attrs.placeholder || attrs.name || 'textarea'
+      const selector = claimSelector(
+        attrs.id
+          ? `#${attrs.id}`
+          : attrs.name
+            ? `textarea[name="${attrs.name}"]`
+            : `textarea:nth-of-type(${++elIndex})`,
+        'textarea',
+        attrs,
+      )
+      const explicitLabel = attrs.id ? labelsByFor.get(attrs.id) : undefined
+      const implicitLabel = resolveImplicitLabel(m.index, implicitLabelSpans)
+      const label = explicitLabel || implicitLabel || attrs['aria-label'] || attrs.placeholder || attrs.name || 'textarea'
       const value = decodeEntities(m[13]).trim()
       elements.push({
         selector,
@@ -426,12 +536,18 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
     if (m[15] !== undefined) {
       // <select>
       const attrs = parseAttrs(m[14] ?? '')
-      const selector = attrs.id
-        ? `#${attrs.id}`
-        : attrs.name
-          ? `select[name="${attrs.name}"]`
-          : `select:nth-of-type(${++elIndex})`
-      const label = (attrs.id && labelsByFor.get(attrs.id)) || attrs['aria-label'] || attrs.name || 'select'
+      const selector = claimSelector(
+        attrs.id
+          ? `#${attrs.id}`
+          : attrs.name
+            ? `select[name="${attrs.name}"]`
+            : `select:nth-of-type(${++elIndex})`,
+        'select',
+        attrs,
+      )
+      const explicitLabel = attrs.id ? labelsByFor.get(attrs.id) : undefined
+      const implicitLabel = resolveImplicitLabel(m.index, implicitLabelSpans)
+      const label = explicitLabel || implicitLabel || attrs['aria-label'] || attrs.name || 'select'
       const options: Array<{ value: string; label: string; selected?: boolean }> = []
       const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi
       let om: RegExpExecArray | null
@@ -464,8 +580,14 @@ function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc 
     }
 
     if (m[17] !== undefined) {
-      // <li>
-      const text = stripTags(m[17])
+      // <li>: descend if it wraps visible form controls (e.g. `<li><label><input type="radio"> Plan</label></li>`)
+      const inner = m[17]
+      if (containsVisibleFormControl(inner)) {
+        const openTagLen = full.length - inner.length - 5 // '</li>'.length
+        linearRe.lastIndex = m.index + Math.max(1, openTagLen)
+        continue
+      }
+      const text = stripTags(inner)
       if (text) pushBlock({ kind: 'list-item', text, tag: 'li' })
       continue
     }
