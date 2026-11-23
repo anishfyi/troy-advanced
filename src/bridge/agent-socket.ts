@@ -47,6 +47,7 @@ export async function createAgentSocket(
             engine: manager.engine.kind,
             cdpPort: manager.engine.cdpPort,
             tabs: manager.listTabs().length,
+            crashRecovery: manager.getCrashRecoveryStats(),
           },
         }
       case '/tabs':

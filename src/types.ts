@@ -468,3 +468,58 @@ export interface EmulationUpdateMode {
   clearHeaders?: boolean
   removeHeaders?: string[]
 }
+
+export interface CrashRecoveryOptions {
+  /** Enable automatic Chromium crash detection and relaunch (default: true for local Chromium). */
+  enabled?: boolean
+  /** Maximum consecutive automatic crash recoveries before failing (default: 5). */
+  maxRestarts?: number
+  /** Initial backoff delay in ms before relaunching (default: 250). */
+  backoffMs?: number
+  /** Maximum backoff delay in ms (default: 5000). */
+  maxBackoffMs?: number
+  /** Reset consecutive restart counter after this many ms of healthy uptime (default: 60000). */
+  resetWindowMs?: number
+  /** Re-navigate open tabs to their last URLs after relaunch (default: true). */
+  restoreTabs?: boolean
+}
+
+export type CrashRecoveryEventKind =
+  | 'chromium_crashed'
+  | 'chromium_relaunching'
+  | 'chromium_recovered'
+  | 'chromium_recovery_failed'
+
+export interface CrashRecoveryEvent {
+  kind: CrashRecoveryEventKind
+  ts: number
+  pid?: number
+  exitCode?: number | null
+  signal?: string | null
+  restartCount: number
+  maxRestarts: number
+  cdpPort?: number
+  profileDir?: string
+  restoredTabs?: number
+  error?: string
+}
+
+export type CrashRecoveryStatus = 'healthy' | 'crashed' | 'recovering' | 'failed' | 'closed'
+
+export interface CrashRecoveryStats {
+  enabled: boolean
+  canRecover: boolean
+  status: CrashRecoveryStatus
+  pid: number | null
+  cdpPort: number
+  profileDir: string | null
+  restartCount: number
+  consecutiveRestarts: number
+  totalCrashes: number
+  maxRestarts: number
+  lastCrashAt: number | null
+  lastRecoveredAt: number | null
+  lastExitCode: number | null
+  lastExitSignal: string | null
+  lastError: string | null
+}

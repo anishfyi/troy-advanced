@@ -4,6 +4,8 @@ import type {
   ConsoleEntry,
   CookieExportOptions,
   CookieImportResult,
+  CrashRecoveryEvent,
+  CrashRecoveryStats,
   EmulationOptions,
   EmulationProfile,
   EmulationUpdateMode,
@@ -63,6 +65,8 @@ export interface BrowserEngine {
   createTab(initialUrl?: string): Promise<TabDriver>
   getDefaultEmulation?(): EmulationProfile
   setDefaultEmulation?(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile
+  getCrashRecoveryStats?(): CrashRecoveryStats
+  onCrashRecovery?(fn: (ev: CrashRecoveryEvent) => void): () => void
   exportCookies(opts?: CookieExportOptions): Promise<BrowserCookie[]>
   importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult>
   clearCookies?(opts?: { domain?: string }): Promise<number>

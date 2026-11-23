@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type {
   BrowserCookie,
+  CrashRecoveryOptions,
   EmulationOptions,
   EngineKind,
   OriginStorageSnapshot,
@@ -219,6 +220,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           mode: typeof flags['tracker-mode'] === 'string' ? (flags['tracker-mode'] as TrackerBlockMode) : undefined,
         }
       : undefined
+  const crashRecovery: CrashRecoveryOptions | undefined =
+    flags['no-crash-recovery'] || flags['max-restarts'] !== undefined
+      ? {
+          enabled: !flags['no-crash-recovery'],
+          maxRestarts: flags['max-restarts'] !== undefined ? Number(flags['max-restarts']) : undefined,
+        }
+      : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -283,6 +291,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       initialUrl: typeof flags.url === 'string' ? flags.url : undefined,
       trackerBlocking,
       emulation: cliEmulation,
+      crashRecovery,
     }
 
     if (sub === 'run') {
@@ -319,6 +328,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
       trackerBlocking,
       emulation: cliEmulation,
+      crashRecovery,
     })
     try {
       await runTerminalBrowser(manager, {
@@ -338,6 +348,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
       trackerBlocking,
       emulation: cliEmulation,
+      crashRecovery,
     })
     try {
       await runMcpStdioServer(manager)
@@ -354,6 +365,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
       trackerBlocking,
       emulation: cliEmulation,
+      crashRecovery,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })

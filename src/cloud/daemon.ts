@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { EmulationOptions, EngineKind, TrackerBlockingOptions } from '../types.js'
+import type { CrashRecoveryOptions, EmulationOptions, EngineKind, TrackerBlockingOptions } from '../types.js'
 import { BrowserManager } from '../engine/manager.js'
 import { createAgentSocket } from '../bridge/agent-socket.js'
 import {
@@ -26,6 +26,7 @@ export interface DaemonOptions {
   initialUrl?: string
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
+  crashRecovery?: CrashRecoveryOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -36,6 +37,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     remoteCdpPort: opts.remoteCdpPort,
     trackerBlocking: opts.trackerBlocking,
     emulation: opts.emulation,
+    crashRecovery: opts.crashRecovery,
   })
 
   if (opts.initialUrl) {
@@ -46,23 +48,35 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
   const endpointFile = opts.endpointFile || defaultEndpointPath()
   const compatFile = opts.compatTroy ? troyCompatEndpointPath() : null
 
-  const descriptor = {
+  const startedAt = new Date().toISOString()
+  const buildDescriptor = () => ({
     port: manager.engine.cdpPort,
     httpEndpoint: manager.engine.cdpPort ? `http://127.0.0.1:${manager.engine.cdpPort}` : '',
     webSocketDebuggerUrlHint: manager.engine.cdpPort ? `http://127.0.0.1:${manager.engine.cdpPort}/json/list` : '',
     pid: process.pid,
     version: '0.1.0',
-    startedAt: new Date().toISOString(),
+    startedAt,
     engine: manager.engine.kind,
     agentPort: socket.port,
     agentToken: socket.token,
     profileDir: manager.profileDir,
+  })
+
+  const syncEndpoints = () => {
+    const descriptor = buildDescriptor()
+    writeEndpoint(endpointFile, descriptor)
+    if (compatFile && compatFile !== endpointFile) {
+      writeEndpoint(compatFile, descriptor)
+    }
   }
 
-  writeEndpoint(endpointFile, descriptor)
-  if (compatFile && compatFile !== endpointFile) {
-    writeEndpoint(compatFile, descriptor)
-  }
+  syncEndpoints()
+
+  const offCrashSync = manager.onEvent((ev) => {
+    if (ev.type === 'chromium_recovered') {
+      syncEndpoints()
+    }
+  })
 
   console.log(
     JSON.stringify({
@@ -81,6 +95,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
   const shutdown = async () => {
     if (shuttingDown) return
     shuttingDown = true
+    offCrashSync()
     clearEndpoint(endpointFile)
     if (compatFile && compatFile !== endpointFile) clearEndpoint(compatFile)
     await socket.close().catch(() => {})
@@ -117,6 +132,8 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.initialUrl) args.push('--url', opts.initialUrl)
   if (opts.trackerBlocking?.enabled === false) args.push('--no-block-trackers')
   if (opts.trackerBlocking?.mode) args.push('--tracker-mode', opts.trackerBlocking.mode)
+  if (opts.crashRecovery?.enabled === false) args.push('--no-crash-recovery')
+  if (opts.crashRecovery?.maxRestarts !== undefined) args.push('--max-restarts', String(opts.crashRecovery.maxRestarts))
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport
     if (typeof vp === 'string') {

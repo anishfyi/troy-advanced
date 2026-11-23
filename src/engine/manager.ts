@@ -10,6 +10,8 @@ import type {
   BrowserCookie,
   CookieExportOptions,
   CookieImportResult,
+  CrashRecoveryOptions,
+  CrashRecoveryStats,
   ElementDescriptor,
   EmulationOptions,
   EmulationProfile,
@@ -52,6 +54,7 @@ import {
 import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
+import { defaultDisabledCrashRecoveryStats } from './crash-recovery.js'
 import {
   defaultEmulationProfile,
   formatEmulationAscii,
@@ -102,6 +105,7 @@ export interface BrowserManagerOptions {
   chromeBin?: string
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
+  crashRecovery?: CrashRecoveryOptions
 }
 
 export class BrowserManager {
@@ -112,11 +116,22 @@ export class BrowserManager {
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
   private eventListeners = new Set<(event: Record<string, unknown>) => void>()
+  private unsubscribeCrash?: () => void
 
   private constructor(engine: BrowserEngine, profileDir: string, memory: PageMemory | null) {
     this.engine = engine
     this.profileDir = profileDir
     this.memory = memory
+    if (engine.onCrashRecovery) {
+      this.unsubscribeCrash = engine.onCrashRecovery((ev) => {
+        if (ev.kind === 'chromium_recovered') {
+          for (const session of this.tabs.values()) {
+            session.lastSnapshot = null
+          }
+        }
+        this.emit({ type: ev.kind, ...ev })
+      })
+    }
   }
 
   static async create(opts: BrowserManagerOptions = {}): Promise<BrowserManager> {
@@ -135,6 +150,7 @@ export class BrowserManager {
         profileDir: path.join(profileDir, 'chrome-data'),
         trackerBlocking: opts.trackerBlocking,
         emulation: opts.emulation,
+        crashRecovery: opts.crashRecovery,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -147,6 +163,7 @@ export class BrowserManager {
             profileDir: path.join(profileDir, 'chrome-data'),
             trackerBlocking: opts.trackerBlocking,
             emulation: opts.emulation,
+            crashRecovery: opts.crashRecovery,
           })
         } catch {
           engine = new LiteBrowserEngine({ emulation: opts.emulation })
@@ -1627,7 +1644,15 @@ export class BrowserManager {
     }
   }
 
+  getCrashRecoveryStats(): CrashRecoveryStats {
+    return this.engine.getCrashRecoveryStats
+      ? this.engine.getCrashRecoveryStats()
+      : defaultDisabledCrashRecoveryStats(this.engine.cdpPort)
+  }
+
   async close(): Promise<void> {
+    this.unsubscribeCrash?.()
+    this.unsubscribeCrash = undefined
     for (const s of this.tabs.values()) {
       await s.driver.close().catch(() => {})
     }

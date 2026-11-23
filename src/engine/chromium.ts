@@ -13,6 +13,10 @@ import type {
   ContentBlock,
   CookieExportOptions,
   CookieImportResult,
+  CrashRecoveryEvent,
+  CrashRecoveryOptions,
+  CrashRecoveryStats,
+  CrashRecoveryStatus,
   ElementDescriptor,
   EmulationOptions,
   EmulationProfile,
@@ -37,6 +41,13 @@ import {
   normalizeCookie,
   toCdpCookieParam,
 } from './cookies.js'
+import {
+  cleanupStaleProfileLocks,
+  computeRecoveryBackoffMs,
+  isCdpDisconnectError,
+  resolveCrashRecoveryOptions,
+  shouldRestoreTabUrl,
+} from './crash-recovery.js'
 import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import {
   IFRAME_OWNER_INFO_FUNCTION,
@@ -496,6 +507,16 @@ async function allocateFreePort(): Promise<number> {
   })
 }
 
+function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = net.createServer()
+    srv.once('error', () => resolve(false))
+    srv.listen(port, '127.0.0.1', () => {
+      srv.close(() => resolve(true))
+    })
+  })
+}
+
 async function waitForCdp(port: number, timeoutMs = 15000): Promise<{ webSocketDebuggerUrl: string }> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -553,10 +574,15 @@ interface DiscoveredFrame {
 const MAX_FRAME_DEPTH = 5
 const MAX_DISCOVERED_FRAMES = 20
 
+interface ChromiumTabRecoveryHost {
+  withRecovery<T>(fn: () => Promise<T>): Promise<T>
+  onTabClosed(tab: ChromiumTab): void
+}
+
 class ChromiumTab implements TabDriver {
   readonly id: number
   readonly engine = 'chromium' as const
-  readonly targetId: string
+  private targetId: string
   private cdp: CdpClient
   private cdpPort: number
   private url = 'about:blank'
@@ -571,8 +597,10 @@ class ChromiumTab implements TabDriver {
   private reqStart = new Map<string, { url: string; method: string; ts: number }>()
   private blockedByFetch = new Map<string, string>()
   private networkIdle = new NetworkIdleTracker()
+  private trackerBlocking?: TrackerBlockingOptions
   private trackerBlocker: CdpTrackerBlocker
   private emulation: EmulationProfile
+  private recoveryHost?: ChromiumTabRecoveryHost
 
   constructor(
     id: number,
@@ -581,13 +609,21 @@ class ChromiumTab implements TabDriver {
     cdpPort: number,
     trackerBlocking?: TrackerBlockingOptions,
     initialEmulation?: EmulationProfile,
+    recoveryHost?: ChromiumTabRecoveryHost,
   ) {
     this.id = id
     this.targetId = targetId
     this.cdp = cdp
     this.cdpPort = cdpPort
+    this.trackerBlocking = trackerBlocking
+    this.recoveryHost = recoveryHost
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
-    this.trackerBlocker = new CdpTrackerBlocker(cdp, trackerBlocking, {
+    this.trackerBlocker = this.createTrackerBlocker(cdp)
+    this.bindCdpListeners()
+  }
+
+  private createTrackerBlocker(cdp: CdpClient): CdpTrackerBlocker {
+    return new CdpTrackerBlocker(cdp, this.trackerBlocking, {
       onBlocked: (ev) => {
         this.blockedByFetch.set(ev.url, ev.reason)
         if (this.blockedByFetch.size > 200) {
@@ -596,7 +632,13 @@ class ChromiumTab implements TabDriver {
         }
       },
     })
+  }
 
+  private runWithRecovery<T>(fn: () => Promise<T>): Promise<T> {
+    return this.recoveryHost ? this.recoveryHost.withRecovery(fn) : fn()
+  }
+
+  private bindCdpListeners(): void {
     this.cdp.on('Page.frameNavigated', (params, sessionId) => {
       if (sessionId) return
       const frame = params.frame as { id?: string; parentId?: string; url?: string } | undefined
@@ -760,6 +802,46 @@ class ChromiumTab implements TabDriver {
     await this.trackerBlocker.enable()
   }
 
+  /**
+   * Transparently reattach this tab to a newly launched Chromium process after crash recovery.
+   */
+  async reattach(
+    newTargetId: string,
+    newCdp: CdpClient,
+    newCdpPort: number,
+    opts: { restoreUrl?: boolean } = {},
+  ): Promise<boolean> {
+    const prevUrl = this.url
+    const oldCdp = this.cdp
+    this.targetId = newTargetId
+    this.cdp = newCdp
+    this.cdpPort = newCdpPort
+    this.mainFrameId = null
+    this.frameContexts.clear()
+    this.oopifSessions.clear()
+    this.reqStart.clear()
+    this.blockedByFetch.clear()
+    this.networkIdle.onNavigationReset()
+    this.loading = false
+    this.epoch += 1
+    this.trackerBlocker = this.createTrackerBlocker(newCdp)
+    this.bindCdpListeners()
+
+    await oldCdp.close().catch(() => {})
+    await this.init()
+
+    if (opts.restoreUrl !== false && shouldRestoreTabUrl(prevUrl)) {
+      try {
+        await this.navigateDirect(prevUrl)
+        return true
+      } catch {
+        // Page may be temporarily unreachable; tab is still attached and usable
+        return false
+      }
+    }
+    return false
+  }
+
   private async applyEmulation(): Promise<void> {
     const { viewport, userAgent, acceptLanguage, platform, extraHeaders } = this.emulation
     const ops: Array<Promise<unknown>> = [
@@ -797,7 +879,7 @@ class ChromiumTab implements TabDriver {
 
   async setEmulation(opts: EmulationOptions, mode?: EmulationUpdateMode): Promise<EmulationProfile> {
     this.emulation = resolveEmulationProfile(opts, this.emulation, mode)
-    await this.applyEmulation()
+    await this.runWithRecovery(() => this.applyEmulation())
     return cloneEmulationProfile(this.emulation)
   }
 
@@ -1245,6 +1327,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async navigate(url: string): Promise<{ url: string; title: string }> {
+    return this.runWithRecovery(() => this.navigateDirect(url))
+  }
+
+  private async navigateDirect(url: string): Promise<{ url: string; title: string }> {
     this.loading = true
     const loadPromise = new Promise<void>((resolve) => {
       let done = false
@@ -1266,7 +1352,7 @@ class ChromiumTab implements TabDriver {
     }
     await loadPromise
     // Wait for initial SPA hydration (network idle + DOM mutation settle)
-    await this.waitForSettle({ timeoutMs: 1500, networkIdleMs: 200, domQuietMs: 150 })
+    await this.waitForSettleDirect({ timeoutMs: 1500, networkIdleMs: 200, domQuietMs: 150 })
     const meta = await this.evalJson<{ url: string; title: string }>('({ url: location.href, title: document.title || "" })')
     this.url = meta?.url || url
     this.title = meta?.title || this.url
@@ -1276,6 +1362,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async history(direction: 'back' | 'forward' | 'reload'): Promise<{ url: string; title: string }> {
+    return this.runWithRecovery(() => this.historyDirect(direction))
+  }
+
+  private async historyDirect(direction: 'back' | 'forward' | 'reload'): Promise<{ url: string; title: string }> {
     if (direction === 'reload') {
       await this.cdp.send('Page.reload')
     } else {
@@ -1295,6 +1385,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async snapshot(): Promise<PageSnapshot> {
+    return this.runWithRecovery(() => this.snapshotDirect())
+  }
+
+  private async snapshotDirect(): Promise<PageSnapshot> {
     const mainRaw = await this.evalJson<RawFrameSnapshot>(SNAPSHOT_SCRIPT)
     this.url = mainRaw.url || this.url
     this.title = mainRaw.title || this.title
@@ -1356,6 +1450,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async click(selector: string): Promise<{ ok: boolean; note?: string }> {
+    return this.runWithRecovery(() => this.clickDirect(selector))
+  }
+
+  private async clickDirect(selector: string): Promise<{ ok: boolean; note?: string }> {
     const target = await this.resolveFrameTarget(selector)
     if (!target.ok) return { ok: false, note: target.error }
 
@@ -1394,6 +1492,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async fill(selector: string, text: string, clear = true): Promise<{ ok: boolean; value?: string }> {
+    return this.runWithRecovery(() => this.fillDirect(selector, text, clear))
+  }
+
+  private async fillDirect(selector: string, text: string, clear = true): Promise<{ ok: boolean; value?: string }> {
     const target = await this.resolveFrameTarget(selector)
     if (!target.ok) return { ok: false }
 
@@ -1433,6 +1535,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async select(selector: string, value: string): Promise<{ ok: boolean; value?: string }> {
+    return this.runWithRecovery(() => this.selectDirect(selector, value))
+  }
+
+  private async selectDirect(selector: string, value: string): Promise<{ ok: boolean; value?: string }> {
     const target = await this.resolveFrameTarget(selector)
     if (!target.ok) return { ok: false }
 
@@ -1462,6 +1568,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async press(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }> {
+    return this.runWithRecovery(() => this.pressDirect(key, selector))
+  }
+
+  private async pressDirect(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }> {
     if (selector) {
       const target = await this.resolveFrameTarget(selector)
       if (!target.ok) {
@@ -1498,6 +1608,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async hover(selector: string): Promise<{ ok: boolean }> {
+    return this.runWithRecovery(() => this.hoverDirect(selector))
+  }
+
+  private async hoverDirect(selector: string): Promise<{ ok: boolean }> {
     const target = await this.resolveFrameTarget(selector)
     if (!target.ok) return { ok: false }
 
@@ -1528,6 +1642,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async scroll(direction: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom', amount = 450) {
+    return this.runWithRecovery(() => this.scrollDirect(direction, amount))
+  }
+
+  private async scrollDirect(direction: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom', amount = 450) {
     return this.evalJson<{ scrollX: number; scrollY: number }>(
       `(() => {
         const dir = ${JSON.stringify(direction)};
@@ -1544,6 +1662,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async waitForSettle(options: SettleOptions = {}): Promise<SettleResult> {
+    return this.runWithRecovery(() => this.waitForSettleDirect(options))
+  }
+
+  private async waitForSettleDirect(options: SettleOptions = {}): Promise<SettleResult> {
     return waitForPageSettle(
       {
         checkNetwork: (now, opts) => {
@@ -1573,6 +1695,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async waitFor(options: WaitConditionOptions): Promise<WaitResult> {
+    return this.runWithRecovery(() => this.waitForDirect(options))
+  }
+
+  private async waitForDirect(options: WaitConditionOptions): Promise<WaitResult> {
     const hasCondition = Boolean(options.text || options.selector || options.url)
     const wantSettle = Boolean(options.settle)
 
@@ -1824,16 +1950,18 @@ class ChromiumTab implements TabDriver {
   }
 
   async evaluate(expression: string): Promise<unknown> {
-    return this.evalJson(expression)
+    return this.runWithRecovery(() => this.evalJson(expression))
   }
 
   async screenshot(opts: { fullPage?: boolean } = {}): Promise<Buffer | null> {
-    const res = await this.cdp.send<{ data?: string }>('Page.captureScreenshot', {
-      format: 'png',
-      fromSurface: true,
-      captureBeyondViewport: Boolean(opts.fullPage),
+    return this.runWithRecovery(async () => {
+      const res = await this.cdp.send<{ data?: string }>('Page.captureScreenshot', {
+        format: 'png',
+        fromSurface: true,
+        captureBeyondViewport: Boolean(opts.fullPage),
+      })
+      return res.data ? Buffer.from(res.data, 'base64') : null
     })
-    return res.data ? Buffer.from(res.data, 'base64') : null
   }
 
   getConsole(opts: { clear?: boolean; level?: string; limit?: number } = {}): ConsoleEntry[] {
@@ -1856,6 +1984,10 @@ class ChromiumTab implements TabDriver {
   }
 
   async getStorage(opts: { area?: StorageArea; keyPrefix?: string } = {}): Promise<OriginStorageSnapshot> {
+    return this.runWithRecovery(() => this.getStorageDirect(opts))
+  }
+
+  private async getStorageDirect(opts: { area?: StorageArea; keyPrefix?: string } = {}): Promise<OriginStorageSnapshot> {
     const area = normalizeStorageArea(opts.area)
     const keyPrefix = typeof opts.keyPrefix === 'string' ? opts.keyPrefix : ''
     const payload = JSON.stringify({ area, keyPrefix })
@@ -1895,6 +2027,13 @@ class ChromiumTab implements TabDriver {
   }
 
   async setStorage(
+    data: { localStorage?: Record<string, string>; sessionStorage?: Record<string, string> },
+    opts: { clearBeforeImport?: boolean } = {},
+  ): Promise<{ origin: string; localKeys: number; sessionKeys: number }> {
+    return this.runWithRecovery(() => this.setStorageDirect(data, opts))
+  }
+
+  private async setStorageDirect(
     data: { localStorage?: Record<string, string>; sessionStorage?: Record<string, string> },
     opts: { clearBeforeImport?: boolean } = {},
   ): Promise<{ origin: string; localKeys: number; sessionKeys: number }> {
@@ -1943,6 +2082,14 @@ class ChromiumTab implements TabDriver {
     removedLocal: number
     removedSession: number
   }> {
+    return this.runWithRecovery(() => this.clearStorageDirect(opts))
+  }
+
+  private async clearStorageDirect(opts: { area?: StorageArea; keys?: string[] } = {}): Promise<{
+    origin: string
+    removedLocal: number
+    removedSession: number
+  }> {
     const area = normalizeStorageArea(opts.area)
     const keys = Array.isArray(opts.keys) && opts.keys.length > 0 ? opts.keys : null
     const payload = JSON.stringify({ area, keys })
@@ -1984,6 +2131,7 @@ class ChromiumTab implements TabDriver {
   }
 
   async close(): Promise<void> {
+    this.recoveryHost?.onTabClosed(this)
     await this.cdp.close()
     try {
       await fetch(`http://127.0.0.1:${this.cdpPort}/json/close/${this.targetId}`)
@@ -2000,44 +2148,165 @@ export interface ChromiumLaunchOptions {
   remoteCdpPort?: number
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
+  crashRecovery?: CrashRecoveryOptions
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
   readonly kind = 'chromium' as const
-  readonly cdpPort: number
+  private _cdpPort: number
+  private preferredCdpPort?: number
+  private chromeBin: string | null
+  private profileDir: string | null
   private proc: ChildProcess | null
   private nextTabId = 1
   private trackerBlocking?: TrackerBlockingOptions
   private defaultEmulation: EmulationProfile
+  private recoveryOpts: Required<CrashRecoveryOptions>
+  private closing = false
+  private status: CrashRecoveryStatus = 'healthy'
+  private restartCount = 0
+  private consecutiveRestarts = 0
+  private totalCrashes = 0
+  private startedAt = Date.now()
+  private lastCrashAt: number | null = null
+  private lastRecoveredAt: number | null = null
+  private lastExitCode: number | null = null
+  private lastExitSignal: string | null = null
+  private lastError: string | null = null
+  private recoveryPromise: Promise<void> | null = null
+  private liveTabs = new Set<ChromiumTab>()
+  private crashListeners = new Set<(ev: CrashRecoveryEvent) => void>()
 
-  private constructor(
-    cdpPort: number,
-    proc: ChildProcess | null,
-    trackerBlocking?: TrackerBlockingOptions,
-    defaultEmulation?: EmulationProfile,
-  ) {
-    this.cdpPort = cdpPort
-    this.proc = proc
-    this.trackerBlocking = trackerBlocking
-    this.defaultEmulation = defaultEmulation ? cloneEmulationProfile(defaultEmulation) : defaultEmulationProfile()
+  private constructor(cfg: {
+    cdpPort: number
+    preferredCdpPort?: number
+    chromeBin: string | null
+    profileDir: string | null
+    proc: ChildProcess | null
+    trackerBlocking?: TrackerBlockingOptions
+    defaultEmulation?: EmulationProfile
+    crashRecovery?: CrashRecoveryOptions
+  }) {
+    this._cdpPort = cfg.cdpPort
+    this.preferredCdpPort = cfg.preferredCdpPort
+    this.chromeBin = cfg.chromeBin
+    this.profileDir = cfg.profileDir
+    this.proc = cfg.proc
+    this.trackerBlocking = cfg.trackerBlocking
+    this.defaultEmulation = cfg.defaultEmulation ? cloneEmulationProfile(cfg.defaultEmulation) : defaultEmulationProfile()
+    this.recoveryOpts = resolveCrashRecoveryOptions(cfg.crashRecovery)
+    if (this.proc) {
+      this.attachProcessExitHandler(this.proc)
+    }
   }
 
-  static async launch(opts: ChromiumLaunchOptions = {}): Promise<ChromiumBrowserEngine> {
-    const initialEmulation = resolveEmulationProfile(opts.emulation)
+  get cdpPort(): number {
+    return this._cdpPort
+  }
 
-    if (opts.remoteCdpPort && opts.remoteCdpPort > 0) {
-      await waitForCdp(opts.remoteCdpPort, 5000)
-      return new ChromiumBrowserEngine(opts.remoteCdpPort, null, opts.trackerBlocking, initialEmulation)
+  get canRecover(): boolean {
+    return this.chromeBin !== null && this.profileDir !== null
+  }
+
+  getPid(): number | null {
+    return this.proc?.pid ?? null
+  }
+
+  getProfileDir(): string | null {
+    return this.profileDir
+  }
+
+  private isProcessDead(): boolean {
+    if (!this.canRecover) return false
+    if (!this.proc) return true
+    return this.proc.exitCode !== null || this.proc.signalCode !== null
+  }
+
+  onCrashRecovery(fn: (ev: CrashRecoveryEvent) => void): () => void {
+    this.crashListeners.add(fn)
+    return () => this.crashListeners.delete(fn)
+  }
+
+  private emitCrashEvent(ev: CrashRecoveryEvent): void {
+    for (const fn of this.crashListeners) {
+      try {
+        fn(ev)
+      } catch {
+        // ignore listener failure
+      }
     }
+  }
 
-    const chromeBin = opts.chromeBin || findChromeBinary()
-    if (!chromeBin) {
-      throw new Error('No Chrome/Chromium binary found. Install chromium/google-chrome or use --engine lite.')
+  getCrashRecoveryStats(): CrashRecoveryStats {
+    return {
+      enabled: this.canRecover && this.recoveryOpts.enabled,
+      canRecover: this.canRecover,
+      status: this.status,
+      pid: this.proc?.pid ?? null,
+      cdpPort: this._cdpPort,
+      profileDir: this.profileDir,
+      restartCount: this.restartCount,
+      consecutiveRestarts: this.consecutiveRestarts,
+      totalCrashes: this.totalCrashes,
+      maxRestarts: this.recoveryOpts.maxRestarts,
+      lastCrashAt: this.lastCrashAt,
+      lastRecoveredAt: this.lastRecoveredAt,
+      lastExitCode: this.lastExitCode,
+      lastExitSignal: this.lastExitSignal,
+      lastError: this.lastError,
     }
+  }
 
-    const port = opts.cdpPort && opts.cdpPort > 0 ? opts.cdpPort : await allocateFreePort()
-    const profileDir = opts.profileDir || path.join(os.tmpdir(), `troy-advanced-chrome-${process.pid}`)
+  private attachProcessExitHandler(proc: ChildProcess): void {
+    proc.once('exit', (code, signal) => {
+      this.handleProcessExit(proc, code, signal)
+    })
+  }
+
+  private handleProcessExit(exitedProc: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.closing || this.proc !== exitedProc) return
+    this.totalCrashes += 1
+    this.lastCrashAt = Date.now()
+    this.lastExitCode = code
+    this.lastExitSignal = signal
+    this.status = 'crashed'
+    this.emitCrashEvent({
+      kind: 'chromium_crashed',
+      ts: this.lastCrashAt,
+      pid: exitedProc.pid,
+      exitCode: code,
+      signal,
+      restartCount: this.restartCount,
+      maxRestarts: this.recoveryOpts.maxRestarts,
+      cdpPort: this._cdpPort,
+      profileDir: this.profileDir ?? undefined,
+    })
+
+    if (this.recoveryOpts.enabled && this.canRecover) {
+      void this.recover().catch(() => {
+        // Error recorded in stats and emitted via chromium_recovery_failed
+      })
+    }
+  }
+
+  private static async spawnChromiumProcess(
+    chromeBin: string,
+    profileDir: string,
+    viewport: { width: number; height: number },
+    preferredPort?: number,
+    cleanLocks = false,
+  ): Promise<{ proc: ChildProcess; port: number }> {
     fs.mkdirSync(profileDir, { recursive: true })
+    if (cleanLocks) {
+      cleanupStaleProfileLocks(profileDir)
+    }
+
+    let port: number
+    if (preferredPort && preferredPort > 0 && (await isPortAvailable(preferredPort))) {
+      port = preferredPort
+    } else {
+      port = await allocateFreePort()
+    }
 
     const args = [
       '--headless=new',
@@ -2051,7 +2320,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       '--disable-sync',
       '--no-first-run',
       '--no-default-browser-check',
-      `--window-size=${initialEmulation.viewport.width},${initialEmulation.viewport.height}`,
+      `--window-size=${viewport.width},${viewport.height}`,
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
       'about:blank',
@@ -2070,11 +2339,223 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     try {
       await waitForCdp(port, 15000)
     } catch (err) {
-      proc.kill('SIGTERM')
+      try {
+        proc.kill('SIGTERM')
+      } catch {
+        // ignore
+      }
       throw new Error(`${(err as Error).message}${stderrTail ? `\nChrome stderr: ${stderrTail}` : ''}`)
     }
 
-    return new ChromiumBrowserEngine(port, proc, opts.trackerBlocking, initialEmulation)
+    return { proc, port }
+  }
+
+  static async launch(opts: ChromiumLaunchOptions = {}): Promise<ChromiumBrowserEngine> {
+    const initialEmulation = resolveEmulationProfile(opts.emulation)
+
+    if (opts.remoteCdpPort && opts.remoteCdpPort > 0) {
+      await waitForCdp(opts.remoteCdpPort, 5000)
+      return new ChromiumBrowserEngine({
+        cdpPort: opts.remoteCdpPort,
+        chromeBin: null,
+        profileDir: null,
+        proc: null,
+        trackerBlocking: opts.trackerBlocking,
+        defaultEmulation: initialEmulation,
+        crashRecovery: { ...opts.crashRecovery, enabled: false },
+      })
+    }
+
+    const chromeBin = opts.chromeBin || findChromeBinary()
+    if (!chromeBin) {
+      throw new Error('No Chrome/Chromium binary found. Install chromium/google-chrome or use --engine lite.')
+    }
+
+    const profileDir = opts.profileDir || path.join(os.tmpdir(), `troy-advanced-chrome-${process.pid}`)
+    const preferredCdpPort = opts.cdpPort && opts.cdpPort > 0 ? opts.cdpPort : undefined
+    const { proc, port } = await ChromiumBrowserEngine.spawnChromiumProcess(
+      chromeBin,
+      profileDir,
+      initialEmulation.viewport,
+      preferredCdpPort,
+      false,
+    )
+
+    return new ChromiumBrowserEngine({
+      cdpPort: port,
+      preferredCdpPort,
+      chromeBin,
+      profileDir,
+      proc,
+      trackerBlocking: opts.trackerBlocking,
+      defaultEmulation: initialEmulation,
+      crashRecovery: opts.crashRecovery,
+    })
+  }
+
+  async recover(): Promise<void> {
+    if (this.closing) return
+    if (this.recoveryPromise) return this.recoveryPromise
+    if (!this.canRecover || !this.recoveryOpts.enabled) {
+      this.status = 'failed'
+      this.lastError = 'Chromium crash recovery is disabled'
+      throw new Error(this.lastError)
+    }
+
+    this.recoveryPromise = this.performRecovery().finally(() => {
+      this.recoveryPromise = null
+    })
+    return this.recoveryPromise
+  }
+
+  private async performRecovery(): Promise<void> {
+    const healthySince = this.lastRecoveredAt ?? this.startedAt
+    if (this.recoveryOpts.resetWindowMs > 0 && Date.now() - healthySince >= this.recoveryOpts.resetWindowMs) {
+      this.consecutiveRestarts = 0
+    }
+
+    if (this.consecutiveRestarts >= this.recoveryOpts.maxRestarts) {
+      this.status = 'failed'
+      this.lastError = `Chromium exceeded max crash restarts (${this.recoveryOpts.maxRestarts})`
+      this.emitCrashEvent({
+        kind: 'chromium_recovery_failed',
+        ts: Date.now(),
+        restartCount: this.restartCount,
+        maxRestarts: this.recoveryOpts.maxRestarts,
+        cdpPort: this._cdpPort,
+        profileDir: this.profileDir ?? undefined,
+        error: this.lastError,
+      })
+      throw new Error(this.lastError)
+    }
+
+    const attempt = this.consecutiveRestarts
+    this.status = 'recovering'
+    this.emitCrashEvent({
+      kind: 'chromium_relaunching',
+      ts: Date.now(),
+      restartCount: this.restartCount,
+      maxRestarts: this.recoveryOpts.maxRestarts,
+      cdpPort: this._cdpPort,
+      profileDir: this.profileDir ?? undefined,
+    })
+
+    const delayMs = computeRecoveryBackoffMs(attempt, this.recoveryOpts)
+    if (delayMs > 0) {
+      await new Promise((r) => setTimeout(r, delayMs))
+    }
+    if (this.closing) return
+
+    try {
+      const { proc: nextProc, port: nextPort } = await ChromiumBrowserEngine.spawnChromiumProcess(
+        this.chromeBin!,
+        this.profileDir!,
+        this.defaultEmulation.viewport,
+        this.preferredCdpPort,
+        true,
+      )
+
+      if (this.closing) {
+        try {
+          nextProc.kill('SIGTERM')
+        } catch {
+          // ignore
+        }
+        return
+      }
+
+      this.proc = nextProc
+      this._cdpPort = nextPort
+      this.attachProcessExitHandler(nextProc)
+
+      let restoredTabs = 0
+      for (const tab of [...this.liveTabs]) {
+        if (this.closing) break
+        const target = await this.openNewTarget(this._cdpPort)
+        const cdp = await CdpClient.connect(target.webSocketDebuggerUrl)
+        const restored = await tab.reattach(target.id, cdp, this._cdpPort, {
+          restoreUrl: this.recoveryOpts.restoreTabs,
+        })
+        if (restored) restoredTabs += 1
+      }
+
+      this.restartCount += 1
+      this.consecutiveRestarts += 1
+      this.lastRecoveredAt = Date.now()
+      this.lastError = null
+      this.status = 'healthy'
+
+      this.emitCrashEvent({
+        kind: 'chromium_recovered',
+        ts: this.lastRecoveredAt,
+        pid: nextProc.pid,
+        restartCount: this.restartCount,
+        maxRestarts: this.recoveryOpts.maxRestarts,
+        cdpPort: this._cdpPort,
+        profileDir: this.profileDir ?? undefined,
+        restoredTabs,
+      })
+    } catch (err) {
+      this.consecutiveRestarts += 1
+      this.status = 'failed'
+      this.lastError = String((err as Error)?.message ?? err)
+      this.emitCrashEvent({
+        kind: 'chromium_recovery_failed',
+        ts: Date.now(),
+        restartCount: this.restartCount,
+        maxRestarts: this.recoveryOpts.maxRestarts,
+        cdpPort: this._cdpPort,
+        profileDir: this.profileDir ?? undefined,
+        error: this.lastError,
+      })
+      throw err
+    }
+  }
+
+  async ensureReady(): Promise<void> {
+    if (this.closing) {
+      throw new Error('Chromium engine is closed')
+    }
+    if (this.recoveryPromise) {
+      await this.recoveryPromise
+      return
+    }
+    if (this.status === 'crashed' || this.isProcessDead()) {
+      await this.recover()
+      return
+    }
+    if (this.status === 'failed') {
+      throw new Error(this.lastError ?? 'Chromium crash recovery failed')
+    }
+  }
+
+  async withRecovery<T>(fn: () => Promise<T>): Promise<T> {
+    await this.ensureReady()
+    try {
+      return await fn()
+    } catch (err) {
+      if (!this.closing && this.canRecover && this.recoveryOpts.enabled && isCdpDisconnectError(err)) {
+        if (!this.recoveryPromise && this.status === 'healthy' && !this.isProcessDead()) {
+          // Give the child process exit event a brief moment to propagate
+          await new Promise((r) => setTimeout(r, 100))
+        }
+        if (this.recoveryPromise || this.status === 'crashed' || this.isProcessDead()) {
+          await this.recover()
+          return await fn()
+        }
+      }
+      throw err
+    }
+  }
+
+  private async openNewTarget(port: number): Promise<{ id: string; webSocketDebuggerUrl: string }> {
+    const res = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' }).catch(() =>
+      fetch(`http://127.0.0.1:${port}/json/new?about:blank`),
+    )
+    if (!res.ok) {
+      throw new Error(`Failed to open Chromium tab (HTTP ${res.status})`)
+    }
+    return (await res.json()) as { id: string; webSocketDebuggerUrl: string }
   }
 
   getDefaultEmulation(): EmulationProfile {
@@ -2087,23 +2568,27 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   }
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
-    const res = await fetch(`http://127.0.0.1:${this.cdpPort}/json/new?about:blank`, { method: 'PUT' }).catch(() =>
-      fetch(`http://127.0.0.1:${this.cdpPort}/json/new?about:blank`),
-    )
-    if (!res.ok) {
-      throw new Error(`Failed to open Chromium tab (HTTP ${res.status})`)
-    }
-    const target = (await res.json()) as { id: string; webSocketDebuggerUrl: string }
-    const cdp = await CdpClient.connect(target.webSocketDebuggerUrl)
-    const tab = new ChromiumTab(
-      this.nextTabId++,
-      target.id,
-      cdp,
-      this.cdpPort,
-      this.trackerBlocking,
-      this.defaultEmulation,
-    )
-    await tab.init()
+    const tab = await this.withRecovery(async () => {
+      const target = await this.openNewTarget(this._cdpPort)
+      const cdp = await CdpClient.connect(target.webSocketDebuggerUrl)
+      const created = new ChromiumTab(
+        this.nextTabId++,
+        target.id,
+        cdp,
+        this._cdpPort,
+        this.trackerBlocking,
+        this.defaultEmulation,
+        {
+          withRecovery: (fn) => this.withRecovery(fn),
+          onTabClosed: (t) => {
+            this.liveTabs.delete(t)
+          },
+        },
+      )
+      await created.init()
+      this.liveTabs.add(created)
+      return created
+    })
     if (initialUrl) {
       await tab.navigate(initialUrl)
     }
@@ -2111,20 +2596,22 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   }
 
   private async withBrowserCdp<T>(fn: (cdp: CdpClient) => Promise<T>): Promise<T> {
-    const res = await fetch(`http://127.0.0.1:${this.cdpPort}/json/version`)
-    if (!res.ok) {
-      throw new Error(`Failed to query Chromium CDP version (HTTP ${res.status})`)
-    }
-    const info = (await res.json()) as { webSocketDebuggerUrl?: string }
-    if (!info.webSocketDebuggerUrl) {
-      throw new Error('Chromium /json/version did not return webSocketDebuggerUrl')
-    }
-    const cdp = await CdpClient.connect(info.webSocketDebuggerUrl)
-    try {
-      return await fn(cdp)
-    } finally {
-      await cdp.close()
-    }
+    return this.withRecovery(async () => {
+      const res = await fetch(`http://127.0.0.1:${this._cdpPort}/json/version`)
+      if (!res.ok) {
+        throw new Error(`Failed to query Chromium CDP version (HTTP ${res.status})`)
+      }
+      const info = (await res.json()) as { webSocketDebuggerUrl?: string }
+      if (!info.webSocketDebuggerUrl) {
+        throw new Error('Chromium /json/version did not return webSocketDebuggerUrl')
+      }
+      const cdp = await CdpClient.connect(info.webSocketDebuggerUrl)
+      try {
+        return await fn(cdp)
+      } finally {
+        await cdp.close()
+      }
+    })
   }
 
   async exportCookies(opts: CookieExportOptions = {}): Promise<BrowserCookie[]> {
@@ -2207,10 +2694,15 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   }
 
   async close(): Promise<void> {
-    if (this.proc && !this.proc.killed) {
+    this.closing = true
+    this.status = 'closed'
+    this.liveTabs.clear()
+    if (this.proc && !this.proc.killed && this.proc.exitCode === null && this.proc.signalCode === null) {
       this.proc.kill('SIGTERM')
       await new Promise((r) => setTimeout(r, 200))
-      if (!this.proc.killed) this.proc.kill('SIGKILL')
+      if (!this.proc.killed && this.proc.exitCode === null && this.proc.signalCode === null) {
+        this.proc.kill('SIGKILL')
+      }
     }
   }
 }

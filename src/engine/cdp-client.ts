@@ -145,6 +145,10 @@ export class CdpClient {
     return this.send<T>(method, params, timeoutMs, sessionId)
   }
 
+  isClosed(): boolean {
+    return this.closed
+  }
+
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
