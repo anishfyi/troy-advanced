@@ -11,6 +11,9 @@ import type {
   CookieExportOptions,
   CookieImportResult,
   ElementDescriptor,
+  EmulationOptions,
+  EmulationProfile,
+  EmulationUpdateMode,
   EngineKind,
   MarkdownRenderOptions,
   OriginStorageSnapshot,
@@ -49,6 +52,11 @@ import {
 import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
+import {
+  defaultEmulationProfile,
+  formatEmulationAscii,
+  redactHeaders,
+} from './emulation.js'
 import {
   countStorageKeys,
   filterStorageSnapshots,
@@ -93,6 +101,7 @@ export interface BrowserManagerOptions {
   memoryEnabled?: boolean
   chromeBin?: string
   trackerBlocking?: TrackerBlockingOptions
+  emulation?: EmulationOptions
 }
 
 export class BrowserManager {
@@ -117,7 +126,7 @@ export class BrowserManager {
     let engine: BrowserEngine
     const requested = opts.engine ?? 'auto'
     if (requested === 'lite') {
-      engine = new LiteBrowserEngine()
+      engine = new LiteBrowserEngine({ emulation: opts.emulation })
     } else if (requested === 'chromium') {
       engine = await ChromiumBrowserEngine.launch({
         chromeBin: opts.chromeBin,
@@ -125,6 +134,7 @@ export class BrowserManager {
         remoteCdpPort: opts.remoteCdpPort,
         profileDir: path.join(profileDir, 'chrome-data'),
         trackerBlocking: opts.trackerBlocking,
+        emulation: opts.emulation,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -136,12 +146,13 @@ export class BrowserManager {
             remoteCdpPort: opts.remoteCdpPort,
             profileDir: path.join(profileDir, 'chrome-data'),
             trackerBlocking: opts.trackerBlocking,
+            emulation: opts.emulation,
           })
         } catch {
-          engine = new LiteBrowserEngine()
+          engine = new LiteBrowserEngine({ emulation: opts.emulation })
         }
       } else {
-        engine = new LiteBrowserEngine()
+        engine = new LiteBrowserEngine({ emulation: opts.emulation })
       }
     }
 
@@ -1172,6 +1183,43 @@ export class BrowserManager {
         return { ok: true, results }
       }
 
+      case 'page_emulate': {
+        const hasUpdate =
+          args.viewport !== undefined ||
+          args.userAgent !== undefined ||
+          args.acceptLanguage !== undefined ||
+          args.platform !== undefined ||
+          args.extraHeaders !== undefined ||
+          args.headers !== undefined ||
+          Boolean(args.clearHeaders) ||
+          (Array.isArray(args.removeHeaders) && args.removeHeaders.length > 0)
+
+        if (!hasUpdate) {
+          return this.getEmulation(session.driver.id, { revealHeaders: Boolean(args.revealHeaders) })
+        }
+
+        const extraHeaders =
+          (typeof args.extraHeaders === 'object' && args.extraHeaders !== null
+            ? (args.extraHeaders as Record<string, string>)
+            : typeof args.headers === 'object' && args.headers !== null
+              ? (args.headers as Record<string, string>)
+              : undefined)
+
+        return this.setEmulation({
+          tabId: args.allTabs ? undefined : session.driver.id,
+          allTabs: Boolean(args.allTabs),
+          viewport: args.viewport as EmulationOptions['viewport'],
+          userAgent: typeof args.userAgent === 'string' ? args.userAgent : undefined,
+          acceptLanguage: typeof args.acceptLanguage === 'string' ? args.acceptLanguage : undefined,
+          platform: typeof args.platform === 'string' ? args.platform : undefined,
+          extraHeaders,
+          mergeHeaders: typeof args.mergeHeaders === 'boolean' ? args.mergeHeaders : undefined,
+          clearHeaders: Boolean(args.clearHeaders),
+          removeHeaders: Array.isArray(args.removeHeaders) ? args.removeHeaders.map(String) : undefined,
+          revealHeaders: Boolean(args.revealHeaders),
+        })
+      }
+
       default:
         return { ok: false, error: `unknown tool: ${name}` }
     }
@@ -1439,6 +1487,144 @@ export class BrowserManager {
     }
     this.emit({ type: 'storage_cleared', ...result })
     return result
+  }
+
+  getEmulation(
+    tabId?: number,
+    opts: { revealHeaders?: boolean } = {},
+  ): {
+    ok: boolean
+    tabId?: number
+    emulation?: EmulationProfile
+    defaultEmulation?: EmulationProfile
+    ascii?: string
+    error?: string
+  } {
+    const defaultProfile = this.engine.getDefaultEmulation
+      ? this.engine.getDefaultEmulation()
+      : defaultEmulationProfile()
+    const reveal = Boolean(opts.revealHeaders)
+
+    const maskProfile = (p: EmulationProfile): EmulationProfile => ({
+      ...p,
+      viewport: { ...p.viewport },
+      extraHeaders: redactHeaders(p.extraHeaders, reveal),
+    })
+
+    if (tabId !== undefined) {
+      const session = this.tabs.get(tabId)
+      if (!session) return { ok: false, error: `no tab ${tabId}` }
+      const prof = session.driver.getEmulation()
+      return {
+        ok: true,
+        tabId: session.driver.id,
+        emulation: maskProfile(prof),
+        defaultEmulation: maskProfile(defaultProfile),
+        ascii: formatEmulationAscii(prof, { revealHeaders: reveal, tabId: session.driver.id }),
+      }
+    }
+
+    const active = this.resolveSession()
+    if (active) {
+      const prof = active.driver.getEmulation()
+      return {
+        ok: true,
+        tabId: active.driver.id,
+        emulation: maskProfile(prof),
+        defaultEmulation: maskProfile(defaultProfile),
+        ascii: formatEmulationAscii(prof, { revealHeaders: reveal, tabId: active.driver.id }),
+      }
+    }
+
+    return {
+      ok: true,
+      emulation: maskProfile(defaultProfile),
+      defaultEmulation: maskProfile(defaultProfile),
+      ascii: formatEmulationAscii(defaultProfile, { revealHeaders: reveal }),
+    }
+  }
+
+  async setEmulation(
+    opts: EmulationOptions &
+      EmulationUpdateMode & {
+        tabId?: number
+        allTabs?: boolean
+        revealHeaders?: boolean
+      },
+  ): Promise<{
+    ok: boolean
+    tabId?: number
+    updatedTabs?: number[]
+    emulation?: EmulationProfile
+    ascii?: string
+    error?: string
+  }> {
+    const emuOpts: EmulationOptions = {
+      viewport: opts.viewport,
+      userAgent: opts.userAgent,
+      acceptLanguage: opts.acceptLanguage,
+      platform: opts.platform,
+      extraHeaders: opts.extraHeaders,
+    }
+    const mode: EmulationUpdateMode = {
+      mergeHeaders: opts.mergeHeaders,
+      clearHeaders: opts.clearHeaders,
+      removeHeaders: opts.removeHeaders,
+    }
+    const reveal = Boolean(opts.revealHeaders)
+    const maskProfile = (p: EmulationProfile): EmulationProfile => ({
+      ...p,
+      viewport: { ...p.viewport },
+      extraHeaders: redactHeaders(p.extraHeaders, reveal),
+    })
+
+    try {
+      if (opts.allTabs || (opts.tabId === undefined && this.tabs.size === 0)) {
+        const defaultProf = this.engine.setDefaultEmulation
+          ? this.engine.setDefaultEmulation(emuOpts, mode)
+          : defaultEmulationProfile()
+        const updatedTabs: number[] = []
+        let lastProf = defaultProf
+        for (const session of this.tabs.values()) {
+          lastProf = await session.driver.setEmulation(emuOpts, mode)
+          updatedTabs.push(session.driver.id)
+        }
+        this.emit({
+          type: 'emulation_updated',
+          allTabs: true,
+          updatedTabs,
+          preset: lastProf.preset,
+          viewport: lastProf.viewport,
+        })
+        return {
+          ok: true,
+          updatedTabs,
+          emulation: maskProfile(lastProf),
+          ascii: formatEmulationAscii(lastProf, { revealHeaders: reveal }),
+        }
+      }
+
+      const session = this.resolveSession(opts.tabId)
+      if (!session) {
+        return { ok: false, error: opts.tabId !== undefined ? `no tab ${opts.tabId}` : 'no active tab' }
+      }
+      const updated = await session.driver.setEmulation(emuOpts, mode)
+      this.emit({
+        type: 'emulation_updated',
+        tabId: session.driver.id,
+        preset: updated.preset,
+        viewport: updated.viewport,
+      })
+      return {
+        ok: true,
+        tabId: session.driver.id,
+        updatedTabs: [session.driver.id],
+        emulation: maskProfile(updated),
+        ascii: formatEmulationAscii(updated, { revealHeaders: reveal, tabId: session.driver.id }),
+      }
+    } catch (err) {
+      return { ok: false, error: String((err as Error)?.message ?? err) }
+    }
   }
 
   async close(): Promise<void> {

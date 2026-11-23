@@ -5,7 +5,7 @@
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { parseAsciiDensity } from '../ascii/layout.js'
-import type { BrowserCookie, OriginStorageSnapshot } from '../types.js'
+import type { BrowserCookie, EmulationOptions, OriginStorageSnapshot } from '../types.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 
@@ -261,6 +261,47 @@ export async function createAgentSocket(
           keys: Array.isArray(body.keys) ? body.keys.map((k) => String(k)) : undefined,
         })
         return { status: 200, payload: { ok: true, ...result } }
+      }
+      case '/emulation': {
+        const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const hasUpdate =
+          body.viewport !== undefined ||
+          body.userAgent !== undefined ||
+          body.acceptLanguage !== undefined ||
+          body.platform !== undefined ||
+          body.extraHeaders !== undefined ||
+          body.headers !== undefined ||
+          Boolean(body.clearHeaders) ||
+          (Array.isArray(body.removeHeaders) && body.removeHeaders.length > 0)
+
+        if (!hasUpdate) {
+          return {
+            status: 200,
+            payload: manager.getEmulation(tabId, { revealHeaders: Boolean(body.revealHeaders) }),
+          }
+        }
+
+        const extraHeaders =
+          typeof body.extraHeaders === 'object' && body.extraHeaders !== null
+            ? (body.extraHeaders as Record<string, string>)
+            : typeof body.headers === 'object' && body.headers !== null
+              ? (body.headers as Record<string, string>)
+              : undefined
+
+        const result = await manager.setEmulation({
+          tabId,
+          allTabs: Boolean(body.allTabs),
+          viewport: body.viewport as EmulationOptions['viewport'],
+          userAgent: typeof body.userAgent === 'string' ? body.userAgent : undefined,
+          acceptLanguage: typeof body.acceptLanguage === 'string' ? body.acceptLanguage : undefined,
+          platform: typeof body.platform === 'string' ? body.platform : undefined,
+          extraHeaders,
+          mergeHeaders: typeof body.mergeHeaders === 'boolean' ? body.mergeHeaders : undefined,
+          clearHeaders: Boolean(body.clearHeaders),
+          removeHeaders: Array.isArray(body.removeHeaders) ? body.removeHeaders.map(String) : undefined,
+          revealHeaders: Boolean(body.revealHeaders),
+        })
+        return { status: 200, payload: result }
       }
       default:
         return { status: 404, payload: { ok: false, error: `no route ${pathname}` } }

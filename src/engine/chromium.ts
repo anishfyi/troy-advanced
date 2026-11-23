@@ -14,6 +14,9 @@ import type {
   CookieExportOptions,
   CookieImportResult,
   ElementDescriptor,
+  EmulationOptions,
+  EmulationProfile,
+  EmulationUpdateMode,
   NetworkEntry,
   OriginStorageSnapshot,
   PageSnapshot,
@@ -34,6 +37,7 @@ import {
   normalizeCookie,
   toCdpCookieParam,
 } from './cookies.js'
+import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import {
   IFRAME_OWNER_INFO_FUNCTION,
   flattenFrameSnapshots,
@@ -568,6 +572,7 @@ class ChromiumTab implements TabDriver {
   private blockedByFetch = new Map<string, string>()
   private networkIdle = new NetworkIdleTracker()
   private trackerBlocker: CdpTrackerBlocker
+  private emulation: EmulationProfile
 
   constructor(
     id: number,
@@ -575,11 +580,13 @@ class ChromiumTab implements TabDriver {
     cdp: CdpClient,
     cdpPort: number,
     trackerBlocking?: TrackerBlockingOptions,
+    initialEmulation?: EmulationProfile,
   ) {
     this.id = id
     this.targetId = targetId
     this.cdp = cdp
     this.cdpPort = cdpPort
+    this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.trackerBlocker = new CdpTrackerBlocker(cdp, trackerBlocking, {
       onBlocked: (ev) => {
         this.blockedByFetch.set(ev.url, ev.reason)
@@ -741,13 +748,8 @@ class ChromiumTab implements TabDriver {
       this.cdp.send('Runtime.enable'),
       this.cdp.send('Network.enable'),
       this.cdp.send('DOM.enable').catch(() => {}),
-      this.cdp.send('Emulation.setDeviceMetricsOverride', {
-        width: 1280,
-        height: 800,
-        deviceScaleFactor: 1,
-        mobile: false,
-      }),
     ])
+    await this.applyEmulation()
     await this.cdp
       .send('Target.setAutoAttach', {
         autoAttach: true,
@@ -756,6 +758,47 @@ class ChromiumTab implements TabDriver {
       })
       .catch(() => {})
     await this.trackerBlocker.enable()
+  }
+
+  private async applyEmulation(): Promise<void> {
+    const { viewport, userAgent, acceptLanguage, platform, extraHeaders } = this.emulation
+    const ops: Array<Promise<unknown>> = [
+      this.cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: viewport.width,
+        height: viewport.height,
+        deviceScaleFactor: viewport.deviceScaleFactor,
+        mobile: viewport.mobile,
+      }),
+      this.cdp
+        .send('Emulation.setTouchEmulationEnabled', {
+          enabled: viewport.hasTouch,
+          maxTouchPoints: viewport.hasTouch ? 5 : 1,
+        })
+        .catch(() => {}),
+      this.cdp.send('Network.setExtraHTTPHeaders', {
+        headers: extraHeaders,
+      }),
+    ]
+    if (userAgent) {
+      ops.push(
+        this.cdp.send('Network.setUserAgentOverride', {
+          userAgent,
+          ...(acceptLanguage ? { acceptLanguage } : {}),
+          ...(platform ? { platform } : {}),
+        }),
+      )
+    }
+    await Promise.all(ops)
+  }
+
+  getEmulation(): EmulationProfile {
+    return cloneEmulationProfile(this.emulation)
+  }
+
+  async setEmulation(opts: EmulationOptions, mode?: EmulationUpdateMode): Promise<EmulationProfile> {
+    this.emulation = resolveEmulationProfile(opts, this.emulation, mode)
+    await this.applyEmulation()
+    return cloneEmulationProfile(this.emulation)
   }
 
   getUrl(): string {
@@ -1956,6 +1999,7 @@ export interface ChromiumLaunchOptions {
   profileDir?: string
   remoteCdpPort?: number
   trackerBlocking?: TrackerBlockingOptions
+  emulation?: EmulationOptions
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
@@ -1964,17 +2008,26 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   private proc: ChildProcess | null
   private nextTabId = 1
   private trackerBlocking?: TrackerBlockingOptions
+  private defaultEmulation: EmulationProfile
 
-  private constructor(cdpPort: number, proc: ChildProcess | null, trackerBlocking?: TrackerBlockingOptions) {
+  private constructor(
+    cdpPort: number,
+    proc: ChildProcess | null,
+    trackerBlocking?: TrackerBlockingOptions,
+    defaultEmulation?: EmulationProfile,
+  ) {
     this.cdpPort = cdpPort
     this.proc = proc
     this.trackerBlocking = trackerBlocking
+    this.defaultEmulation = defaultEmulation ? cloneEmulationProfile(defaultEmulation) : defaultEmulationProfile()
   }
 
   static async launch(opts: ChromiumLaunchOptions = {}): Promise<ChromiumBrowserEngine> {
+    const initialEmulation = resolveEmulationProfile(opts.emulation)
+
     if (opts.remoteCdpPort && opts.remoteCdpPort > 0) {
       await waitForCdp(opts.remoteCdpPort, 5000)
-      return new ChromiumBrowserEngine(opts.remoteCdpPort, null, opts.trackerBlocking)
+      return new ChromiumBrowserEngine(opts.remoteCdpPort, null, opts.trackerBlocking, initialEmulation)
     }
 
     const chromeBin = opts.chromeBin || findChromeBinary()
@@ -1998,7 +2051,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       '--disable-sync',
       '--no-first-run',
       '--no-default-browser-check',
-      '--window-size=1280,800',
+      `--window-size=${initialEmulation.viewport.width},${initialEmulation.viewport.height}`,
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
       'about:blank',
@@ -2021,7 +2074,16 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       throw new Error(`${(err as Error).message}${stderrTail ? `\nChrome stderr: ${stderrTail}` : ''}`)
     }
 
-    return new ChromiumBrowserEngine(port, proc, opts.trackerBlocking)
+    return new ChromiumBrowserEngine(port, proc, opts.trackerBlocking, initialEmulation)
+  }
+
+  getDefaultEmulation(): EmulationProfile {
+    return cloneEmulationProfile(this.defaultEmulation)
+  }
+
+  setDefaultEmulation(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile {
+    this.defaultEmulation = resolveEmulationProfile(opts, this.defaultEmulation, mode)
+    return cloneEmulationProfile(this.defaultEmulation)
   }
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
@@ -2033,7 +2095,14 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     }
     const target = (await res.json()) as { id: string; webSocketDebuggerUrl: string }
     const cdp = await CdpClient.connect(target.webSocketDebuggerUrl)
-    const tab = new ChromiumTab(this.nextTabId++, target.id, cdp, this.cdpPort, this.trackerBlocking)
+    const tab = new ChromiumTab(
+      this.nextTabId++,
+      target.id,
+      cdp,
+      this.cdpPort,
+      this.trackerBlocking,
+      this.defaultEmulation,
+    )
     await tab.init()
     if (initialUrl) {
       await tab.navigate(initialUrl)

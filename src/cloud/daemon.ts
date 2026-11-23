@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { EngineKind, TrackerBlockingOptions } from '../types.js'
+import type { EmulationOptions, EngineKind, TrackerBlockingOptions } from '../types.js'
 import { BrowserManager } from '../engine/manager.js'
 import { createAgentSocket } from '../bridge/agent-socket.js'
 import {
@@ -25,6 +25,7 @@ export interface DaemonOptions {
   compatTroy?: boolean
   initialUrl?: string
   trackerBlocking?: TrackerBlockingOptions
+  emulation?: EmulationOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -34,6 +35,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     cdpPort: opts.cdpPort,
     remoteCdpPort: opts.remoteCdpPort,
     trackerBlocking: opts.trackerBlocking,
+    emulation: opts.emulation,
   })
 
   if (opts.initialUrl) {
@@ -115,6 +117,24 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.initialUrl) args.push('--url', opts.initialUrl)
   if (opts.trackerBlocking?.enabled === false) args.push('--no-block-trackers')
   if (opts.trackerBlocking?.mode) args.push('--tracker-mode', opts.trackerBlocking.mode)
+  if (opts.emulation?.viewport) {
+    const vp = opts.emulation.viewport
+    if (typeof vp === 'string') {
+      args.push('--viewport', vp)
+    } else if (typeof vp === 'object') {
+      const scale = vp.deviceScaleFactor && vp.deviceScaleFactor !== 1 ? `@${vp.deviceScaleFactor}` : ''
+      const mob = vp.mobile ? 'm' : ''
+      args.push('--viewport', `${vp.width}x${vp.height}${scale}${mob}`)
+    }
+  }
+  if (opts.emulation?.userAgent) args.push('--user-agent', opts.emulation.userAgent)
+  if (opts.emulation?.acceptLanguage) args.push('--accept-language', opts.emulation.acceptLanguage)
+  if (opts.emulation?.platform) args.push('--platform', opts.emulation.platform)
+  if (opts.emulation?.extraHeaders) {
+    for (const [k, v] of Object.entries(opts.emulation.extraHeaders)) {
+      args.push('--header', `${k}: ${v}`)
+    }
+  }
 
   const child = spawn(process.execPath, args, {
     detached: true,

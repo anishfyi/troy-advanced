@@ -4,6 +4,9 @@ import type {
   ConsoleEntry,
   CookieExportOptions,
   CookieImportResult,
+  EmulationOptions,
+  EmulationProfile,
+  EmulationUpdateMode,
   NetworkEntry,
   OriginStorageSnapshot,
   PageSnapshot,
@@ -49,6 +52,8 @@ export interface TabDriver {
     removedLocal: number
     removedSession: number
   }>
+  getEmulation(): EmulationProfile
+  setEmulation(opts: EmulationOptions, mode?: EmulationUpdateMode): Promise<EmulationProfile>
   close(): Promise<void>
 }
 
@@ -56,6 +61,8 @@ export interface BrowserEngine {
   readonly kind: 'chromium' | 'lite'
   readonly cdpPort: number
   createTab(initialUrl?: string): Promise<TabDriver>
+  getDefaultEmulation?(): EmulationProfile
+  setDefaultEmulation?(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile
   exportCookies(opts?: CookieExportOptions): Promise<BrowserCookie[]>
   importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult>
   clearCookies?(opts?: { domain?: string }): Promise<number>

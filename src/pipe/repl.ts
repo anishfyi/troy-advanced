@@ -5,6 +5,7 @@
 
 import readline from 'node:readline'
 import type { BrowserManager } from '../engine/manager.js'
+import { parseHeaderList } from '../engine/emulation.js'
 
 function tokenizePipeArgs(input: string): string[] {
   const tokens: string[] = []
@@ -284,6 +285,65 @@ export async function executePipeCommand(
       return {
         output: format(manager.memory ? { ok: true, ...manager.memory.recall(argStr) } : { ok: false, error: 'memory disabled' }),
       }
+    case 'emulate':
+    case 'viewport': {
+      const tokens = tokenizePipeArgs(argStr)
+      let viewport: string | undefined
+      let userAgent: string | undefined
+      let acceptLanguage: string | undefined
+      let platform: string | undefined
+      const rawHeaders: string[] = []
+      const removeHeaders: string[] = []
+      let clearHeaders = false
+      let allTabs = false
+      let revealHeaders = false
+
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if ((tok === '--viewport' || tok === '-v') && tokens[i + 1] !== undefined) viewport = tokens[++i]
+        else if (tok.startsWith('--viewport=')) viewport = tok.slice('--viewport='.length)
+        else if ((tok === '--user-agent' || tok === '--ua') && tokens[i + 1] !== undefined) userAgent = tokens[++i]
+        else if (tok.startsWith('--user-agent=')) userAgent = tok.slice('--user-agent='.length)
+        else if (tok.startsWith('--ua=')) userAgent = tok.slice('--ua='.length)
+        else if (tok === '--accept-language' && tokens[i + 1] !== undefined) acceptLanguage = tokens[++i]
+        else if (tok.startsWith('--accept-language=')) acceptLanguage = tok.slice('--accept-language='.length)
+        else if (tok === '--platform' && tokens[i + 1] !== undefined) platform = tokens[++i]
+        else if (tok.startsWith('--platform=')) platform = tok.slice('--platform='.length)
+        else if ((tok === '--header' || tok === '-H') && tokens[i + 1] !== undefined) rawHeaders.push(tokens[++i]!)
+        else if (tok.startsWith('--header=')) rawHeaders.push(tok.slice('--header='.length))
+        else if (tok === '--remove-header' && tokens[i + 1] !== undefined) removeHeaders.push(tokens[++i]!)
+        else if (tok.startsWith('--remove-header=')) removeHeaders.push(tok.slice('--remove-header='.length))
+        else if (tok === '--clear-headers') clearHeaders = true
+        else if (tok === '--all-tabs') allTabs = true
+        else if (tok === '--reveal') revealHeaders = true
+        else if (!tok.startsWith('-') && viewport === undefined) viewport = tok
+      }
+
+      const extraHeaders = rawHeaders.length > 0 ? parseHeaderList(rawHeaders) : undefined
+      const hasUpdate =
+        viewport !== undefined ||
+        userAgent !== undefined ||
+        acceptLanguage !== undefined ||
+        platform !== undefined ||
+        extraHeaders !== undefined ||
+        clearHeaders ||
+        removeHeaders.length > 0
+
+      const res = hasUpdate
+        ? await manager.setEmulation({
+            allTabs,
+            viewport,
+            userAgent,
+            acceptLanguage,
+            platform,
+            extraHeaders,
+            clearHeaders,
+            removeHeaders: removeHeaders.length > 0 ? removeHeaders : undefined,
+            revealHeaders,
+          })
+        : manager.getEmulation(undefined, { revealHeaders })
+      return { output: format(res) }
+    }
     default:
       return { output: opts.jsonMode ? JSON.stringify({ ok: false, error: `unknown command: ${verb}` }) : `ERR: unknown command "${verb}" (try "help")` }
   }

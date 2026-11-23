@@ -150,6 +150,38 @@ const MCP_TOOLS = [
       required: ['query'],
     },
   },
+  {
+    name: 'troy_emulate',
+    description:
+      'Inspect or configure viewport presets (desktop, mobile, terminal, or custom WxH), User-Agent, Accept-Language, platform, and custom HTTP headers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        allTabs: { type: 'boolean', description: 'Apply to engine defaults and all open tabs' },
+        viewport: {
+          type: 'string',
+          description: 'Viewport preset ("desktop", "mobile", "terminal") or custom "WxH" (e.g. "1440x900", "390x844@3m")',
+        },
+        userAgent: { type: 'string', description: 'Custom User-Agent header & navigator.userAgent override' },
+        acceptLanguage: { type: 'string', description: 'Custom Accept-Language override (e.g. "en-US,en;q=0.9")' },
+        platform: { type: 'string', description: 'Optional navigator.platform override' },
+        extraHeaders: {
+          type: 'object',
+          description: 'Custom HTTP headers object sent on every request',
+          additionalProperties: { type: 'string' },
+        },
+        mergeHeaders: { type: 'boolean', description: 'Merge with existing custom headers (default: true)' },
+        clearHeaders: { type: 'boolean', description: 'Clear existing custom headers before applying new ones' },
+        removeHeaders: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Header names to remove',
+        },
+        revealHeaders: { type: 'boolean', description: 'Include unmasked sensitive header values in output' },
+      },
+    },
+  },
 ]
 
 export async function handleMcpRequest(
@@ -269,6 +301,40 @@ export async function handleMcpRequest(
             }
           : { ok: false, error: 'memory disabled' }
         break
+      case 'troy_emulate': {
+        const hasUpdate =
+          args.viewport !== undefined ||
+          args.userAgent !== undefined ||
+          args.acceptLanguage !== undefined ||
+          args.platform !== undefined ||
+          args.extraHeaders !== undefined ||
+          args.headers !== undefined ||
+          Boolean(args.clearHeaders) ||
+          (Array.isArray(args.removeHeaders) && args.removeHeaders.length > 0)
+        if (!hasUpdate) {
+          result = manager.getEmulation(tabId, { revealHeaders: Boolean(args.revealHeaders) })
+        } else {
+          result = await manager.setEmulation({
+            tabId,
+            allTabs: Boolean(args.allTabs),
+            viewport: typeof args.viewport === 'string' ? args.viewport : undefined,
+            userAgent: typeof args.userAgent === 'string' ? args.userAgent : undefined,
+            acceptLanguage: typeof args.acceptLanguage === 'string' ? args.acceptLanguage : undefined,
+            platform: typeof args.platform === 'string' ? args.platform : undefined,
+            extraHeaders:
+              typeof args.extraHeaders === 'object' && args.extraHeaders !== null
+                ? (args.extraHeaders as Record<string, string>)
+                : typeof args.headers === 'object' && args.headers !== null
+                  ? (args.headers as Record<string, string>)
+                  : undefined,
+            mergeHeaders: typeof args.mergeHeaders === 'boolean' ? args.mergeHeaders : undefined,
+            clearHeaders: Boolean(args.clearHeaders),
+            removeHeaders: Array.isArray(args.removeHeaders) ? args.removeHeaders.map(String) : undefined,
+            revealHeaders: Boolean(args.revealHeaders),
+          })
+        }
+        break
+      }
       default:
         return {
           jsonrpc: '2.0',

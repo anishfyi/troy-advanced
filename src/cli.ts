@@ -2,8 +2,16 @@
 
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import type { BrowserCookie, EngineKind, OriginStorageSnapshot, TrackerBlockingOptions, TrackerBlockMode } from './types.js'
+import type {
+  BrowserCookie,
+  EmulationOptions,
+  EngineKind,
+  OriginStorageSnapshot,
+  TrackerBlockingOptions,
+  TrackerBlockMode,
+} from './types.js'
 import { BrowserManager } from './engine/manager.js'
+import { parseHeaderList } from './engine/emulation.js'
 import {
   filterCookies,
   parseCookieBundle,
@@ -79,9 +87,11 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Import plain or AES-256-GCM encrypted web storage into daemon or profile
   storage clear [--origin <origin|host>] [--area local|session|both] [--keys k1,k2]
                                           Clear localStorage/sessionStorage from daemon or profile
+  emulate [desktop|mobile|terminal|WxH] [--user-agent <ua>] [--accept-language <lang>] [--platform <p>] [--header "K: V"] [--remove-header <k>] [--clear-headers] [--all-tabs] [--reveal]
+                                          Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --json  --ascii  --width <n>
+  --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -117,7 +127,16 @@ const VALUE_FLAGS = new Set([
   '--area',
   '--prefix',
   '--keys',
+  '--viewport',
+  '--user-agent',
+  '--ua',
+  '--accept-language',
+  '--platform',
+  '--header',
+  '--remove-header',
 ])
+
+const REPEATABLE_FLAGS = new Set(['--header', '--remove-header'])
 
 async function readStdinUtf8(): Promise<string> {
   const chunks: Buffer[] = []
@@ -130,18 +149,35 @@ async function readStdinUtf8(): Promise<string> {
 function parseArgv(argv: string[]) {
   const positional: string[] = []
   const flags: Record<string, string | boolean> = {}
+  const multiFlags: Record<string, string[]> = {}
+  const pushMulti = (key: string, val: string) => {
+    if (!multiFlags[key]) multiFlags[key] = []
+    multiFlags[key]!.push(val)
+    flags[key] = val
+  }
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i]!
     if (tok === '--') {
       positional.push(...argv.slice(i + 1))
       break
     }
+    if (tok === '-H' && i + 1 < argv.length) {
+      pushMulti('header', argv[++i]!)
+      continue
+    }
     if (tok.startsWith('--')) {
       const eq = tok.indexOf('=')
       if (eq > 0) {
-        flags[tok.slice(2, eq)] = tok.slice(eq + 1)
+        const flagName = tok.slice(0, eq)
+        const key = tok.slice(2, eq)
+        const val = tok.slice(eq + 1)
+        if (REPEATABLE_FLAGS.has(flagName)) pushMulti(key, val)
+        else flags[key] = val
       } else if (VALUE_FLAGS.has(tok) && i + 1 < argv.length) {
-        flags[tok.slice(2)] = argv[++i]!
+        const key = tok.slice(2)
+        const val = argv[++i]!
+        if (REPEATABLE_FLAGS.has(tok)) pushMulti(key, val)
+        else flags[key] = val
       } else {
         flags[tok.slice(2)] = true
       }
@@ -149,7 +185,7 @@ function parseArgv(argv: string[]) {
       positional.push(tok)
     }
   }
-  return { positional, flags }
+  return { positional, flags, multiFlags }
 }
 
 async function callDaemon(
@@ -166,7 +202,7 @@ async function callDaemon(
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
-  const { positional, flags } = parseArgv(argv)
+  const { positional, flags, multiFlags } = parseArgv(argv)
   const cmd = positional[0]
 
   if (!cmd || cmd === 'help' || flags.help) {
@@ -181,6 +217,27 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       ? {
           enabled: !flags['no-block-trackers'],
           mode: typeof flags['tracker-mode'] === 'string' ? (flags['tracker-mode'] as TrackerBlockMode) : undefined,
+        }
+      : undefined
+  const rawHeaderArgs = multiFlags.header ?? []
+  const cliUserAgent =
+    typeof flags['user-agent'] === 'string'
+      ? flags['user-agent']
+      : typeof flags.ua === 'string'
+        ? flags.ua
+        : undefined
+  const cliEmulation: EmulationOptions | undefined =
+    typeof flags.viewport === 'string' ||
+    cliUserAgent !== undefined ||
+    typeof flags['accept-language'] === 'string' ||
+    typeof flags.platform === 'string' ||
+    rawHeaderArgs.length > 0
+      ? {
+          ...(typeof flags.viewport === 'string' ? { viewport: flags.viewport } : {}),
+          ...(cliUserAgent !== undefined ? { userAgent: cliUserAgent } : {}),
+          ...(typeof flags['accept-language'] === 'string' ? { acceptLanguage: flags['accept-language'] } : {}),
+          ...(typeof flags.platform === 'string' ? { platform: flags.platform } : {}),
+          ...(rawHeaderArgs.length > 0 ? { extraHeaders: parseHeaderList(rawHeaderArgs) } : {}),
         }
       : undefined
 
@@ -225,6 +282,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       compatTroy: Boolean(flags['compat-troy']),
       initialUrl: typeof flags.url === 'string' ? flags.url : undefined,
       trackerBlocking,
+      emulation: cliEmulation,
     }
 
     if (sub === 'run') {
@@ -260,6 +318,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
       trackerBlocking,
+      emulation: cliEmulation,
     })
     try {
       await runTerminalBrowser(manager, {
@@ -278,6 +337,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
       trackerBlocking,
+      emulation: cliEmulation,
     })
     try {
       await runMcpStdioServer(manager)
@@ -293,6 +353,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
       remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
       trackerBlocking,
+      emulation: cliEmulation,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -754,7 +815,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   // One-shot ASCII / Markdown / Visual fetch without needing a running daemon
   if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md') && positional[1] && !readLiveEndpoint(endpointFlag)) {
-    const manager = await BrowserManager.create({ engine, trackerBlocking })
+    const manager = await BrowserManager.create({ engine, trackerBlocking, emulation: cliEmulation })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })
       if (!opened.ok) {
@@ -1004,12 +1065,32 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'forget':
       res = await callDaemon(live.endpoint, '/forget', { origin: args[0] })
       break
+    case 'emulate':
+    case 'viewport': {
+      const viewportArg = typeof flags.viewport === 'string' ? flags.viewport : args[0]
+      const extraHeaders = rawHeaderArgs.length > 0 ? parseHeaderList(rawHeaderArgs) : undefined
+      const removeHeaders = multiFlags['remove-header']
+      res = await callDaemon(live.endpoint, '/emulation', {
+        tabId,
+        allTabs: Boolean(flags['all-tabs']),
+        ...(viewportArg !== undefined ? { viewport: viewportArg } : {}),
+        ...(cliUserAgent !== undefined ? { userAgent: cliUserAgent } : {}),
+        ...(typeof flags['accept-language'] === 'string' ? { acceptLanguage: flags['accept-language'] } : {}),
+        ...(typeof flags.platform === 'string' ? { platform: flags.platform } : {}),
+        ...(extraHeaders ? { extraHeaders } : {}),
+        ...(flags['replace-headers'] ? { mergeHeaders: false } : {}),
+        ...(flags['clear-headers'] ? { clearHeaders: true } : {}),
+        ...(removeHeaders && removeHeaders.length > 0 ? { removeHeaders } : {}),
+        revealHeaders: Boolean(flags.reveal),
+      })
+      break
+    }
     default:
       console.error(`Unknown command: ${cmd}\nRun "troy-advanced help" for usage.`)
       process.exit(1)
   }
 
-  if (!flags.json && (cmd === 'ascii' || cmd === 'visual' || flags.ascii) && typeof res.ascii === 'string') {
+  if (!flags.json && (cmd === 'ascii' || cmd === 'visual' || cmd === 'emulate' || cmd === 'viewport' || flags.ascii) && typeof res.ascii === 'string') {
     console.log(res.ascii)
   } else if (!flags.json && (cmd === 'markdown' || cmd === 'md') && typeof res.markdown === 'string') {
     console.log(res.markdown)

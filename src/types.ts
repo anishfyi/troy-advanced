@@ -423,3 +423,48 @@ export interface EncryptedStorageBundle {
   ciphertext: string
   exportedAt: string
 }
+
+export type ViewportPresetName = 'desktop' | 'mobile' | 'terminal'
+
+export interface ViewportConfig {
+  width: number
+  height: number
+  deviceScaleFactor?: number
+  mobile?: boolean
+  hasTouch?: boolean
+  preset?: ViewportPresetName | 'custom'
+}
+
+export interface EmulationProfile {
+  preset: ViewportPresetName | 'custom'
+  viewport: {
+    width: number
+    height: number
+    deviceScaleFactor: number
+    mobile: boolean
+    hasTouch: boolean
+  }
+  userAgent: string
+  acceptLanguage?: string
+  platform?: string
+  extraHeaders: Record<string, string>
+}
+
+export interface EmulationOptions {
+  /** Named preset ('desktop' | 'mobile' | 'terminal') or custom 'WxH' string (e.g. '1440x900'). */
+  viewport?: ViewportPresetName | string | ViewportConfig
+  /** Custom User-Agent string (overrides preset default UA). */
+  userAgent?: string
+  /** Optional Accept-Language override (e.g. 'en-US,en;q=0.9'). */
+  acceptLanguage?: string
+  /** Optional navigator.platform override (e.g. 'Linux x86_64', 'iPhone'). */
+  platform?: string
+  /** Custom HTTP headers sent with every request. */
+  extraHeaders?: Record<string, string>
+}
+
+export interface EmulationUpdateMode {
+  mergeHeaders?: boolean
+  clearHeaders?: boolean
+  removeHeaders?: string[]
+}

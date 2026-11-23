@@ -9,6 +9,9 @@ import type {
   CookieExportOptions,
   CookieImportResult,
   ElementDescriptor,
+  EmulationOptions,
+  EmulationProfile,
+  EmulationUpdateMode,
   FrameSummary,
   InlineLink,
   NetworkEntry,
@@ -34,6 +37,7 @@ import {
   normalizeCookie,
   parseSetCookieHeader,
 } from './cookies.js'
+import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import { flattenFrameSnapshots, prefixFrameSelector, type ChildFrameSnapshotInput } from './frames.js'
 import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
@@ -617,15 +621,27 @@ class LiteTab implements TabDriver {
   private cookies: Map<string, BrowserCookie>
   private localStorageByOrigin: Map<string, Map<string, string>>
   private sessionStorageByOrigin = new Map<string, Map<string, string>>()
+  private emulation: EmulationProfile
 
   constructor(
     id: number,
     cookies: Map<string, BrowserCookie>,
     localStorageByOrigin: Map<string, Map<string, string>>,
+    initialEmulation?: EmulationProfile,
   ) {
     this.id = id
     this.cookies = cookies
     this.localStorageByOrigin = localStorageByOrigin
+    this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
+  }
+
+  getEmulation(): EmulationProfile {
+    return cloneEmulationProfile(this.emulation)
+  }
+
+  async setEmulation(opts: EmulationOptions, mode?: EmulationUpdateMode): Promise<EmulationProfile> {
+    this.emulation = resolveEmulationProfile(opts, this.emulation, mode)
+    return cloneEmulationProfile(this.emulation)
   }
 
   getUrl(): string {
@@ -688,9 +704,19 @@ class LiteTab implements TabDriver {
     }
     this.loading = true
     const started = Date.now()
-    const headers = new Headers(init?.headers)
+    const headers = new Headers()
+    for (const [k, v] of Object.entries(this.emulation.extraHeaders)) {
+      headers.set(k, v)
+    }
+    if (init?.headers) {
+      const initHeaders = new Headers(init.headers)
+      initHeaders.forEach((v, k) => headers.set(k, v))
+    }
     if (!headers.has('user-agent')) {
-      headers.set('user-agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) TroyAdvanced/0.1 Safari/537.36')
+      headers.set('user-agent', this.emulation.userAgent)
+    }
+    if (this.emulation.acceptLanguage && !headers.has('accept-language')) {
+      headers.set('accept-language', this.emulation.acceptLanguage)
     }
     if (!headers.has('accept')) {
       headers.set('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
@@ -779,11 +805,11 @@ class LiteTab implements TabDriver {
       title: this.title,
       epoch: this.epoch,
       viewport: {
-        width: 1280,
-        height: 800,
+        width: this.emulation.viewport.width,
+        height: this.emulation.viewport.height,
         scrollX: 0,
         scrollY: this.scrollY,
-        scrollHeight: Math.max(800, this.doc.blocks.length * 40),
+        scrollHeight: Math.max(this.emulation.viewport.height, this.doc.blocks.length * 40),
       },
       blocks: this.doc.blocks.map((b) => ({ ...b })),
       elements: this.doc.elements.map((e) => ({ ...e })),
@@ -1141,15 +1167,33 @@ class LiteTab implements TabDriver {
   }
 }
 
+export interface LiteEngineOptions {
+  emulation?: EmulationOptions
+}
+
 export class LiteBrowserEngine implements BrowserEngine {
   readonly kind = 'lite' as const
   readonly cdpPort = 0
   private nextId = 1
   private cookies = new Map<string, BrowserCookie>()
   private localStorageByOrigin = new Map<string, Map<string, string>>()
+  private defaultEmulation: EmulationProfile
+
+  constructor(opts: LiteEngineOptions = {}) {
+    this.defaultEmulation = resolveEmulationProfile(opts.emulation)
+  }
+
+  getDefaultEmulation(): EmulationProfile {
+    return cloneEmulationProfile(this.defaultEmulation)
+  }
+
+  setDefaultEmulation(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile {
+    this.defaultEmulation = resolveEmulationProfile(opts, this.defaultEmulation, mode)
+    return cloneEmulationProfile(this.defaultEmulation)
+  }
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
-    const tab = new LiteTab(this.nextId++, this.cookies, this.localStorageByOrigin)
+    const tab = new LiteTab(this.nextId++, this.cookies, this.localStorageByOrigin, this.defaultEmulation)
     if (initialUrl) {
       await tab.navigate(initialUrl)
     }
