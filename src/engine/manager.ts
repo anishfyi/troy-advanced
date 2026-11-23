@@ -362,7 +362,7 @@ export class BrowserManager {
             return { ...lnk, ref: refBySelector.get(lnk.selector) }
           }
           const match = registered.find(
-            (e) => e.tag === 'a' && e.text === lnk.text && (!lnk.href || e.href === lnk.href),
+            (e) => (e.tag === 'a' || e.role === 'link') && e.text === lnk.text && (!lnk.href || e.href === lnk.href),
           )
           return match?.ref ? { ...lnk, ref: match.ref } : lnk
         })
@@ -376,7 +376,7 @@ export class BrowserManager {
       // Fallback match by text+kind for Lite engine
       if (next.kind === 'link' || next.kind === 'button' || next.kind === 'input' || next.kind === 'select') {
         const match = registered.find((e) => {
-          if (next.kind === 'link') return e.tag === 'a' && e.text === next.text && (!next.href || e.href === next.href)
+          if (next.kind === 'link') return (e.tag === 'a' || e.role === 'link') && e.text === next.text && (!next.href || e.href === next.href)
           if (next.kind === 'button') return (e.tag === 'button' || e.role === 'button') && e.text === next.text
           if (next.kind === 'select') return e.tag === 'select' && (e.label === next.text || e.text === next.text)
           return (e.tag === 'input' || e.tag === 'textarea') && (e.label === next.text || e.text === next.text)

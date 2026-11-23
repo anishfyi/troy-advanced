@@ -148,6 +148,77 @@ function containsVisibleFormControl(innerHtml: string): boolean {
   return false
 }
 
+const VOID_HTML_TAGS = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+])
+
+function getInteractiveAriaRole(roleAttr: string | undefined): 'button' | 'link' | undefined {
+  if (!roleAttr) return undefined
+  for (const token of roleAttr.trim().toLowerCase().split(/\s+/)) {
+    if (token === 'button' || token === 'link') return token
+  }
+  return undefined
+}
+
+function containsInteractiveAriaRole(innerHtml: string, roles: ReadonlyArray<'button' | 'link'>): boolean {
+  if (!/\brole\s*=/i.test(innerHtml)) return false
+  const tagRe = /<[a-z][a-z0-9-]*\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi
+  let m: RegExpExecArray | null
+  while ((m = tagRe.exec(innerHtml)) !== null) {
+    const attrs = parseAttrs(m[1] ?? '')
+    const role = getInteractiveAriaRole(attrs.role)
+    if (role && roles.includes(role)) return true
+  }
+  return false
+}
+
+function findMatchingCloseTag(
+  html: string,
+  tagName: string,
+  contentStart: number,
+): { inner: string; endIndex: number } {
+  const lower = tagName.toLowerCase()
+  if (VOID_HTML_TAGS.has(lower)) {
+    return { inner: '', endIndex: contentStart }
+  }
+  const tagRe = new RegExp(`<(\\/?)${lower}\\b(?:"[^"]*"|'[^']*'|[^>"'])*(\\/?)>`, 'gi')
+  tagRe.lastIndex = contentStart
+  let depth = 1
+  let tm: RegExpExecArray | null
+  while ((tm = tagRe.exec(html)) !== null) {
+    const isClose = tm[1] === '/'
+    const isSelfClosing = tm[2] === '/'
+    if (isClose) {
+      depth -= 1
+      if (depth === 0) {
+        return {
+          inner: html.slice(contentStart, tm.index),
+          endIndex: tm.index + tm[0].length,
+        }
+      }
+    } else if (!isSelfClosing) {
+      depth += 1
+    }
+  }
+  return {
+    inner: html.slice(contentStart),
+    endIndex: html.length,
+  }
+}
+
 function parseAttrs(attrString: string): Record<string, string> {
   const attrs: Record<string, string> = {}
   const regex = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g
@@ -314,6 +385,12 @@ export interface LiteFormMeta {
   hiddenFields: LiteHiddenField[]
   fieldOrder?: LiteFormFieldRef[]
   title?: string
+  dialogKey?: string
+}
+
+export interface LiteParseOptions {
+  detailsOpen?: ReadonlyMap<string, boolean>
+  dialogOpen?: ReadonlyMap<string, boolean>
 }
 
 export interface ParsedDoc {
@@ -325,9 +402,15 @@ export interface ParsedDoc {
   frames?: FrameSummary[]
   text: string
   forms: Map<string, LiteFormMeta>
+  detailsBySummarySelector?: Map<string, string>
 }
 
-export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc {
+export function parseHtmlDocument(
+  html: string,
+  baseUrl: string,
+  depth = 0,
+  options?: LiteParseOptions,
+): ParsedDoc {
   // Remove scripts, styles, comments, and inline SVG before scanning
   const cleaned = stripIgnoredHtmlBlocks(html)
   const documentUrl = baseUrl
@@ -379,13 +462,41 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     }
   }
 
-  const blocks: ContentBlock[] = []
+  const blocks: Array<ContentBlock & { selector?: string }> = []
   const elements: ElementDescriptor[] = []
   const forms = new Map<string, LiteFormMeta>()
   const formIdsByHtmlId = new Map<string, string>()
+  const detailsBySummarySelector = new Map<string, string>()
   const usedSelectors = new Set<string>()
   let elIndex = 0
+  let detailsIndex = 0
+  let dialogIndex = 0
   let currentFormId = ''
+
+  interface FieldsetFrame {
+    disabled: boolean
+    legendSeen: boolean
+    inFirstLegend: boolean
+  }
+  interface DetailsFrame {
+    key: string
+    open: boolean
+    summarySeen: boolean
+    hiddenByAncestor: boolean
+  }
+  interface DialogFrame {
+    key: string
+    open: boolean
+    hiddenByAncestor: boolean
+  }
+
+  const fieldsetStack: FieldsetFrame[] = []
+  const detailsStack: DetailsFrame[] = []
+  const dialogStack: DialogFrame[] = []
+
+  const isHiddenByDialog = (): boolean => dialogStack.some((d) => !d.open)
+  const isContentHidden = (): boolean => isHiddenByDialog() || detailsStack.some((d) => !d.open)
+  const isDisabledByFieldset = (): boolean => fieldsetStack.some((f) => f.disabled && !f.inFirstLegend)
 
   const resolveTargetFormId = (formAttr?: string): string => {
     const trimmed = formAttr?.trim()
@@ -409,7 +520,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     if (!formMeta) return
     const name = attrs.name
     if (!name) return
-    const disabled = 'disabled' in attrs ? true : undefined
+    const disabled = 'disabled' in attrs || isDisabledByFieldset() ? true : undefined
     const hidden: LiteHiddenField = {
       name,
       value: attrs.value ?? '',
@@ -450,7 +561,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     return disambiguated
   }
 
-  const pushBlock = (block: ContentBlock) => {
+  const pushBlock = (block: ContentBlock & { selector?: string }) => {
     if (currentFormId) {
       const formMeta = forms.get(currentFormId)
       blocks.push({
@@ -463,16 +574,207 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     }
   }
 
-  // Better linear scan: handle paired and void tags cleanly
+  const emitAriaInteractiveElement = (
+    tag: string,
+    attrs: Record<string, string>,
+    role: 'button' | 'link',
+    innerHtml: string,
+  ): void => {
+    extractHiddenInputsFromFragment(innerHtml)
+    const isDisabled = 'disabled' in attrs || attrs['aria-disabled']?.trim().toLowerCase() === 'true'
+    if (role === 'link') {
+      const rawHref = attrs.href || attrs['data-href']
+      const href = resolveHref(rawHref, effectiveBaseUrl)
+      const text = attrs['aria-label']?.trim() || stripTags(innerHtml) || attrs.alt?.trim() || attrs.title?.trim() || rawHref || ''
+      if (!text) return
+      const selector = claimSelector(
+        attrs.id ? `#${attrs.id}` : `${tag}[role="link"]:nth-of-type(${++elIndex})`,
+        tag,
+        attrs,
+      )
+      elements.push({
+        selector,
+        tag,
+        type: 'link',
+        id: attrs.id,
+        role: 'link',
+        text,
+        ariaLabel: attrs['aria-label'],
+        ...(isDisabled ? { disabled: true } : {}),
+        href,
+      })
+      pushBlock({ kind: 'link', text, href, tag, selector })
+    } else {
+      const text = attrs['aria-label']?.trim() || stripTags(innerHtml) || attrs.alt?.trim() || attrs.title?.trim() || 'Button'
+      const selector = claimSelector(
+        attrs.id ? `#${attrs.id}` : `${tag}[role="button"]:nth-of-type(${++elIndex})`,
+        tag,
+        attrs,
+      )
+      elements.push({
+        selector,
+        tag,
+        type: 'button',
+        id: attrs.id,
+        role: 'button',
+        text,
+        ariaLabel: attrs['aria-label'],
+        ...(isDisabled ? { disabled: true } : {}),
+      })
+      pushBlock({ kind: 'button', text, tag, selector })
+    }
+  }
+
+  // Linear scan handling container open/close tags (<form>, <fieldset>, <details>, <dialog>),
+  // paired & void HTML elements, and ARIA role="button" / role="link" elements.
   const linearRe =
-    /<form\b([^>]*)>|<\/form>|<(h[1-6])\b([^>]*)>([\s\S]*?)<\/\2>|<p\b([^>]*)>([\s\S]*?)<\/p>|<a\b([^>]*)>([\s\S]*?)<\/a>|<button\b([^>]*)>([\s\S]*?)<\/button>|<input\b([^>]*)\/?>|<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<select\b([^>]*)>([\s\S]*?)<\/select>|<li\b([^>]*)>([\s\S]*?)<\/li>|<pre\b([^>]*)>([\s\S]*?)<\/pre>|<tr\b([^>]*)>([\s\S]*?)<\/tr>|<img\b([^>]*)\/?>|<hr\b[^>]*\/?>|<legend\b[^>]*>([\s\S]*?)<\/legend>|<canvas\b([^>]*)>([\s\S]*?)<\/canvas>|<canvas\b([^>]*)\/?>/gi
+    /<form\b(?<formAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>|<\/form>|<fieldset\b(?<fieldsetAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>|<\/fieldset>|<\/legend>|<details\b(?<detailsAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>|<\/details>|<summary\b(?<summaryAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<summaryInner>[\s\S]*?)<\/summary>|<dialog\b(?<dialogAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>|<\/dialog>|<(?:(?<hTag>h[1-6]))\b(?<hAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<hInner>[\s\S]*?)<\/\k<hTag>>|<p\b(?<pAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<pInner>[\s\S]*?)<\/p>|<a\b(?<aAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<aInner>[\s\S]*?)<\/a>|<button\b(?<btnAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<btnInner>[\s\S]*?)<\/button>|<input\b(?<inputAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)\/?>|<textarea\b(?<taAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<taInner>[\s\S]*?)<\/textarea>|<select\b(?<selAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<selInner>[\s\S]*?)<\/select>|<li\b(?<liAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<liInner>[\s\S]*?)<\/li>|<pre\b(?<preAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<preInner>[\s\S]*?)<\/pre>|<tr\b(?<trAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<trInner>[\s\S]*?)<\/tr>|<img\b(?<imgAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)\/?>|<hr\b(?:"[^"]*"|'[^']*'|[^>"'])*\/?>|<legend\b(?<legendAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<legendInner>[\s\S]*?)<\/legend>|<canvas\b(?<canvasAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<canvasInner>[\s\S]*?)<\/canvas>|<canvas\b(?<canvasVoidAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)\/?>|<(?<ariaTag>[a-z][a-z0-9-]*)\b(?<ariaAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*\brole\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)(?:"[^"]*"|'[^']*'|[^>"'])*)(?<ariaSelf>\/?)>/gi
 
   let m: RegExpExecArray | null
   while ((m = linearRe.exec(bodyHtml)) !== null) {
     const full = m[0]
+    const g = m.groups ?? {}
 
-    if (/^<form\b/i.test(full)) {
-      const attrs = parseAttrs(m[1] ?? '')
+    // --- <dialog> / </dialog> ---
+    if (g.dialogAttrs !== undefined) {
+      const attrs = parseAttrs(g.dialogAttrs)
+      dialogIndex += 1
+      const key = attrs.id?.trim() ? `#${attrs.id.trim()}` : `dialog:nth-of-type(${dialogIndex})`
+      const open = options?.dialogOpen?.has(key) ? Boolean(options.dialogOpen.get(key)) : 'open' in attrs
+      const hiddenByAncestor = isContentHidden()
+      dialogStack.push({ key, open, hiddenByAncestor })
+      if (open && !hiddenByAncestor) {
+        const dialogTitle = attrs['aria-label']?.trim() || attrs.title?.trim()
+        pushBlock({
+          kind: 'heading',
+          level: 2,
+          text: dialogTitle ? `[Dialog: ${dialogTitle}]` : '[Dialog]',
+          tag: 'dialog',
+        })
+      }
+      continue
+    }
+    if (/^<\/dialog>/i.test(full)) {
+      const closed = dialogStack.pop()
+      if (closed?.open && !closed.hiddenByAncestor) {
+        pushBlock({ kind: 'hr', text: '---', tag: 'dialog' })
+      }
+      continue
+    }
+
+    // --- <details> / </details> ---
+    if (g.detailsAttrs !== undefined) {
+      const attrs = parseAttrs(g.detailsAttrs)
+      detailsIndex += 1
+      const key = attrs.id?.trim() ? `#${attrs.id.trim()}` : `details:nth-of-type(${detailsIndex})`
+      const open = options?.detailsOpen?.has(key) ? Boolean(options.detailsOpen.get(key)) : 'open' in attrs
+      const hiddenByAncestor = isContentHidden()
+      detailsStack.push({ key, open, summarySeen: false, hiddenByAncestor })
+      continue
+    }
+    if (/^<\/details>/i.test(full)) {
+      const closed = detailsStack.pop()
+      if (closed && !closed.summarySeen && !closed.hiddenByAncestor && !isHiddenByDialog()) {
+        // HTML5 default disclosure summary when <details> has no <summary> child
+        const selector = claimSelector(`${closed.key} > summary`, 'summary')
+        detailsBySummarySelector.set(selector, closed.key)
+        elements.push({
+          selector,
+          tag: 'summary',
+          type: 'summary',
+          role: 'button',
+          text: 'Details',
+          checked: closed.open,
+        })
+        pushBlock({
+          kind: 'button',
+          text: `${closed.open ? 'v' : '>'} Details`,
+          tag: 'summary',
+          checked: closed.open,
+          selector,
+        })
+      }
+      continue
+    }
+
+    // --- <summary> ---
+    if (g.summaryInner !== undefined) {
+      if (isHiddenByDialog()) continue
+      const topDetails = detailsStack[detailsStack.length - 1]
+      if (topDetails) {
+        if (topDetails.hiddenByAncestor) continue
+        if (!topDetails.summarySeen) {
+          topDetails.summarySeen = true
+          const attrs = parseAttrs(g.summaryAttrs ?? '')
+          const summaryText = stripTags(g.summaryInner) || attrs['aria-label']?.trim() || 'Details'
+          const selector = claimSelector(
+            attrs.id?.trim() ? `#${attrs.id.trim()}` : `${topDetails.key} > summary`,
+            'summary',
+            attrs,
+          )
+          detailsBySummarySelector.set(selector, topDetails.key)
+          elements.push({
+            selector,
+            tag: 'summary',
+            type: 'summary',
+            id: attrs.id,
+            role: attrs.role || 'button',
+            text: summaryText,
+            ariaLabel: attrs['aria-label'],
+            checked: topDetails.open,
+          })
+          pushBlock({
+            kind: 'button',
+            text: `${topDetails.open ? 'v' : '>'} ${summaryText}`,
+            tag: 'summary',
+            checked: topDetails.open,
+            selector,
+          })
+          continue
+        }
+        // Subsequent <summary> inside the same <details> is ordinary body content
+        if (!topDetails.open) continue
+        const text = stripTags(g.summaryInner)
+        if (text) pushBlock({ kind: 'paragraph', text, tag: 'summary' })
+        continue
+      }
+      // Orphan <summary> outside <details>
+      if (isContentHidden()) continue
+      const text = stripTags(g.summaryInner)
+      if (text) pushBlock({ kind: 'paragraph', text, tag: 'summary' })
+      continue
+    }
+
+    // Everything below is skipped when inside a closed <dialog> or closed <details>
+    if (isContentHidden()) {
+      continue
+    }
+
+    // --- <fieldset> / </fieldset> / </legend> ---
+    if (g.fieldsetAttrs !== undefined) {
+      const attrs = parseAttrs(g.fieldsetAttrs)
+      fieldsetStack.push({
+        disabled: 'disabled' in attrs,
+        legendSeen: false,
+        inFirstLegend: false,
+      })
+      continue
+    }
+    if (/^<\/fieldset>/i.test(full)) {
+      fieldsetStack.pop()
+      continue
+    }
+    if (/^<\/legend>/i.test(full)) {
+      const topFieldset = fieldsetStack[fieldsetStack.length - 1]
+      if (topFieldset) {
+        topFieldset.inFirstLegend = false
+      }
+      continue
+    }
+
+    // --- <form> / </form> ---
+    if (g.formAttrs !== undefined) {
+      const attrs = parseAttrs(g.formAttrs)
       currentFormId = `form-${forms.size + 1}`
       if (attrs.id?.trim()) {
         formIdsByHtmlId.set(attrs.id.trim(), currentFormId)
@@ -481,14 +783,17 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         attrs['aria-label']?.trim() ||
         attrs.title?.trim() ||
         humanizeFormName(attrs.name || attrs.id)
+      const method = (attrs.method ?? 'GET').toUpperCase()
+      const activeDialog = dialogStack[dialogStack.length - 1]
       forms.set(currentFormId, {
         action: attrs.action?.trim() ? (resolveHref(attrs.action.trim(), effectiveBaseUrl) ?? documentUrl) : documentUrl,
-        method: (attrs.method ?? 'GET').toUpperCase(),
+        method,
         enctype: normalizeFormEnctype(attrs.enctype),
         fieldSelectors: [],
         hiddenFields: [],
         fieldOrder: [],
         title: formTitle,
+        ...(method === 'DIALOG' && activeDialog ? { dialogKey: activeDialog.key } : {}),
       })
       continue
     }
@@ -497,43 +802,112 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       continue
     }
 
-    if (m[23] !== undefined) {
-      // <legend> inside a form sets the form container title if not already explicitly labeled
-      const legendText = stripTags(m[23])
-      if (currentFormId && legendText) {
-        const formMeta = forms.get(currentFormId)
-        if (formMeta && !formMeta.title) {
-          formMeta.title = legendText
+    // --- <legend> ---
+    if (g.legendInner !== undefined) {
+      const inner = g.legendInner
+      const topFieldset = fieldsetStack[fieldsetStack.length - 1]
+      const isFirstLegend = Boolean(topFieldset && !topFieldset.legendSeen)
+      if (topFieldset && !topFieldset.legendSeen) {
+        topFieldset.legendSeen = true
+      }
+
+      if (containsVisibleFormControl(inner)) {
+        if (topFieldset && isFirstLegend) {
+          topFieldset.inFirstLegend = true
+        }
+        const legendText = extractLabelText(inner)
+        if (currentFormId && legendText) {
+          const formMeta = forms.get(currentFormId)
+          if (formMeta && !formMeta.title) {
+            formMeta.title = legendText
+          }
+        }
+        const openTagLen = full.length - inner.length - 9 // '</legend>'.length
+        linearRe.lastIndex = m.index + Math.max(1, openTagLen)
+        continue
+      }
+
+      const legendText = stripTags(inner)
+      if (legendText) {
+        let usedAsFormTitle = false
+        if (currentFormId) {
+          const formMeta = forms.get(currentFormId)
+          if (formMeta && !formMeta.title) {
+            formMeta.title = legendText
+            usedAsFormTitle = true
+          }
+        }
+        if (!usedAsFormTitle) {
+          pushBlock({ kind: 'heading', level: 3, text: legendText, tag: 'legend' })
         }
       }
       continue
     }
 
-    if (m[2]) {
-      // Heading h1..h6
-      const level = Number(m[2].slice(1))
-      const text = stripTags(m[4] ?? '')
-      if (text) pushBlock({ kind: 'heading', level, text, tag: m[2].toLowerCase() })
+    // --- Generic ARIA role="button" / role="link" on non-native elements ---
+    if (g.ariaTag !== undefined) {
+      const tag = g.ariaTag.toLowerCase()
+      const attrs = parseAttrs(g.ariaAttrs ?? '')
+      const ariaRole = getInteractiveAriaRole(attrs.role)
+      if (!ariaRole) {
+        continue
+      }
+      const isSelfClosing = g.ariaSelf === '/' || VOID_HTML_TAGS.has(tag)
+      let inner = ''
+      if (!isSelfClosing) {
+        const closed = findMatchingCloseTag(bodyHtml, tag, m.index + full.length)
+        inner = closed.inner
+        linearRe.lastIndex = closed.endIndex
+      }
+      emitAriaInteractiveElement(tag, attrs, ariaRole, inner)
       continue
     }
 
-    if (m[6] !== undefined) {
-      // Paragraph <p>: if it wraps visible form controls (e.g. `<p><label>Email <input .../></label></p>`),
-      // descend into its inner HTML so controls and implicit <label> spans are parsed at their real offsets.
-      const inner = m[6]
-      if (containsVisibleFormControl(inner)) {
+    if (g.hTag !== undefined) {
+      // Heading h1..h6
+      const hAttrs = parseAttrs(g.hAttrs ?? '')
+      const ariaRole = getInteractiveAriaRole(hAttrs.role)
+      if (ariaRole) {
+        emitAriaInteractiveElement(g.hTag.toLowerCase(), hAttrs, ariaRole, g.hInner ?? '')
+        continue
+      }
+      const level = Number(g.hTag.slice(1))
+      const text = stripTags(g.hInner ?? '')
+      if (text) pushBlock({ kind: 'heading', level, text, tag: g.hTag.toLowerCase() })
+      continue
+    }
+
+    if (g.pInner !== undefined) {
+      // Paragraph <p>: check if <p> itself carries an interactive ARIA role
+      const pAttrs = parseAttrs(g.pAttrs ?? '')
+      const pAriaRole = getInteractiveAriaRole(pAttrs.role)
+      if (pAriaRole) {
+        emitAriaInteractiveElement('p', pAttrs, pAriaRole, g.pInner)
+        continue
+      }
+      // If it wraps visible form controls or ARIA role="button", descend into its inner HTML
+      // so controls and implicit <label> spans are parsed at their real offsets.
+      const inner = g.pInner
+      if (containsVisibleFormControl(inner) || containsInteractiveAriaRole(inner, ['button'])) {
         const openTagLen = full.length - inner.length - 4 // '</p>'.length
         linearRe.lastIndex = m.index + Math.max(1, openTagLen)
         continue
       }
       extractHiddenInputsFromFragment(inner)
-      // Otherwise capture inline <a> links in place so they render inline as [eN: link text]
+      // Otherwise capture inline <a> and inline [role="link"] elements in place so they render inline as [eN: link text]
       const inlineLinks: InlineLink[] = []
-      const innerLinkRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi
+      const innerLinkRe =
+        /<a\b(?<laAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<laInner>[\s\S]*?)<\/a>|<(?<lrTag>[a-z][a-z0-9-]*)\b(?<lrAttrs>(?:"[^"]*"|'[^']*'|[^>"'])*\brole\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)(?:"[^"]*"|'[^']*'|[^>"'])*)>(?<lrInner>[\s\S]*?)<\/\k<lrTag>>/gi
       let textParts = ''
       let lastIdx = 0
       let alm: RegExpExecArray | null
       while ((alm = innerLinkRe.exec(inner)) !== null) {
+        const lg = alm.groups ?? {}
+        const isAriaInline = lg.lrTag !== undefined
+        const attrs = parseAttrs((isAriaInline ? lg.lrAttrs : lg.laAttrs) ?? '')
+        if (isAriaInline && getInteractiveAriaRole(attrs.role) !== 'link') {
+          continue
+        }
         const beforeRaw = inner.slice(lastIdx, alm.index)
         const beforeClean = stripTags(beforeRaw)
         if (beforeClean) {
@@ -545,19 +919,31 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
           textParts += beforeClean
         }
         const hadSpaceBeforeLink = /\s$/.test(beforeRaw)
-        const attrs = parseAttrs(alm[1] ?? '')
-        const lText = stripTags(alm[2] ?? '') || attrs['aria-label'] || attrs.href || ''
+        const linkTag = isAriaInline ? lg.lrTag!.toLowerCase() : 'a'
+        const rawHref = isAriaInline ? attrs.href || attrs['data-href'] : attrs.href
+        const lInner = (isAriaInline ? lg.lrInner : lg.laInner) ?? ''
+        const lText = stripTags(lInner) || attrs['aria-label'] || rawHref || ''
         if (lText) {
-          const selector = attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`
-          const href = resolveHref(attrs.href, effectiveBaseUrl)
+          const selector = claimSelector(
+            attrs.id
+              ? `#${attrs.id}`
+              : isAriaInline
+                ? `${linkTag}[role="link"]:nth-of-type(${++elIndex})`
+                : `a:nth-of-type(${++elIndex})`,
+            linkTag,
+            attrs,
+          )
+          const href = resolveHref(rawHref, effectiveBaseUrl)
+          const isDisabled = attrs['aria-disabled']?.trim().toLowerCase() === 'true'
           const el: ElementDescriptor = {
             selector,
-            tag: 'a',
+            tag: linkTag,
             type: 'link',
             id: attrs.id,
-            role: attrs.role || 'link',
+            role: isAriaInline ? 'link' : attrs.role || 'link',
             text: lText,
             ariaLabel: attrs['aria-label'],
+            ...(isDisabled ? { disabled: true } : {}),
             href,
           }
           elements.push(el)
@@ -591,34 +977,37 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       continue
     }
 
-    if (m[8] !== undefined) {
+    if (g.aInner !== undefined) {
       // Anchor <a>
-      const attrs = parseAttrs(m[7] ?? '')
-      const text = stripTags(m[8]) || attrs['aria-label'] || attrs.href || ''
+      const attrs = parseAttrs(g.aAttrs ?? '')
+      const text = stripTags(g.aInner) || attrs['aria-label'] || attrs.href || ''
       if (!text) continue
-      const selector = attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`
+      const selector = claimSelector(attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`, 'a', attrs)
       const href = resolveHref(attrs.href, effectiveBaseUrl)
+      const role = attrs.role || 'link'
+      const isDisabled = attrs['aria-disabled']?.trim().toLowerCase() === 'true'
       elements.push({
         selector,
         tag: 'a',
         type: 'link',
         id: attrs.id,
-        role: attrs.role || 'link',
+        role,
         text,
         ariaLabel: attrs['aria-label'],
+        ...(isDisabled ? { disabled: true } : {}),
         href,
       })
-      pushBlock({ kind: 'link', text, href, tag: 'a' })
+      pushBlock({ kind: 'link', text, href, tag: 'a', selector })
       continue
     }
 
-    if (m[10] !== undefined) {
+    if (g.btnInner !== undefined) {
       // <button>
-      const attrs = parseAttrs(m[9] ?? '')
+      const attrs = parseAttrs(g.btnAttrs ?? '')
       const explicitLabel = attrs.id ? labelsByFor.get(attrs.id) : undefined
       const implicitLabel = resolveImplicitLabel(m.index, implicitLabelSpans)
       const associatedLabel = explicitLabel || implicitLabel
-      const text = stripTags(m[10]) || attrs['aria-label'] || associatedLabel || attrs.value || 'Button'
+      const text = stripTags(g.btnInner) || attrs['aria-label'] || associatedLabel || attrs.value || 'Button'
       const type = (attrs.type || 'submit').toLowerCase()
       const selector = claimSelector(
         attrs.id ? `#${attrs.id}` : `button:nth-of-type(${++elIndex})`,
@@ -632,7 +1021,9 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
           ? forms.get(targetFormId)?.action
           : undefined
       const formMethod = attrs.formmethod?.trim() ? attrs.formmethod.trim().toUpperCase() : undefined
+      const effectiveFormMethod = (formMethod || (targetFormId ? forms.get(targetFormId)?.method : undefined) || 'GET').toUpperCase()
       const formEnctype = attrs.formenctype?.trim() ? normalizeFormEnctype(attrs.formenctype) : undefined
+      const disabled = 'disabled' in attrs || isDisabledByFieldset()
       elements.push({
         selector,
         tag: 'button',
@@ -644,20 +1035,20 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         ...(associatedLabel ? { label: associatedLabel } : {}),
         ariaLabel: attrs['aria-label'],
         ...('value' in attrs ? { value: attrs.value } : {}),
-        disabled: 'disabled' in attrs,
-        defaultSubmit: type === 'submit' && Boolean(targetFormId),
+        disabled,
+        defaultSubmit: type === 'submit' && Boolean(targetFormId) && effectiveFormMethod !== 'DIALOG',
         formAction,
         ...(formMethod ? { formMethod } : {}),
         ...(formEnctype ? { formEnctype } : {}),
       })
-      pushBlock({ kind: 'button', text, tag: 'button' })
+      pushBlock({ kind: 'button', text, tag: 'button', selector })
       recordFormElement(targetFormId, selector)
       continue
     }
 
-    if (m[11] !== undefined) {
+    if (g.inputAttrs !== undefined) {
       // <input>
-      const attrs = parseAttrs(m[11])
+      const attrs = parseAttrs(g.inputAttrs)
       const type = (attrs.type || 'text').toLowerCase()
       const targetFormId = resolveTargetFormId(attrs.form)
       if (type === 'hidden') {
@@ -685,7 +1076,9 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
           ? forms.get(targetFormId)?.action
           : undefined
       const formMethod = attrs.formmethod?.trim() ? attrs.formmethod.trim().toUpperCase() : undefined
+      const effectiveFormMethod = (formMethod || (targetFormId ? forms.get(targetFormId)?.method : undefined) || 'GET').toUpperCase()
       const formEnctype = attrs.formenctype?.trim() ? normalizeFormEnctype(attrs.formenctype) : undefined
+      const disabled = 'disabled' in attrs || isDisabledByFieldset()
       elements.push({
         selector,
         tag: 'input',
@@ -700,17 +1093,17 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         autocomplete: attrs.autocomplete,
         value,
         valueRedacted: isPassword,
-        disabled: 'disabled' in attrs,
+        disabled,
         readOnly: 'readonly' in attrs,
         editable: !isBtn && type !== 'checkbox' && type !== 'radio' && type !== 'file',
         checked: 'checked' in attrs,
-        defaultSubmit: type === 'submit',
+        defaultSubmit: type === 'submit' && effectiveFormMethod !== 'DIALOG',
         formAction,
         ...(formMethod ? { formMethod } : {}),
         ...(formEnctype ? { formEnctype } : {}),
       })
       if (isBtn) {
-        pushBlock({ kind: 'button', text: attrs.value || label, tag: 'input' })
+        pushBlock({ kind: 'button', text: attrs.value || label, tag: 'input', selector })
       } else {
         pushBlock({
           kind: 'input',
@@ -719,15 +1112,16 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
           value: isPassword ? '********' : value,
           checked: 'checked' in attrs,
           tag: type === 'checkbox' || type === 'radio' ? type : 'input',
+          selector,
         })
       }
       recordFormElement(targetFormId, selector)
       continue
     }
 
-    if (m[13] !== undefined) {
+    if (g.taInner !== undefined) {
       // <textarea>
-      const attrs = parseAttrs(m[12] ?? '')
+      const attrs = parseAttrs(g.taAttrs ?? '')
       const targetFormId = resolveTargetFormId(attrs.form)
       const selector = claimSelector(
         attrs.id
@@ -741,7 +1135,8 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       const explicitLabel = attrs.id ? labelsByFor.get(attrs.id) : undefined
       const implicitLabel = resolveImplicitLabel(m.index, implicitLabelSpans)
       const label = explicitLabel || implicitLabel || attrs['aria-label'] || attrs.placeholder || attrs.name || 'textarea'
-      const value = decodeEntities(m[13]).trim()
+      const value = decodeEntities(g.taInner).trim()
+      const disabled = 'disabled' in attrs || isDisabledByFieldset()
       elements.push({
         selector,
         tag: 'textarea',
@@ -754,18 +1149,18 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         ariaLabel: attrs['aria-label'],
         placeholder: attrs.placeholder,
         value,
-        disabled: 'disabled' in attrs,
+        disabled,
         readOnly: 'readonly' in attrs,
         editable: true,
       })
-      pushBlock({ kind: 'input', text: label, placeholder: attrs.placeholder, value, tag: 'textarea' })
+      pushBlock({ kind: 'input', text: label, placeholder: attrs.placeholder, value, tag: 'textarea', selector })
       recordFormElement(targetFormId, selector)
       continue
     }
 
-    if (m[15] !== undefined) {
+    if (g.selInner !== undefined) {
       // <select>
-      const attrs = parseAttrs(m[14] ?? '')
+      const attrs = parseAttrs(g.selAttrs ?? '')
       const targetFormId = resolveTargetFormId(attrs.form)
       const selector = claimSelector(
         attrs.id
@@ -782,7 +1177,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       const options: Array<{ value: string; label: string; selected?: boolean }> = []
       const optRe = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi
       let om: RegExpExecArray | null
-      while ((om = optRe.exec(m[15])) !== null) {
+      while ((om = optRe.exec(g.selInner)) !== null) {
         const oAttrs = parseAttrs(om[1] ?? '')
         const oLabel = stripTags(om[2] ?? '')
         options.push({
@@ -792,6 +1187,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         })
       }
       const selected = options.find((o) => o.selected) ?? options[0]
+      const disabled = 'disabled' in attrs || isDisabledByFieldset()
       elements.push({
         selector,
         tag: 'select',
@@ -803,18 +1199,25 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         label,
         ariaLabel: attrs['aria-label'],
         value: selected?.label ?? selected?.value ?? '',
-        disabled: 'disabled' in attrs,
+        disabled,
         options,
       })
-      pushBlock({ kind: 'select', text: label, value: selected?.label ?? selected?.value ?? '', tag: 'select' })
+      pushBlock({ kind: 'select', text: label, value: selected?.label ?? selected?.value ?? '', tag: 'select', selector })
       recordFormElement(targetFormId, selector)
       continue
     }
 
-    if (m[17] !== undefined) {
-      // <li>: descend if it wraps visible form controls (e.g. `<li><label><input type="radio"> Plan</label></li>`)
-      const inner = m[17]
-      if (containsVisibleFormControl(inner)) {
+    if (g.liInner !== undefined) {
+      // <li>: check if <li> itself carries an interactive ARIA role
+      const liAttrs = parseAttrs(g.liAttrs ?? '')
+      const liAriaRole = getInteractiveAriaRole(liAttrs.role)
+      if (liAriaRole) {
+        emitAriaInteractiveElement('li', liAttrs, liAriaRole, g.liInner)
+        continue
+      }
+      // Descend if it wraps visible form controls or ARIA interactive controls
+      const inner = g.liInner
+      if (containsVisibleFormControl(inner) || containsInteractiveAriaRole(inner, ['button', 'link'])) {
         const openTagLen = full.length - inner.length - 5 // '</li>'.length
         linearRe.lastIndex = m.index + Math.max(1, openTagLen)
         continue
@@ -825,21 +1228,21 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       continue
     }
 
-    if (m[19] !== undefined) {
+    if (g.preInner !== undefined) {
       // <pre>
-      const text = decodeEntities(m[19].replace(/<[^>]+>/g, '')).trim()
+      const text = decodeEntities(g.preInner.replace(/<[^>]+>/g, '')).trim()
       if (text) pushBlock({ kind: 'code', text, tag: 'pre' })
       continue
     }
 
-    if (m[21] !== undefined) {
+    if (g.trInner !== undefined) {
       // <tr>
-      extractHiddenInputsFromFragment(m[21])
+      extractHiddenInputsFromFragment(g.trInner)
       const cells: string[] = []
       let thCount = 0
       const cellRe = /<(t[hd])\b[^>]*>([\s\S]*?)<\/\1>/gi
       let cm: RegExpExecArray | null
-      while ((cm = cellRe.exec(m[21])) !== null) {
+      while ((cm = cellRe.exec(g.trInner)) !== null) {
         if ((cm[1] ?? '').toLowerCase() === 'th') thCount++
         cells.push(stripTags(cm[2] ?? ''))
       }
@@ -850,9 +1253,14 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       continue
     }
 
-    if (m[22] !== undefined) {
+    if (g.imgAttrs !== undefined) {
       // <img>
-      const attrs = parseAttrs(m[22])
+      const attrs = parseAttrs(g.imgAttrs)
+      const imgAriaRole = getInteractiveAriaRole(attrs.role)
+      if (imgAriaRole) {
+        emitAriaInteractiveElement('img', attrs, imgAriaRole, '')
+        continue
+      }
       const alt = attrs.alt || attrs.title || attrs.src || 'image'
       const src = resolveHref(attrs.src, effectiveBaseUrl)
       const naturalWidth = parsePositiveDim(attrs.width)
@@ -869,10 +1277,10 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       continue
     }
 
-    if (m[24] !== undefined || m[26] !== undefined) {
+    if (g.canvasAttrs !== undefined || g.canvasVoidAttrs !== undefined) {
       // <canvas>
-      const attrs = parseAttrs(m[24] ?? m[26] ?? '')
-      const fallbackText = m[25] ? stripTags(m[25]) : ''
+      const attrs = parseAttrs(g.canvasAttrs ?? g.canvasVoidAttrs ?? '')
+      const fallbackText = g.canvasInner ? stripTags(g.canvasInner) : ''
       const label = attrs['aria-label'] || attrs.title || fallbackText || attrs.id || 'canvas'
       const naturalWidth = parsePositiveDim(attrs.width)
       const naturalHeight = parsePositiveDim(attrs.height)
@@ -978,6 +1386,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         frames: flattened.frames,
         text: flattened.text,
         forms,
+        ...(detailsBySummarySelector.size > 0 ? { detailsBySummarySelector } : {}),
       }
     }
   }
@@ -990,6 +1399,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     elements,
     text,
     forms,
+    ...(detailsBySummarySelector.size > 0 ? { detailsBySummarySelector } : {}),
   }
 }
 
@@ -1003,6 +1413,8 @@ class LiteTab implements TabDriver {
   private scrollY = 0
   private rawHtml = ''
   private doc: ParsedDoc = { title: 'New Tab', blocks: [], elements: [], text: '', forms: new Map() }
+  private detailsOpenOverrides = new Map<string, boolean>()
+  private dialogOpenOverrides = new Map<string, boolean>()
   private historyStack: string[] = []
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
@@ -1304,6 +1716,8 @@ class LiteTab implements TabDriver {
       })
 
       this.rawHtml = body
+      this.detailsOpenOverrides.clear()
+      this.dialogOpenOverrides.clear()
       if (contentType.includes('application/json') || contentType.includes('text/plain')) {
         const title = new URL(finalUrl).pathname || finalUrl
         this.doc = {
@@ -1498,11 +1912,55 @@ class LiteTab implements TabDriver {
     }
   }
 
+  private reparseCurrentHtml(): void {
+    if (!this.rawHtml) return
+    const prevValues = new Map<string, { value?: string; checked?: boolean; selectedValue?: string }>()
+    for (const el of this.doc.elements) {
+      if (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select') {
+        prevValues.set(el.selector, {
+          value: el.value,
+          checked: el.checked,
+          selectedValue: el.options?.find((o) => o.selected)?.value,
+        })
+      }
+    }
+
+    this.doc = parseHtmlDocument(this.rawHtml, this.url, 0, {
+      detailsOpen: this.detailsOpenOverrides,
+      dialogOpen: this.dialogOpenOverrides,
+    })
+
+    for (const el of this.doc.elements) {
+      const prev = prevValues.get(el.selector)
+      if (!prev) continue
+      if (el.tag === 'select' && prev.selectedValue !== undefined && el.options) {
+        for (const o of el.options) {
+          o.selected = o.value === prev.selectedValue
+        }
+        el.value = prev.value
+      } else if (el.tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) {
+        el.checked = prev.checked
+      } else if (el.tag === 'input' || el.tag === 'textarea') {
+        el.value = prev.value
+      }
+      this.syncBlockForElement(el)
+    }
+  }
+
   async click(selector: string): Promise<{ ok: boolean; note?: string }> {
     const el = this.doc.elements.find((e) => e.selector === selector)
     if (!el) return { ok: false, note: `element ${selector} not found` }
+    if (el.disabled) return { ok: false, note: `element ${selector} is disabled` }
 
-    if (el.tag === 'a' && el.href) {
+    const detailsKey = this.doc.detailsBySummarySelector?.get(selector)
+    if (detailsKey) {
+      const nextOpen = !Boolean(el.checked)
+      this.detailsOpenOverrides.set(detailsKey, nextOpen)
+      this.reparseCurrentHtml()
+      return { ok: true, note: nextOpen ? 'details expanded' : 'details collapsed' }
+    }
+
+    if ((el.tag === 'a' || el.role === 'link') && el.href) {
       await this.navigate(el.href)
       return { ok: true, note: `navigated to ${this.url}` }
     }
@@ -1532,7 +1990,21 @@ class LiteTab implements TabDriver {
     }
     // Check if submit button belongs to a form
     for (const form of this.doc.forms.values()) {
-      if (form.fieldSelectors.includes(selector) && (el.defaultSubmit || (el.tag === 'button' && el.type === 'submit'))) {
+      if (
+        form.fieldSelectors.includes(selector) &&
+        (el.defaultSubmit || ((el.tag === 'button' || el.tag === 'input') && el.type === 'submit'))
+      ) {
+        const effectiveMethod = (el.formMethod || form.method || 'GET').toUpperCase()
+        if (effectiveMethod === 'DIALOG') {
+          if (form.dialogKey) {
+            this.dialogOpenOverrides.set(form.dialogKey, false)
+            this.reparseCurrentHtml()
+          }
+          return {
+            ok: true,
+            note: el.value ? `closed dialog (returnValue=${el.value})` : 'closed dialog',
+          }
+        }
         await this.submitForm(form, el)
         return { ok: true, note: `submitted form to ${this.url}` }
       }
@@ -1544,9 +2016,9 @@ class LiteTab implements TabDriver {
   private syncBlockForElement(el: ElementDescriptor): void {
     const idx = this.doc.elements.indexOf(el)
     if (idx < 0) return
-    const matchingBlock = this.doc.blocks.find(
-      (b) => (b.kind === 'input' || b.kind === 'select') && b.text === (el.label || el.text),
-    )
+    const matchingBlock =
+      this.doc.blocks.find((b) => b.selector === el.selector) ??
+      this.doc.blocks.find((b) => (b.kind === 'input' || b.kind === 'select') && b.text === (el.label || el.text))
     if (matchingBlock) {
       matchingBlock.value = el.valueRedacted ? '********' : el.value
       matchingBlock.checked = el.checked
@@ -1555,7 +2027,7 @@ class LiteTab implements TabDriver {
 
   async fill(selector: string, text: string, clear = true): Promise<{ ok: boolean; value?: string }> {
     const el = this.doc.elements.find((e) => e.selector === selector)
-    if (!el) return { ok: false }
+    if (!el || el.disabled) return { ok: false }
     el.value = clear ? text : `${el.value ?? ''}${text}`
     this.syncBlockForElement(el)
     return { ok: true, value: el.value }
@@ -1563,7 +2035,7 @@ class LiteTab implements TabDriver {
 
   async select(selector: string, value: string): Promise<{ ok: boolean; value?: string }> {
     const el = this.doc.elements.find((e) => e.selector === selector)
-    if (!el || el.tag !== 'select') return { ok: false }
+    if (!el || el.tag !== 'select' || el.disabled) return { ok: false }
     const opt = el.options?.find(
       (o) => o.value.toLowerCase() === value.toLowerCase() || o.label.toLowerCase() === value.toLowerCase(),
     )
@@ -1590,6 +2062,11 @@ class LiteTab implements TabDriver {
             .find((e) => e && !e.disabled && (e.defaultSubmit || (e.tag === 'button' && e.type === 'submit')))
           if (submitBtn) {
             await this.click(submitBtn.selector)
+          } else if (form.method.toUpperCase() === 'DIALOG') {
+            if (form.dialogKey) {
+              this.dialogOpenOverrides.set(form.dialogKey, false)
+              this.reparseCurrentHtml()
+            }
           } else {
             await this.submitForm(form)
           }
