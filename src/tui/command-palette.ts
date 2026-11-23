@@ -318,6 +318,15 @@ export function buildPaletteCommands(ctx: CommandPaletteContext): PaletteCommand
       action: { type: 'command', command: 'ascii' },
     },
     {
+      id: 'view.reflow',
+      label: 'Reflow / Redraw Viewport',
+      category: 'View',
+      shortcut: 'Ctrl+L',
+      description: 'Re-measure terminal size and reflow TUI panes',
+      keywords: ['resize', 'sigwinch', 'tmux', 'screen', 'redraw', 'reflow'],
+      action: { type: 'command', command: 'reflow' },
+    },
+    {
       id: 'view.visual-ascii',
       label: 'Visual Screenshot (ASCII)',
       category: 'View',

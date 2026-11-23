@@ -46,6 +46,16 @@ import {
   type LinkHintState,
 } from './link-hints.js'
 import {
+  TerminalResizeWatcher,
+  dimensionsEqual,
+  formatResizeStatus,
+  resolveViewportDimensions,
+  type ResizeEvent,
+  type ResizeEventSource,
+  type ResizeSignalSource,
+  type TuiViewportDimensions,
+} from './resize.js'
+import {
   BookmarkHistoryStore,
   cloneSidebarState,
   composeSidebarFrame,
@@ -114,6 +124,10 @@ export interface TuiOptions {
   initialBookmarks?: BookmarkEntry[]
   /** Optional initial history entries to seed the sidebar store. */
   initialHistory?: HistoryEntry[]
+  /** Debounce delay in ms for terminal resize (SIGWINCH / stdout 'resize') reflow (default: 50). */
+  resizeDebounceMs?: number
+  /** Optional custom SIGWINCH signal emitter (defaults to `process` for stdout on POSIX). */
+  resizeSignalSource?: ResizeSignalSource | null
 }
 
 export interface TuiSearchMatch {
@@ -127,6 +141,11 @@ export interface TuiState {
   maxScrollOffset: number
   totalLines: number
   viewportRows: number
+  viewportWidth: number
+  viewportHeight: number
+  resizeCount: number
+  sidebarSuspendedByWidth: boolean
+  splitPaneSuspendedByWidth: boolean
   asciiOnly: boolean
   color: boolean
   statusMessage: string
@@ -193,6 +212,10 @@ export class TerminalBrowserController {
   private sidebar: SidebarState | null = null
   private sidebarViewportRows = 12
   private lastRecordedUrlByTab = new Map<number, string>()
+  private lastViewportDimensions: TuiViewportDimensions
+  private resizeCount = 0
+  private sidebarSuspendedByWidth = false
+  private splitPaneSuspendedByWidth = false
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -200,6 +223,7 @@ export class TerminalBrowserController {
     this.opts = opts
     this.input = opts.input ?? (process.stdin as TuiInputStream)
     this.output = opts.output ?? (process.stdout as TuiOutputStream)
+    this.lastViewportDimensions = this.resolveDimensions()
     this.scrollStep = Math.max(1, opts.scrollStep ?? 1)
     this.asciiOnly = opts.asciiOnly ?? false
     this.color = this.asciiOnly ? false : (opts.color ?? Boolean(this.output.isTTY))
@@ -237,6 +261,11 @@ export class TerminalBrowserController {
       maxScrollOffset: this.maxScrollOffset,
       totalLines: this.totalLines,
       viewportRows: this.viewportRows,
+      viewportWidth: this.lastViewportDimensions.width,
+      viewportHeight: this.lastViewportDimensions.height,
+      resizeCount: this.resizeCount,
+      sidebarSuspendedByWidth: this.sidebarSuspendedByWidth,
+      splitPaneSuspendedByWidth: this.splitPaneSuspendedByWidth,
       asciiOnly: this.asciiOnly,
       color: this.color,
       statusMessage: this.statusMessage,
@@ -279,12 +308,97 @@ export class TerminalBrowserController {
     await this.draw({ refresh: true })
   }
 
-  private resolveDimensions(): { width: number; height: number } {
-    const rawCols = this.opts.width ?? this.output.columns ?? 100
-    const rawRows = this.opts.height ?? Math.max(14, (this.output.rows ?? 36) - 3)
-    const width = Math.max(60, Math.min(240, rawCols))
-    const height = Math.max(14, Math.min(80, rawRows))
-    return { width, height }
+  private resolveDimensions(): TuiViewportDimensions {
+    return resolveViewportDimensions(this.output, {
+      width: this.opts.width,
+      height: this.opts.height,
+    })
+  }
+
+  private adaptPanesForWidth(width: number): { pausedPanes: string[]; restoredPanes: string[] } {
+    const pausedPanes: string[] = []
+    const restoredPanes: string[] = []
+
+    const sidebarLayout = this.sidebar
+      ? computeSidebarLayout(width)
+      : { canShow: false, sidebarWidth: 0, pageWidth: width, gapWidth: 0 }
+
+    if (this.sidebar) {
+      if (!sidebarLayout.canShow) {
+        if (!this.sidebarSuspendedByWidth) {
+          this.sidebarSuspendedByWidth = true
+          pausedPanes.push('sidebar')
+        }
+        if (this.mode === 'sidebar') {
+          this.mode = 'normal'
+        }
+      } else if (this.sidebarSuspendedByWidth) {
+        this.sidebarSuspendedByWidth = false
+        restoredPanes.push('sidebar')
+      }
+    } else {
+      this.sidebarSuspendedByWidth = false
+    }
+
+    const remainingWidth = sidebarLayout.canShow ? sidebarLayout.pageWidth : width
+    const splitLayout = this.splitPane
+      ? computeSplitPaneWidths(remainingWidth)
+      : { canSplit: false, leftWidth: remainingWidth, rightWidth: 0, gapWidth: 0 }
+
+    if (this.splitPane) {
+      if (!splitLayout.canSplit) {
+        if (!this.splitPaneSuspendedByWidth) {
+          this.splitPaneSuspendedByWidth = true
+          pausedPanes.push('split-pane')
+        }
+        if (this.activePane === 'inspector') {
+          this.activePane = 'page'
+        }
+      } else if (this.splitPaneSuspendedByWidth) {
+        this.splitPaneSuspendedByWidth = false
+        restoredPanes.push('split-pane')
+      }
+    } else {
+      this.splitPaneSuspendedByWidth = false
+    }
+
+    return { pausedPanes, restoredPanes }
+  }
+
+  /**
+   * Handles a live terminal resize (`SIGWINCH` / `stdout` `'resize'` / manual `Ctrl+L` reflow).
+   * Adapts panes for narrow tmux/screen splits, clamps scroll offsets, keeps focused refs
+   * visible, and re-renders smoothly without refetching the page.
+   */
+  async handleResize(
+    opts: { source?: ResizeEventSource; force?: boolean; event?: ResizeEvent } = {},
+  ): Promise<boolean> {
+    if (this.exited) return false
+
+    const current = opts.event?.current ?? this.resolveDimensions()
+    const previous = opts.event?.previous ?? this.lastViewportDimensions
+
+    if (!opts.force && dimensionsEqual(previous, current)) {
+      return false
+    }
+
+    this.lastViewportDimensions = current
+    this.resizeCount += 1
+
+    const { pausedPanes, restoredPanes } = this.adaptPanesForWidth(current.width)
+    const event: ResizeEvent = {
+      previous,
+      current,
+      source: opts.source ?? opts.event?.source ?? 'manual',
+      resizeCount: this.resizeCount,
+    }
+    this.statusMessage = formatResizeStatus(event, { pausedPanes, restoredPanes })
+
+    await this.draw({
+      refresh: false,
+      ensureFocusVisible: Boolean(this.focusedRef),
+    })
+    return true
   }
 
   private collectInspectorData(activeTabId?: number): InspectorData {
@@ -436,7 +550,9 @@ export class TerminalBrowserController {
   }
 
   async draw(opts: { refresh?: boolean; ensureFocusVisible?: boolean } = {}): Promise<string> {
-    const { width, height } = this.resolveDimensions()
+    const dims = this.resolveDimensions()
+    this.lastViewportDimensions = dims
+    const { width, height } = dims
     const sidebarLayout = this.sidebar
       ? computeSidebarLayout(width)
       : { canShow: false, sidebarWidth: 0, pageWidth: width, gapWidth: 0 }
@@ -1815,6 +1931,9 @@ export class TerminalBrowserController {
             refresh = activated.refresh
           }
         }
+      } else if (cmd === 'reflow' || cmd === 'redraw' || cmd === 'resize') {
+        await this.handleResize({ source: 'manual', force: true })
+        return { shouldExit: false, skipDraw: true }
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
           'Keys: j/k g/G 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | bookmarks | history | newtab | close | tabs | palette | split | quit'
@@ -1922,6 +2041,11 @@ export class TerminalBrowserController {
     if (k.ctrl && name === 'p') {
       this.enterCommandPalette()
       await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (k.ctrl && name === 'l') {
+      await this.handleResize({ source: 'manual', force: true })
       return { shouldExit: false, drawn: true }
     }
 
@@ -2159,9 +2283,27 @@ export class TerminalBrowserController {
       let settled = false
       let queue: Promise<void> = Promise.resolve()
 
+      const resizeWatcher = new TerminalResizeWatcher({
+        output: this.output,
+        widthOverride: this.opts.width,
+        heightOverride: this.opts.height,
+        debounceMs: this.opts.resizeDebounceMs,
+        signalSource: this.opts.resizeSignalSource,
+        onResize: (event) => {
+          queue = queue
+            .then(async () => {
+              if (settled || this.exited) return
+              await this.handleResize({ source: event.source, event })
+            })
+            .catch((err) => finish(err as Error))
+        },
+        onError: (err) => finish(err as Error),
+      })
+
       const finish = (err?: Error) => {
         if (settled) return
         settled = true
+        resizeWatcher.stop()
         this.input.off('keypress', onKeypress)
         this.input.off('end', onEnd)
         this.input.off('close', onEnd)
@@ -2194,6 +2336,7 @@ export class TerminalBrowserController {
       this.input.on('keypress', onKeypress)
       this.input.once('end', onEnd)
       this.input.once('close', onEnd)
+      resizeWatcher.start()
     })
   }
 
@@ -2204,25 +2347,55 @@ export class TerminalBrowserController {
       prompt: 'troy-adv> ',
     })
 
+    let lineResizeQueue: Promise<void> = Promise.resolve()
+    const resizeWatcher = new TerminalResizeWatcher({
+      output: this.output,
+      widthOverride: this.opts.width,
+      heightOverride: this.opts.height,
+      debounceMs: this.opts.resizeDebounceMs,
+      signalSource: this.opts.resizeSignalSource,
+      onResize: (event) => {
+        lineResizeQueue = lineResizeQueue
+          .then(async () => {
+            if (this.exited) return
+            const redrawn = await this.handleResize({ source: event.source, event })
+            if (redrawn && !this.exited) {
+              rl.prompt(true)
+            }
+          })
+          .catch(() => {
+            // ignore resize errors on closing readline
+          })
+      },
+    })
+    if (this.output.isTTY || this.opts.resizeSignalSource) {
+      resizeWatcher.start()
+    }
+
     rl.prompt()
 
-    for await (const raw of rl) {
-      const line = raw.trim()
-      if (!line) {
-        await this.draw()
-        rl.prompt()
-        continue
-      }
+    try {
+      for await (const raw of rl) {
+        const line = raw.trim()
+        if (!line) {
+          await this.draw()
+          rl.prompt()
+          continue
+        }
 
-      const result = await this.executeCommand(line)
-      if (result.shouldExit) {
-        rl.close()
-        return
+        const result = await this.executeCommand(line)
+        if (result.shouldExit) {
+          rl.close()
+          return
+        }
+        if (!result.skipDraw) {
+          await this.draw({ refresh: result.refresh })
+        }
+        rl.prompt()
       }
-      if (!result.skipDraw) {
-        await this.draw({ refresh: result.refresh })
-      }
-      rl.prompt()
+    } finally {
+      resizeWatcher.stop()
+      await lineResizeQueue
     }
   }
 }
