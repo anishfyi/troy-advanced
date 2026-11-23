@@ -43,6 +43,7 @@ export interface RecordNetworkInput {
   error?: string
   blocked?: boolean
   blockedReason?: string
+  retries?: number
   requestHeaders?: Record<string, string>
   responseHeaders?: Record<string, string>
   requestBody?: string
@@ -283,6 +284,7 @@ export class NetworkRecorder {
       ...(input.error ? { error: input.error } : {}),
       ...(input.blocked ? { blocked: true } : {}),
       ...(input.blockedReason ? { blockedReason: input.blockedReason } : {}),
+      ...(input.retries !== undefined && input.retries > 0 ? { retries: input.retries } : {}),
       ...(hasRequestBody ? { hasRequestBody: true } : {}),
       ...(hasResponseBody ? { hasResponseBody: true } : {}),
     }

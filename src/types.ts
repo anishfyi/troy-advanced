@@ -148,6 +148,7 @@ export interface NetworkEntry {
   error?: string
   blocked?: boolean
   blockedReason?: string
+  retries?: number
   hasRequestBody?: boolean
   hasResponseBody?: boolean
 }

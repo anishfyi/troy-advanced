@@ -86,6 +86,23 @@ import {
   type ParsedFeed,
 } from './feed-reader.js'
 import {
+  RobotsDisallowedError,
+  RobotsRetryController,
+  computeBackoffDelayMs,
+  isRetryableMethod,
+  isRetryableStatus,
+  parseRetryAfterMs,
+  type RateLimitOptions,
+  type RateLimitStats,
+  type ResolvedRateLimitPolicy,
+  type ResolvedRetryPolicy,
+  type ResolvedRobotsPolicy,
+  type RetryPolicyOptions,
+  type RobotsDecision,
+  type RobotsPolicyOptions,
+  type RobotsRetryHooks,
+} from './robots-retry.js'
+import {
   filterStorageSnapshots,
   normalizeOriginStorageSnapshot,
   normalizeStorageArea,
@@ -1488,6 +1505,7 @@ class LiteTab implements TabDriver {
   private downloads?: DownloadQuarantineManager
   private dialogs?: DialogManager
   private maxMetaRefreshDelaySeconds: number
+  private robotsRetry: RobotsRetryController
 
   constructor(
     id: number,
@@ -1497,6 +1515,7 @@ class LiteTab implements TabDriver {
     downloads?: DownloadQuarantineManager,
     dialogs?: DialogManager,
     maxMetaRefreshDelaySeconds = 5,
+    robotsRetry?: RobotsRetryController,
   ) {
     this.id = id
     this.cookieJar = cookieJar
@@ -1505,6 +1524,7 @@ class LiteTab implements TabDriver {
     this.downloads = downloads
     this.dialogs = dialogs
     this.maxMetaRefreshDelaySeconds = maxMetaRefreshDelaySeconds
+    this.robotsRetry = robotsRetry ?? new RobotsRetryController()
   }
 
   getEmulation(): EmulationProfile {
@@ -1551,6 +1571,7 @@ class LiteTab implements TabDriver {
     let currentInit: RequestInit = { ...init }
     let requestHeadersMap: Record<string, string> = {}
     let requestBodyStr = serializeRequestInitBody(currentInit.body)
+    let totalRetriesForPage = 0
 
     try {
       let res: Response | null = null
@@ -1608,8 +1629,56 @@ class LiteTab implements TabDriver {
         requestHeadersMap = normalizeHeadersMap(hopHeaders)
         requestBodyStr = serializeRequestInitBody(currentInit.body)
 
-        res = await fetch(currentUrl, { ...currentInit, headers: hopHeaders, redirect: 'manual' })
-        this.storeCookies(currentUrl, res.headers)
+        const hopOrigin = new URL(currentUrl).origin
+        const hopUserAgent = hopHeaders.get('user-agent') ?? this.emulation.userAgent
+        const robotsDecision = await this.robotsRetry.checkRobots(currentUrl, hopUserAgent)
+        if (!robotsDecision.allowed) {
+          this.robotsRetry.recordRobotsBlocked()
+          throw new RobotsDisallowedError(currentUrl, robotsDecision)
+        }
+
+        await this.robotsRetry.acquireOriginSlot(hopOrigin, robotsDecision.crawlDelayMs)
+
+        const retryPolicy = this.robotsRetry.getRetryPolicy()
+        const maxAttempts = retryPolicy.enabled && isRetryableMethod(currentInit.method, retryPolicy)
+          ? retryPolicy.maxRetries + 1
+          : 1
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          res = await fetch(currentUrl, { ...currentInit, headers: hopHeaders, redirect: 'manual' })
+          this.storeCookies(currentUrl, res.headers)
+
+          if (
+            retryPolicy.enabled &&
+            isRetryableStatus(res.status, retryPolicy) &&
+            isRetryableMethod(currentInit.method, retryPolicy) &&
+            attempt < retryPolicy.maxRetries
+          ) {
+            const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'), this.robotsRetry.now())
+            const delayMs = computeBackoffDelayMs(attempt, retryPolicy, retryAfterMs, this.robotsRetry.random)
+            this.robotsRetry.recordRetry(delayMs)
+            totalRetriesForPage += 1
+            this.consoleLogs.push({
+              level: 'warning',
+              text: `[retry] HTTP ${res.status} on ${currentUrl}; retrying in ${delayMs}ms (attempt ${attempt + 1}/${retryPolicy.maxRetries})`,
+              ts: this.robotsRetry.now(),
+              url: currentUrl,
+            })
+            try {
+              await res.body?.cancel()
+            } catch {
+              // ignore body cancellation errors
+            }
+            await this.robotsRetry.sleep(delayMs)
+            continue
+          }
+
+          this.robotsRetry.recordResponseHeaders(hopOrigin, res.headers)
+          break
+        }
+        if (!res) {
+          throw new Error(`No response received while fetching ${currentUrl}`)
+        }
 
         const isRedirect = res.status >= 300 && res.status < 400
         const location = res.headers.get('location')
@@ -1772,6 +1841,7 @@ class LiteTab implements TabDriver {
         encodedDataLength: Buffer.byteLength(body, 'utf8'),
         durationMs: Date.now() - started,
         ts: Date.now(),
+        ...(totalRetriesForPage > 0 ? { retries: totalRetriesForPage } : {}),
         requestHeaders: requestHeadersMap,
         responseHeaders: responseHeadersMap,
         requestBody: requestBodyStr,
@@ -1837,12 +1907,15 @@ class LiteTab implements TabDriver {
       }
       return { url: this.url, title: this.title }
     } catch (err) {
+      const isRobotsBlocked = err instanceof RobotsDisallowedError
       this.networkRecorder.record({
-        url: targetUrl,
+        url: isRobotsBlocked ? err.url : targetUrl,
         method: init?.method ?? 'GET',
         ok: false,
         durationMs: Date.now() - started,
         ts: Date.now(),
+        ...(totalRetriesForPage > 0 ? { retries: totalRetriesForPage } : {}),
+        ...(isRobotsBlocked ? { blocked: true, blockedReason: 'robots.txt' } : {}),
         error: String((err as Error)?.message ?? err),
         requestHeaders: requestHeadersMap,
         requestBody: requestBodyStr,
@@ -2593,6 +2666,14 @@ export interface LiteEngineOptions {
   dialogs?: DialogPolicyOptions
   /** Maximum delay in seconds for auto-following `<meta http-equiv="refresh">` / HTTP `Refresh` redirects. Default: 5. Set to -1 to disable. */
   maxMetaRefreshDelaySeconds?: number
+  /** Robots.txt compliance & Crawl-delay awareness options (default: disabled). */
+  robots?: RobotsPolicyOptions
+  /** Exponential backoff retry policy on HTTP 429/503 (default: enabled, maxRetries=3). */
+  retry?: RetryPolicyOptions
+  /** Per-origin rate-limit awareness options (Retry-After, X-RateLimit-Reset, minDelayMs). */
+  rateLimit?: RateLimitOptions
+  /** Optional clock/sleep/random/fetch hooks for deterministic testing. */
+  robotsRetryHooks?: RobotsRetryHooks
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -2605,6 +2686,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   private downloads: DownloadQuarantineManager
   private dialogs: DialogManager
   private maxMetaRefreshDelaySeconds: number
+  private robotsRetry: RobotsRetryController
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
@@ -2624,6 +2706,52 @@ export class LiteBrowserEngine implements BrowserEngine {
     this.downloads = new DownloadQuarantineManager(opts.downloads, defaultQuarantineDir)
     this.dialogs = new DialogManager(opts.dialogs)
     this.maxMetaRefreshDelaySeconds = opts.maxMetaRefreshDelaySeconds ?? 5
+    this.robotsRetry = new RobotsRetryController({
+      robots: opts.robots,
+      retry: opts.retry,
+      rateLimit: opts.rateLimit,
+      hooks: opts.robotsRetryHooks,
+    })
+  }
+
+  getRobotsPolicy(): ResolvedRobotsPolicy {
+    return this.robotsRetry.getRobotsPolicy()
+  }
+
+  setRobotsPolicy(opts: RobotsPolicyOptions): ResolvedRobotsPolicy {
+    return this.robotsRetry.setRobotsPolicy(opts)
+  }
+
+  clearRobotsCache(origin?: string): void {
+    this.robotsRetry.clearRobotsCache(origin)
+  }
+
+  async checkRobots(url: string, userAgent?: string): Promise<RobotsDecision> {
+    return this.robotsRetry.checkRobots(url, userAgent ?? this.defaultEmulation.userAgent, true)
+  }
+
+  getRetryPolicy(): ResolvedRetryPolicy {
+    return this.robotsRetry.getRetryPolicy()
+  }
+
+  setRetryPolicy(opts: RetryPolicyOptions): ResolvedRetryPolicy {
+    return this.robotsRetry.setRetryPolicy(opts)
+  }
+
+  getRateLimitPolicy(): ResolvedRateLimitPolicy {
+    return this.robotsRetry.getRateLimitPolicy()
+  }
+
+  setRateLimitPolicy(opts: RateLimitOptions): ResolvedRateLimitPolicy {
+    return this.robotsRetry.setRateLimitPolicy(opts)
+  }
+
+  getRateLimitStats(): RateLimitStats {
+    return this.robotsRetry.getStats()
+  }
+
+  clearRateLimits(origin?: string): void {
+    this.robotsRetry.clearRateLimits(origin)
   }
 
   getCookieJar(): CookieJar {
@@ -2704,6 +2832,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       this.downloads,
       this.dialogs,
       this.maxMetaRefreshDelaySeconds,
+      this.robotsRetry,
     )
     if (initialUrl) {
       await tab.navigate(initialUrl)

@@ -87,6 +87,12 @@ import {
   redactStorageSnapshots,
 } from './storage.js'
 import { LiteBrowserEngine } from './lite.js'
+import type {
+  RateLimitOptions,
+  RetryPolicyOptions,
+  RobotsPolicyOptions,
+  RobotsRetryHooks,
+} from './robots-retry.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import { parseWaitState } from './wait.js'
 
@@ -126,6 +132,10 @@ export interface BrowserManagerOptions {
   crashRecovery?: CrashRecoveryOptions
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
+  robots?: RobotsPolicyOptions
+  retry?: RetryPolicyOptions
+  rateLimit?: RateLimitOptions
+  robotsRetryHooks?: RobotsRetryHooks
 }
 
 export class BrowserManager {
@@ -183,6 +193,10 @@ export class BrowserManager {
         profileDir,
         downloads: downloadsOpts,
         dialogs: opts.dialogs,
+        robots: opts.robots,
+        retry: opts.retry,
+        rateLimit: opts.rateLimit,
+        robotsRetryHooks: opts.robotsRetryHooks,
       })
     } else if (requested === 'chromium' || opts.cdpUrl) {
       // Explicit --engine chromium or explicit --cdp-url must fail loudly if unreachable
@@ -220,6 +234,10 @@ export class BrowserManager {
             profileDir,
             downloads: downloadsOpts,
             dialogs: opts.dialogs,
+            robots: opts.robots,
+            retry: opts.retry,
+            rateLimit: opts.rateLimit,
+            robotsRetryHooks: opts.robotsRetryHooks,
           })
         }
       } else {
@@ -228,6 +246,10 @@ export class BrowserManager {
           profileDir,
           downloads: downloadsOpts,
           dialogs: opts.dialogs,
+          robots: opts.robots,
+          retry: opts.retry,
+          rateLimit: opts.rateLimit,
+          robotsRetryHooks: opts.robotsRetryHooks,
         })
       }
     }
