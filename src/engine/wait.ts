@@ -3,6 +3,7 @@
 // --url (substring, glob *, or /regex/), and --timeout.
 
 import type { ElementDescriptor, WaitConditionOptions, WaitResult, WaitState } from '../types.js'
+import { decodeHtmlEntities } from './html-entities.js'
 
 export const VALID_WAIT_STATES: readonly WaitState[] = ['visible', 'hidden', 'attached'] as const
 
@@ -130,15 +131,6 @@ interface LiteDomNode {
   parent: LiteDomNode | null
 }
 
-function decodeBasicEntities(val: string): string {
-  return val
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-}
-
 function parseTagAttrs(attrStr: string): Record<string, string> {
   const attrs: Record<string, string> = {}
   const re = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g
@@ -146,7 +138,7 @@ function parseTagAttrs(attrStr: string): Record<string, string> {
   while ((m = re.exec(attrStr)) !== null) {
     const key = m[1]!.toLowerCase()
     const val = m[2] ?? m[3] ?? m[4] ?? ''
-    attrs[key] = decodeBasicEntities(val)
+    attrs[key] = decodeHtmlEntities(val, { attributeMode: true })
   }
   return attrs
 }
@@ -365,7 +357,7 @@ export function extractLitePageText(rawHtml: string): string {
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
     .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
-  return normalizeWhitespace(decodeBasicEntities(cleaned))
+  return normalizeWhitespace(decodeHtmlEntities(cleaned))
 }
 
 export function checkLiteSelectorState(
