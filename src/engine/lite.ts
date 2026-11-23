@@ -165,8 +165,131 @@ function resolveHref(href: string | undefined, baseUrl: string): string | undefi
   }
 }
 
+const UNSAFE_BASE_PROTOCOLS = new Set(['javascript:', 'vbscript:', 'data:'])
+const ALLOWED_REFRESH_PROTOCOLS = new Set(['http:', 'https:'])
+
+function stripIgnoredHtmlBlocks(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, '')
+}
+
+export interface MetaRefreshDirective {
+  delaySeconds: number
+  url?: string
+  rawContent: string
+}
+
+/**
+ * Extract the effective document base URL from the first `<base href="...">` element
+ * per HTML5 §4.2.3. Returns `undefined` when no valid `<base href>` is present.
+ * `<base target="...">` elements without `href` are skipped.
+ */
+export function extractBaseHref(html: string, documentUrl: string): string | undefined {
+  const cleaned = stripIgnoredHtmlBlocks(html)
+  const baseRe = /<base\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+  let m: RegExpExecArray | null
+  while ((m = baseRe.exec(cleaned)) !== null) {
+    const attrs = parseAttrs(m[1] ?? '')
+    if (!('href' in attrs)) continue
+    const rawHref = attrs.href.trim()
+    try {
+      const resolved = new URL(rawHref, documentUrl)
+      if (UNSAFE_BASE_PROTOCOLS.has(resolved.protocol.toLowerCase())) {
+        return undefined
+      }
+      return resolved.toString()
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+/**
+ * Parse the `content` attribute of `<meta http-equiv="refresh" content="...">`
+ * (or an HTTP `Refresh` header) following WHATWG HTML5 shared declarative refresh steps.
+ */
+export function parseMetaRefreshContent(content: string, baseUrl: string): MetaRefreshDirective | undefined {
+  const trimmed = content.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
+  if (!trimmed) return undefined
+
+  const numMatch = /^(\d+(?:\.\d*)?)/.exec(trimmed)
+  if (!numMatch) return undefined
+
+  const delaySeconds = Number.parseFloat(numMatch[1]!)
+  if (!Number.isFinite(delaySeconds) || delaySeconds < 0) return undefined
+
+  let rest = trimmed.slice(numMatch[0].length).replace(/^[\t\n\f\r ]+/, '')
+  if (!rest) {
+    return { delaySeconds, rawContent: content }
+  }
+
+  if (rest[0] === ';' || rest[0] === ',') {
+    rest = rest.slice(1).replace(/^[\t\n\f\r ]+/, '')
+  } else if (!/^url[\t\n\f\r ]*=/i.test(rest)) {
+    return undefined
+  }
+
+  if (!rest) {
+    return { delaySeconds, rawContent: content }
+  }
+
+  const urlPrefix = /^url[\t\n\f\r ]*=[\t\n\f\r ]*/i.exec(rest)
+  if (urlPrefix) {
+    rest = rest.slice(urlPrefix[0].length)
+  }
+
+  let rawUrl = rest
+  if (rawUrl.startsWith('"') || rawUrl.startsWith("'")) {
+    const quote = rawUrl[0]!
+    const closingIdx = rawUrl.indexOf(quote, 1)
+    rawUrl = closingIdx >= 0 ? rawUrl.slice(1, closingIdx) : rawUrl.slice(1)
+  }
+
+  rawUrl = rawUrl.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
+  if (!rawUrl) {
+    return { delaySeconds, rawContent: content }
+  }
+
+  try {
+    const resolved = new URL(rawUrl, baseUrl)
+    if (!ALLOWED_REFRESH_PROTOCOLS.has(resolved.protocol.toLowerCase())) {
+      return undefined
+    }
+    return {
+      delaySeconds,
+      url: resolved.toString(),
+      rawContent: content,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Extract the first valid `<meta http-equiv="refresh" content="...">` directive from HTML.
+ */
+export function extractMetaRefresh(html: string, baseUrl: string): MetaRefreshDirective | undefined {
+  const cleaned = stripIgnoredHtmlBlocks(html)
+  const metaRe = /<meta\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+  let m: RegExpExecArray | null
+  while ((m = metaRe.exec(cleaned)) !== null) {
+    const attrs = parseAttrs(m[1] ?? '')
+    if ((attrs['http-equiv'] ?? '').trim().toLowerCase() !== 'refresh') continue
+    if (!('content' in attrs)) continue
+    const parsed = parseMetaRefreshContent(attrs.content, baseUrl)
+    if (parsed) return parsed
+  }
+  return undefined
+}
+
 export interface ParsedDoc {
   title: string
+  baseUrl?: string
+  metaRefresh?: MetaRefreshDirective
   blocks: Array<ContentBlock & { selector?: string }>
   elements: ElementDescriptor[]
   frames?: FrameSummary[]
@@ -175,12 +298,12 @@ export interface ParsedDoc {
 }
 
 export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc {
-  // Remove scripts, styles, noscript, comments
-  const cleaned = html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, '')
+  // Remove scripts, styles, comments, and inline SVG before scanning
+  const cleaned = stripIgnoredHtmlBlocks(html)
+  const documentUrl = baseUrl
+  const resolvedBaseHref = extractBaseHref(cleaned, documentUrl)
+  const effectiveBaseUrl = resolvedBaseHref ?? documentUrl
+  const metaRefresh = extractMetaRefresh(cleaned, effectiveBaseUrl)
 
   const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(cleaned)
   const title = titleMatch ? stripTags(titleMatch[1]!) : ''
@@ -279,7 +402,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         attrs.title?.trim() ||
         humanizeFormName(attrs.name || attrs.id)
       forms.set(currentFormId, {
-        action: resolveHref(attrs.action, baseUrl) ?? baseUrl,
+        action: attrs.action?.trim() ? (resolveHref(attrs.action.trim(), effectiveBaseUrl) ?? documentUrl) : documentUrl,
         method: (attrs.method ?? 'GET').toUpperCase(),
         fieldSelectors: [],
         title: formTitle,
@@ -342,7 +465,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         const lText = stripTags(alm[2] ?? '') || attrs['aria-label'] || attrs.href || ''
         if (lText) {
           const selector = attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`
-          const href = resolveHref(attrs.href, baseUrl)
+          const href = resolveHref(attrs.href, effectiveBaseUrl)
           const el: ElementDescriptor = {
             selector,
             tag: 'a',
@@ -390,7 +513,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       const text = stripTags(m[8]) || attrs['aria-label'] || attrs.href || ''
       if (!text) continue
       const selector = attrs.id ? `#${attrs.id}` : `a:nth-of-type(${++elIndex})`
-      const href = resolveHref(attrs.href, baseUrl)
+      const href = resolveHref(attrs.href, effectiveBaseUrl)
       elements.push({
         selector,
         tag: 'a',
@@ -620,7 +743,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       // <img>
       const attrs = parseAttrs(m[22])
       const alt = attrs.alt || attrs.title || attrs.src || 'image'
-      const src = resolveHref(attrs.src, baseUrl)
+      const src = resolveHref(attrs.src, effectiveBaseUrl)
       const naturalWidth = parsePositiveDim(attrs.width)
       const naturalHeight = parsePositiveDim(attrs.height)
       pushBlock({
@@ -683,7 +806,7 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
         : attrs.name
           ? `iframe[name="${attrs.name}"]`
           : `iframe:nth-of-type(${iframeCount})`
-      const childDoc = parseHtmlDocument(attrs.srcdoc, baseUrl, depth + 1)
+      const childDoc = parseHtmlDocument(attrs.srcdoc, effectiveBaseUrl, depth + 1)
       if (childDoc.elements.length === 0 && childDoc.blocks.length === 0 && !childDoc.text.trim()) {
         continue
       }
@@ -729,6 +852,8 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
       )
       return {
         title,
+        ...(resolvedBaseHref ? { baseUrl: resolvedBaseHref } : {}),
+        ...(metaRefresh ? { metaRefresh } : {}),
         blocks: flattened.blocks,
         elements: flattened.elements,
         frames: flattened.frames,
@@ -738,7 +863,15 @@ export function parseHtmlDocument(html: string, baseUrl: string, depth = 0): Par
     }
   }
 
-  return { title, blocks, elements, text, forms }
+  return {
+    title,
+    ...(resolvedBaseHref ? { baseUrl: resolvedBaseHref } : {}),
+    ...(metaRefresh ? { metaRefresh } : {}),
+    blocks,
+    elements,
+    text,
+    forms,
+  }
 }
 
 class LiteTab implements TabDriver {
@@ -761,6 +894,7 @@ class LiteTab implements TabDriver {
   private emulation: EmulationProfile
   private downloads?: DownloadQuarantineManager
   private dialogs?: DialogManager
+  private maxMetaRefreshDelaySeconds: number
 
   constructor(
     id: number,
@@ -769,6 +903,7 @@ class LiteTab implements TabDriver {
     initialEmulation?: EmulationProfile,
     downloads?: DownloadQuarantineManager,
     dialogs?: DialogManager,
+    maxMetaRefreshDelaySeconds = 5,
   ) {
     this.id = id
     this.cookieJar = cookieJar
@@ -776,6 +911,7 @@ class LiteTab implements TabDriver {
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.downloads = downloads
     this.dialogs = dialogs
+    this.maxMetaRefreshDelaySeconds = maxMetaRefreshDelaySeconds
   }
 
   getEmulation(): EmulationProfile {
@@ -825,7 +961,30 @@ class LiteTab implements TabDriver {
 
     try {
       let res: Response | null = null
+      let preReadBody: string | null = null
+      let preParsedDoc: ParsedDoc | null = null
+
+      const buildGetRedirectInit = (prevUrl: string, nextUrl: string, prevInit: RequestInit): RequestInit => {
+        const prevOrigin = new URL(prevUrl).origin
+        const nextOrigin = new URL(nextUrl).origin
+        const nextInit: RequestInit = { ...prevInit, method: 'GET' }
+        delete nextInit.body
+        if (nextInit.headers) {
+          const cleaned = new Headers(nextInit.headers)
+          cleaned.delete('cookie')
+          cleaned.delete('content-type')
+          cleaned.delete('content-length')
+          if (prevOrigin !== nextOrigin) {
+            cleaned.delete('authorization')
+          }
+          nextInit.headers = cleaned
+        }
+        return nextInit
+      }
+
       for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+        preReadBody = null
+        preParsedDoc = null
         if (isTrackerHost(currentUrl)) {
           throw new Error(`Blocked tracker host: ${currentUrl}`)
         }
@@ -899,6 +1058,54 @@ class LiteTab implements TabDriver {
           currentInit = nextInit
           continue
         }
+
+        // Check HTTP Refresh header (shared declarative refresh semantics)
+        const refreshHeader = res.headers.get('refresh')
+        if (refreshHeader && this.maxMetaRefreshDelaySeconds >= 0) {
+          const headerRefresh = parseMetaRefreshContent(refreshHeader, currentUrl)
+          if (
+            headerRefresh?.url &&
+            headerRefresh.delaySeconds <= this.maxMetaRefreshDelaySeconds &&
+            headerRefresh.url !== currentUrl
+          ) {
+            if (hop === MAX_REDIRECTS) {
+              throw new Error(`Too many redirects (>${MAX_REDIRECTS}) while fetching ${targetUrl}`)
+            }
+            try {
+              await res.body?.cancel()
+            } catch {
+              // ignore body cancellation errors
+            }
+            currentInit = buildGetRedirectInit(currentUrl, headerRefresh.url, currentInit)
+            currentUrl = headerRefresh.url
+            continue
+          }
+        }
+
+        // Check HTML <meta http-equiv="refresh"> for non-download HTML responses
+        const hopContentType = res.headers.get('content-type') ?? ''
+        const hopContentDisp = res.headers.get('content-disposition')
+        const isDownload = Boolean(this.downloads && isDownloadResponse(hopContentDisp, hopContentType))
+        const isPlainOrJson = hopContentType.includes('application/json') || hopContentType.includes('text/plain')
+        if (!isDownload && !isPlainOrJson) {
+          preReadBody = await res.text()
+          preParsedDoc = parseHtmlDocument(preReadBody, currentUrl)
+          const mr = preParsedDoc.metaRefresh
+          if (
+            this.maxMetaRefreshDelaySeconds >= 0 &&
+            mr?.url &&
+            mr.delaySeconds <= this.maxMetaRefreshDelaySeconds &&
+            mr.url !== currentUrl
+          ) {
+            if (hop === MAX_REDIRECTS) {
+              throw new Error(`Too many redirects (>${MAX_REDIRECTS}) while fetching ${targetUrl}`)
+            }
+            currentInit = buildGetRedirectInit(currentUrl, mr.url, currentInit)
+            currentUrl = mr.url
+            continue
+          }
+        }
+
         break
       }
 
@@ -959,10 +1166,10 @@ class LiteTab implements TabDriver {
         return { url: this.url, title: this.title }
       }
 
-      const body = await res.text()
+      const body = preReadBody ?? (await res.text())
       this.networkRecorder.record({
         url: finalUrl,
-        method: init?.method ?? 'GET',
+        method: currentInit.method ?? init?.method ?? 'GET',
         status: res.status,
         statusText: res.statusText || undefined,
         ok: res.ok,
@@ -988,7 +1195,7 @@ class LiteTab implements TabDriver {
           forms: new Map(),
         }
       } else {
-        this.doc = parseHtmlDocument(body, finalUrl)
+        this.doc = preParsedDoc ?? parseHtmlDocument(body, finalUrl)
       }
 
       this.url = finalUrl
@@ -1452,6 +1659,8 @@ export interface LiteEngineOptions {
   persistSessionCookies?: boolean
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
+  /** Maximum delay in seconds for auto-following `<meta http-equiv="refresh">` / HTTP `Refresh` redirects. Default: 5. Set to -1 to disable. */
+  maxMetaRefreshDelaySeconds?: number
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -1463,6 +1672,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   private defaultEmulation: EmulationProfile
   private downloads: DownloadQuarantineManager
   private dialogs: DialogManager
+  private maxMetaRefreshDelaySeconds: number
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
@@ -1481,6 +1691,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       : path.join(os.tmpdir(), `troy-advanced-lite-quarantine-${process.pid}`)
     this.downloads = new DownloadQuarantineManager(opts.downloads, defaultQuarantineDir)
     this.dialogs = new DialogManager(opts.dialogs)
+    this.maxMetaRefreshDelaySeconds = opts.maxMetaRefreshDelaySeconds ?? 5
   }
 
   getCookieJar(): CookieJar {
@@ -1560,6 +1771,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       this.defaultEmulation,
       this.downloads,
       this.dialogs,
+      this.maxMetaRefreshDelaySeconds,
     )
     if (initialUrl) {
       await tab.navigate(initialUrl)
