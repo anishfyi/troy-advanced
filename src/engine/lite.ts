@@ -17,6 +17,7 @@ import type {
 } from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
+import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import {
@@ -752,8 +753,15 @@ class LiteTab implements TabDriver {
     return { ok: true, value: el.value }
   }
 
-  async press(key: string, selector?: string): Promise<{ ok: boolean }> {
-    if (key === 'Enter' && selector) {
+  async press(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }> {
+    let chord
+    try {
+      chord = parseKeyChord(key)
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+    const mainKey = chord.mainKey?.key
+    if (mainKey === 'Enter' && chord.modifiersBitmask === 0 && selector) {
       for (const form of this.doc.forms.values()) {
         if (form.fieldSelectors.includes(selector)) {
           const submitBtn = form.fieldSelectors
@@ -761,12 +769,23 @@ class LiteTab implements TabDriver {
             .find((e) => e && (e.defaultSubmit || e.tag === 'button'))
           if (submitBtn) {
             await this.click(submitBtn.selector)
-            return { ok: true }
+            return { ok: true, normalized: chord.normalized, modifiers: chord.modifiersBitmask }
           }
         }
       }
     }
-    return { ok: true }
+    if (chord.modifiersBitmask === 0 && !selector) {
+      if (mainKey === 'PageDown' || mainKey === 'ArrowDown') {
+        await this.scroll('down', mainKey === 'PageDown' ? 400 : 80)
+      } else if (mainKey === 'PageUp' || mainKey === 'ArrowUp') {
+        await this.scroll('up', mainKey === 'PageUp' ? 400 : 80)
+      } else if (mainKey === 'Home') {
+        await this.scroll('top')
+      } else if (mainKey === 'End') {
+        await this.scroll('bottom')
+      }
+    }
+    return { ok: true, normalized: chord.normalized, modifiers: chord.modifiersBitmask }
   }
 
   async hover(_selector: string): Promise<{ ok: boolean }> {

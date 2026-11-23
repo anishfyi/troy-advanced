@@ -22,7 +22,7 @@ export interface TabDriver {
   click(selector: string): Promise<{ ok: boolean; note?: string }>
   fill(selector: string, text: string, clear?: boolean): Promise<{ ok: boolean; value?: string }>
   select(selector: string, value: string): Promise<{ ok: boolean; value?: string }>
-  press(key: string, selector?: string): Promise<{ ok: boolean }>
+  press(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }>
   hover(selector: string): Promise<{ ok: boolean }>
   scroll(direction: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom', amount?: number): Promise<{ scrollX: number; scrollY: number }>
   waitFor(options: WaitConditionOptions): Promise<WaitResult>

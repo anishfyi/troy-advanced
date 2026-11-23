@@ -41,7 +41,7 @@ Client Commands (talk to running daemon, or use --oneshot):
   click <ref> [--allow-submit]            Click element ref
   fill <ref> <text> [--clear]             Fill input ref
   select <ref> <value>                    Select dropdown option
-  press <key> [--ref eN]                  Press key
+  press <key> [--ref eN]                  Press key or chord (e.g. Control+A, Shift+Tab, Escape, ArrowDown, Meta+K)
   scroll [up|down|top|bottom] [amount]    Scroll page
   wait [ms] [--text <str>] [--selector <css>] [--url <pattern>] [--state visible|hidden|attached] [--timeout <ms>]
                                           Wait for page condition or fixed delay

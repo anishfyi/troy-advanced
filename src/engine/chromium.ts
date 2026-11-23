@@ -21,6 +21,7 @@ import type {
   WaitState,
 } from '../types.js'
 import { CdpClient } from './cdp-client.js'
+import { dispatchKeyChord } from './keyboard.js'
 import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
 import type { BrowserEngine, TabDriver } from './types.js'
@@ -755,14 +756,17 @@ class ChromiumTab implements TabDriver {
     return res ?? { ok: false }
   }
 
-  async press(key: string, selector?: string): Promise<{ ok: boolean }> {
+  async press(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }> {
     if (selector) {
       await this.evalJson(`document.querySelector(${JSON.stringify(selector)})?.focus()`)
     }
-    await this.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, text: key.length === 1 ? key : undefined })
-    await this.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key })
-    await new Promise((r) => setTimeout(r, 120))
-    return { ok: true }
+    try {
+      const { chord } = await dispatchKeyChord((method, params) => this.cdp.send(method, params), key)
+      await new Promise((r) => setTimeout(r, 120))
+      return { ok: true, normalized: chord.normalized, modifiers: chord.modifiersBitmask }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
   }
 
   async hover(selector: string): Promise<{ ok: boolean }> {
