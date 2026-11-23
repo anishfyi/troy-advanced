@@ -86,6 +86,12 @@ import {
   type ParsedFeed,
 } from './feed-reader.js'
 import {
+  detectDocumentKind,
+  renderDocumentView,
+  type CsvSortDirection,
+  type DocumentKind,
+} from './document-view.js'
+import {
   ResponseCache,
   isCacheableMethod,
   isUnsafeMethod,
@@ -1505,6 +1511,12 @@ class LiteTab implements TabDriver {
   private feedExpandedItems = new Set<number>()
   private feedCategoryFilter: string | null = null
   private feedPage = 0
+  private docKind: DocumentKind | null = null
+  private docContentType = ''
+  private docPage = 0
+  private docCsvSortCol: number | null = null
+  private docCsvSortDir: CsvSortDirection = 'asc'
+  private docRawView = false
   private historyStack: string[] = []
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
@@ -1823,9 +1835,9 @@ class LiteTab implements TabDriver {
         const hopContentType = res.headers.get('content-type') ?? ''
         const hopContentDisp = res.headers.get('content-disposition')
         const isDownload = Boolean(this.downloads && isDownloadResponse(hopContentDisp, hopContentType))
-        const isPlain = hopContentType.toLowerCase().includes('text/plain')
+        const isDocumentByMime = detectDocumentKind(hopContentType, '', currentUrl) !== null
         const isStructuredByMime = detectStructuredKind(hopContentType, '', currentUrl) !== null
-        if (!isDownload && !isPlain && !isStructuredByMime) {
+        if (!isDownload && !isDocumentByMime && !isStructuredByMime) {
           preReadBody = await res.text()
           preParsedDoc = parseHtmlDocument(preReadBody, currentUrl)
           const mr = preParsedDoc.metaRefresh
@@ -1952,6 +1964,12 @@ class LiteTab implements TabDriver {
       this.feedExpandedItems.clear()
       this.feedCategoryFilter = null
       this.feedPage = 0
+      this.docKind = null
+      this.docContentType = ''
+      this.docPage = 0
+      this.docCsvSortCol = null
+      this.docCsvSortDir = 'asc'
+      this.docRawView = false
 
       const feedKind = detectFeedKind(contentType, body, finalUrl)
       if (feedKind) {
@@ -1974,17 +1992,16 @@ class LiteTab implements TabDriver {
             text: parsed.text,
             forms: new Map(),
           }
-        } else if (contentType.toLowerCase().includes('text/plain')) {
-          const title = new URL(finalUrl).pathname || finalUrl
-          this.doc = {
-            title,
-            blocks: [{ kind: 'code', text: body.slice(0, 16000), tag: 'pre' }],
-            elements: [],
-            text: body.slice(0, 16000),
-            forms: new Map(),
-          }
         } else {
-          this.doc = preParsedDoc ?? parseHtmlDocument(body, finalUrl)
+          const docKind = detectDocumentKind(contentType, body, finalUrl)
+          if (docKind) {
+            this.docKind = docKind
+            this.docContentType = contentType
+            this.url = finalUrl
+            this.reparseDocumentView()
+          } else {
+            this.doc = preParsedDoc ?? parseHtmlDocument(body, finalUrl)
+          }
         }
       }
 
@@ -2225,6 +2242,25 @@ class LiteTab implements TabDriver {
     this.title = this.doc.title || this.url
   }
 
+  private reparseDocumentView(): void {
+    if (!this.docKind) return
+    const rendered = renderDocumentView(this.docKind, this.rawHtml, this.url, this.docContentType, {
+      page: this.docPage,
+      sortColumn: this.docCsvSortCol,
+      sortDirection: this.docCsvSortDir,
+      rawView: this.docRawView,
+    })
+    this.docPage = rendered.page
+    this.doc = {
+      title: rendered.title,
+      blocks: rendered.blocks,
+      elements: rendered.elements,
+      text: rendered.text,
+      forms: new Map(),
+    }
+    this.title = this.doc.title || this.url
+  }
+
   private reparseStructuredView(): void {
     if (!this.structuredKind) return
     const parsed = parseStructuredDocument(this.structuredKind, this.rawHtml, this.url, {
@@ -2337,6 +2373,69 @@ class LiteTab implements TabDriver {
         }
         this.reparseStructuredView()
         return { ok: true, note: 'collapsed all nodes' }
+      }
+    }
+
+    if (this.docKind) {
+      if (selector === 'doc-page:next') {
+        this.docPage += 1
+        this.scrollY = 0
+        this.reparseDocumentView()
+        return { ok: true, note: `document page ${this.docPage + 1}` }
+      }
+      if (selector === 'doc-page:prev') {
+        this.docPage = Math.max(0, this.docPage - 1)
+        this.scrollY = 0
+        this.reparseDocumentView()
+        return { ok: true, note: `document page ${this.docPage + 1}` }
+      }
+      if (selector === 'doc-csv-sort:reset') {
+        this.docCsvSortCol = null
+        this.docCsvSortDir = 'asc'
+        this.docPage = 0
+        this.scrollY = 0
+        this.reparseDocumentView()
+        return { ok: true, note: 'reset CSV sort order' }
+      }
+      if (selector.startsWith('doc-csv-sort:')) {
+        const colIdx = Number.parseInt(selector.slice('doc-csv-sort:'.length), 10)
+        if (Number.isFinite(colIdx) && colIdx >= 0) {
+          if (this.docCsvSortCol === colIdx) {
+            if (this.docCsvSortDir === 'asc') {
+              this.docCsvSortDir = 'desc'
+            } else {
+              this.docCsvSortCol = null
+              this.docCsvSortDir = 'asc'
+            }
+          } else {
+            this.docCsvSortCol = colIdx
+            this.docCsvSortDir = 'asc'
+          }
+          this.docPage = 0
+          this.scrollY = 0
+          this.reparseDocumentView()
+          return {
+            ok: true,
+            note:
+              this.docCsvSortCol !== null
+                ? `sorted column ${this.docCsvSortCol + 1} (${this.docCsvSortDir})`
+                : 'reset CSV sort order',
+          }
+        }
+      }
+      if (selector === 'doc-action:raw-text') {
+        this.docRawView = true
+        this.docPage = 0
+        this.scrollY = 0
+        this.reparseDocumentView()
+        return { ok: true, note: 'switched to raw text view' }
+      }
+      if (selector === 'doc-action:formatted') {
+        this.docRawView = false
+        this.docPage = 0
+        this.scrollY = 0
+        this.reparseDocumentView()
+        return { ok: true, note: `switched to formatted ${this.docKind} view` }
       }
     }
 
