@@ -4,6 +4,7 @@
 export interface CdpEvent {
   method: string
   params: Record<string, unknown>
+  sessionId?: string
 }
 
 export class CdpClient {
@@ -13,7 +14,7 @@ export class CdpClient {
     number,
     { resolve: (v: Record<string, unknown>) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
   >()
-  private listeners = new Map<string, Set<(params: Record<string, unknown>) => void>>()
+  private listeners = new Map<string, Set<(params: Record<string, unknown>, sessionId?: string) => void>>()
   private closed = false
 
   private constructor(ws: WebSocket) {
@@ -26,6 +27,7 @@ export class CdpClient {
           error?: { message?: string; code?: number }
           method?: string
           params?: Record<string, unknown>
+          sessionId?: string
         }
         if (typeof msg.id === 'number') {
           const entry = this.pending.get(msg.id)
@@ -43,7 +45,7 @@ export class CdpClient {
           if (set) {
             for (const fn of set) {
               try {
-                fn(msg.params ?? {})
+                fn(msg.params ?? {}, msg.sessionId)
               } catch {
                 // listener error should not break CDP dispatch
               }
@@ -96,7 +98,7 @@ export class CdpClient {
     })
   }
 
-  on(method: string, handler: (params: Record<string, unknown>) => void): () => void {
+  on(method: string, handler: (params: Record<string, unknown>, sessionId?: string) => void): () => void {
     let set = this.listeners.get(method)
     if (!set) {
       set = new Set()
@@ -112,6 +114,7 @@ export class CdpClient {
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = 15000,
+    sessionId?: string,
   ): Promise<T> {
     if (this.closed) return Promise.reject(new Error('CDP client is closed'))
     const id = this.nextId++
@@ -127,8 +130,19 @@ export class CdpClient {
         timer,
       })
 
-      this.ws.send(JSON.stringify({ id, method, params }))
+      const payload: Record<string, unknown> = { id, method, params }
+      if (sessionId) payload.sessionId = sessionId
+      this.ws.send(JSON.stringify(payload))
     })
+  }
+
+  sendToSession<T extends Record<string, unknown> = Record<string, unknown>>(
+    sessionId: string | undefined,
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs = 15000,
+  ): Promise<T> {
+    return this.send<T>(method, params, timeoutMs, sessionId)
   }
 
   async close(): Promise<void> {

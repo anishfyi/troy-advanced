@@ -25,7 +25,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M18: Network idle + DOM mutation settle detector (`waitForPageSettle`) so SPAs finish hydrating before snapshots
 - [x] M19: Full keyboard chord support (`Control+A`, `Shift+Tab`, `Escape`, `ArrowDown`, `Meta+K`) with proper CDP modifier bitmasks and Windows virtual key codes
 - [x] M20: Shadow DOM deep selector traversal in `click`, `fill`, `select`, `hover`, and `press` (not just `document.querySelector`)
-- [ ] M21: Cross-frame `<iframe>` discovery and snapshot flattening so embedded forms and widgets get real `eN` refs
+- [x] M21: Cross-frame `<iframe>` discovery and snapshot flattening so embedded forms and widgets get real `eN` refs
 - [ ] M22: Deterministic stale-ref recovery (re-locate by `id`, `ariaLabel`, `name+tag`, `role+ariaLabel` when unique match exists on same epoch)
 - [ ] M23: Cookie export/import commands (`troy-advanced cookies export|import`) for transferring signed-in sessions to an EC2 instance securely
 - [ ] M24: LocalStorage / SessionStorage inspection & transfer helpers for EC2 session hydration

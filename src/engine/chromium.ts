@@ -21,6 +21,16 @@ import type {
   WaitState,
 } from '../types.js'
 import { CdpClient } from './cdp-client.js'
+import {
+  IFRAME_OWNER_INFO_FUNCTION,
+  flattenFrameSnapshots,
+  isCrossOriginUrl,
+  offsetRect,
+  parseFrameIdToken,
+  parseFrameSelector,
+  type ChildFrameSnapshotInput,
+  type RawFrameSnapshot,
+} from './frames.js'
 import { dispatchKeyChord } from './keyboard.js'
 import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
 import { SHADOW_DOM_QUERY_HELPER } from './shadow-dom.js'
@@ -485,6 +495,46 @@ async function waitForCdp(port: number, timeoutMs = 15000): Promise<{ webSocketD
   throw new Error(`Chromium CDP did not become ready on port ${port} within ${timeoutMs}ms`)
 }
 
+interface CdpFrameTreeNode {
+  frame: {
+    id: string
+    parentId?: string
+    name?: string
+    url?: string
+    securityOrigin?: string
+  }
+  childFrames?: CdpFrameTreeNode[]
+}
+
+interface FrameOwnerInfo {
+  visible: boolean
+  contentX?: number
+  contentY?: number
+  box?: { x: number; y: number; width: number; height: number }
+  selector?: string
+  name?: string
+  title?: string
+}
+
+interface DiscoveredFrame {
+  frameId: string
+  parentFrameId?: string
+  url: string
+  name?: string
+  title?: string
+  selectorChain: string[]
+  offsetX: number
+  offsetY: number
+  box?: { x: number; y: number; width: number; height: number }
+  sessionId?: string
+  parentSessionId?: string
+  depth: number
+  crossOrigin: boolean
+}
+
+const MAX_FRAME_DEPTH = 5
+const MAX_DISCOVERED_FRAMES = 20
+
 class ChromiumTab implements TabDriver {
   readonly id: number
   readonly engine = 'chromium' as const
@@ -495,6 +545,9 @@ class ChromiumTab implements TabDriver {
   private title = 'New Tab'
   private loading = false
   private epoch = 0
+  private mainFrameId: string | null = null
+  private frameContexts = new Map<string, number>()
+  private oopifSessions = new Map<string, string>()
   private consoleLogs: ConsoleEntry[] = []
   private networkLogs: NetworkEntry[] = []
   private reqStart = new Map<string, { url: string; method: string; ts: number }>()
@@ -523,16 +576,64 @@ class ChromiumTab implements TabDriver {
       },
     })
 
-    this.cdp.on('Page.frameNavigated', (params) => {
-      const frame = params.frame as { parentId?: string; url?: string } | undefined
+    this.cdp.on('Page.frameNavigated', (params, sessionId) => {
+      if (sessionId) return
+      const frame = params.frame as { id?: string; parentId?: string; url?: string } | undefined
       if (frame && !frame.parentId && frame.url) {
+        if (frame.id) this.mainFrameId = frame.id
         this.url = frame.url
         this.epoch += 1
         this.networkIdle.onNavigationReset()
       }
     })
-    this.cdp.on('Page.loadEventFired', () => {
-      this.loading = false
+    this.cdp.on('Page.loadEventFired', (_params, sessionId) => {
+      if (!sessionId) this.loading = false
+    })
+    this.cdp.on('Runtime.executionContextCreated', (params, sessionId) => {
+      const ctx = params.context as
+        | { id?: number; auxData?: { frameId?: string; isDefault?: boolean; type?: string } }
+        | undefined
+      if (typeof ctx?.id === 'number' && ctx.auxData?.frameId && ctx.auxData.isDefault) {
+        this.frameContexts.set(`${sessionId ?? ''}:${ctx.auxData.frameId}`, ctx.id)
+      }
+    })
+    this.cdp.on('Runtime.executionContextDestroyed', (params, sessionId) => {
+      const destroyedId = params.executionContextId
+      const prefix = `${sessionId ?? ''}:`
+      for (const [key, val] of this.frameContexts) {
+        if (key.startsWith(prefix) && val === destroyedId) {
+          this.frameContexts.delete(key)
+        }
+      }
+    })
+    this.cdp.on('Runtime.executionContextsCleared', (_params, sessionId) => {
+      const prefix = `${sessionId ?? ''}:`
+      for (const key of [...this.frameContexts.keys()]) {
+        if (key.startsWith(prefix)) this.frameContexts.delete(key)
+      }
+    })
+    this.cdp.on('Target.attachedToTarget', (params) => {
+      const childSessionId = String(params.sessionId ?? '')
+      const targetInfo = params.targetInfo as { targetId?: string; type?: string; url?: string } | undefined
+      if (childSessionId && targetInfo?.targetId && targetInfo.type === 'iframe') {
+        this.oopifSessions.set(targetInfo.targetId, childSessionId)
+        void Promise.all([
+          this.cdp.sendToSession(childSessionId, 'Runtime.enable').catch(() => {}),
+          this.cdp.sendToSession(childSessionId, 'Page.enable').catch(() => {}),
+          this.cdp.sendToSession(childSessionId, 'DOM.enable').catch(() => {}),
+        ])
+      }
+    })
+    this.cdp.on('Target.detachedFromTarget', (params) => {
+      const detachedSessionId = String(params.sessionId ?? '')
+      if (!detachedSessionId) return
+      for (const [frameId, sid] of this.oopifSessions) {
+        if (sid === detachedSessionId) this.oopifSessions.delete(frameId)
+      }
+      const prefix = `${detachedSessionId}:`
+      for (const key of [...this.frameContexts.keys()]) {
+        if (key.startsWith(prefix)) this.frameContexts.delete(key)
+      }
     })
     this.cdp.on('Runtime.consoleAPICalled', (params) => {
       const levelRaw = String(params.type ?? 'log')
@@ -625,6 +726,7 @@ class ChromiumTab implements TabDriver {
       this.cdp.send('Page.enable'),
       this.cdp.send('Runtime.enable'),
       this.cdp.send('Network.enable'),
+      this.cdp.send('DOM.enable').catch(() => {}),
       this.cdp.send('Emulation.setDeviceMetricsOverride', {
         width: 1280,
         height: 800,
@@ -632,6 +734,13 @@ class ChromiumTab implements TabDriver {
         mobile: false,
       }),
     ])
+    await this.cdp
+      .send('Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      })
+      .catch(() => {})
     await this.trackerBlocker.enable()
   }
 
@@ -651,19 +760,431 @@ class ChromiumTab implements TabDriver {
     return this.epoch
   }
 
-  private async evalJson<T>(expression: string): Promise<T> {
-    const res = await this.cdp.send<{
-      result?: { value?: T; description?: string }
-      exceptionDetails?: { text?: string; exception?: { description?: string } }
-    }>('Runtime.evaluate', {
+  private async evalJson<T>(expression: string, sessionId?: string, contextId?: number): Promise<T> {
+    const params: Record<string, unknown> = {
       expression,
       returnByValue: true,
       awaitPromise: true,
-    })
+    }
+    if (contextId !== undefined) params.contextId = contextId
+    const res = await this.cdp.sendToSession<{
+      result?: { value?: T; description?: string }
+      exceptionDetails?: { text?: string; exception?: { description?: string } }
+    }>(sessionId, 'Runtime.evaluate', params)
     if (res.exceptionDetails) {
       throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'Runtime.evaluate exception')
     }
     return res.result?.value as T
+  }
+
+  private async evalInFrame<T>(frameId: string | undefined, sessionId: string | undefined, expression: string): Promise<T> {
+    if (!frameId || (frameId === this.mainFrameId && !sessionId)) {
+      return this.evalJson<T>(expression)
+    }
+
+    const oopifSession = this.oopifSessions.get(frameId)
+    const targetSessionId = sessionId ?? oopifSession
+
+    // If this frame is the root of an OOPIF target, evaluate directly in its session's default context
+    if (oopifSession && targetSessionId === oopifSession) {
+      return this.evalJson<T>(expression, oopifSession)
+    }
+
+    // Same-process child frame (either on main session or nested inside an OOPIF session)
+    const ctxKey = `${targetSessionId ?? ''}:${frameId}`
+    const knownCtx = this.frameContexts.get(ctxKey)
+    if (knownCtx !== undefined) {
+      try {
+        return await this.evalJson<T>(expression, targetSessionId, knownCtx)
+      } catch {
+        this.frameContexts.delete(ctxKey)
+      }
+    }
+
+    const world = await this.cdp.sendToSession<{ executionContextId: number }>(
+      targetSessionId,
+      'Page.createIsolatedWorld',
+      { frameId, worldName: 'troy-advanced' },
+    )
+    return this.evalJson<T>(expression, targetSessionId, world.executionContextId)
+  }
+
+  private async getFrameOwnerInfo(frameId: string, parentSessionId?: string): Promise<FrameOwnerInfo | null> {
+    try {
+      const owner = await this.cdp.sendToSession<{ backendNodeId?: number }>(
+        parentSessionId,
+        'DOM.getFrameOwner',
+        { frameId },
+      )
+      if (!owner.backendNodeId) return null
+      const resolved = await this.cdp.sendToSession<{ object?: { objectId?: string } }>(
+        parentSessionId,
+        'DOM.resolveNode',
+        { backendNodeId: owner.backendNodeId },
+      )
+      const objectId = resolved.object?.objectId
+      if (!objectId) return null
+      try {
+        const res = await this.cdp.sendToSession<{ result?: { value?: FrameOwnerInfo } }>(
+          parentSessionId,
+          'Runtime.callFunctionOn',
+          {
+            objectId,
+            functionDeclaration: IFRAME_OWNER_INFO_FUNCTION,
+            returnByValue: true,
+          },
+        )
+        return res.result?.value ?? null
+      } finally {
+        void this.cdp.sendToSession(parentSessionId, 'Runtime.releaseObject', { objectId }).catch(() => {})
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private async discoverFrames(): Promise<DiscoveredFrame[]> {
+    let rootTree: CdpFrameTreeNode | undefined
+    try {
+      const res = await this.cdp.send<{ frameTree?: CdpFrameTreeNode }>('Page.getFrameTree')
+      rootTree = res.frameTree
+    } catch {
+      return []
+    }
+    if (!rootTree?.frame?.id) return []
+    this.mainFrameId = rootTree.frame.id
+    const mainUrl = rootTree.frame.url || this.url
+
+    const discovered: DiscoveredFrame[] = []
+    const seen = new Set<string>([rootTree.frame.id])
+
+    const walkChildren = async (
+      children: CdpFrameTreeNode[] | undefined,
+      parent: {
+        frameId: string
+        url: string
+        offsetX: number
+        offsetY: number
+        selectorChain: string[]
+        sessionId?: string
+        depth: number
+      },
+    ): Promise<void> => {
+      if (!children || children.length === 0) return
+      if (parent.depth >= MAX_FRAME_DEPTH || discovered.length >= MAX_DISCOVERED_FRAMES) return
+
+      for (const node of children) {
+        if (discovered.length >= MAX_DISCOVERED_FRAMES) break
+        const fid = node.frame?.id
+        if (!fid || seen.has(fid)) continue
+        seen.add(fid)
+
+        const owner = await this.getFrameOwnerInfo(fid, parent.sessionId)
+        if (owner && !owner.visible) continue
+
+        const offsetX = parent.offsetX + (owner?.contentX ?? 0)
+        const offsetY = parent.offsetY + (owner?.contentY ?? 0)
+        const box = owner?.box ? offsetRect(owner.box, parent.offsetX, parent.offsetY) : undefined
+        const seg = owner?.selector || `frame:${fid}`
+        const selectorChain = [...parent.selectorChain, seg]
+        const frameUrl = node.frame.url || 'about:blank'
+        const oopifSid = this.oopifSessions.get(fid)
+        const childSessionId = oopifSid ?? parent.sessionId
+
+        const entry: DiscoveredFrame = {
+          frameId: fid,
+          parentFrameId: parent.frameId,
+          url: frameUrl,
+          name: node.frame.name || owner?.name || undefined,
+          title: owner?.title || undefined,
+          selectorChain,
+          offsetX,
+          offsetY,
+          box,
+          sessionId: childSessionId,
+          parentSessionId: parent.sessionId,
+          depth: parent.depth + 1,
+          crossOrigin: isCrossOriginUrl(mainUrl, frameUrl),
+        }
+        discovered.push(entry)
+
+        let nestedChildren = node.childFrames
+        // For OOPIFs, query the OOPIF's own Page.getFrameTree if main tree didn't include its nested children
+        if (oopifSid && (!nestedChildren || nestedChildren.length === 0)) {
+          try {
+            const subTree = await this.cdp.sendToSession<{ frameTree?: CdpFrameTreeNode }>(oopifSid, 'Page.getFrameTree')
+            nestedChildren = subTree.frameTree?.childFrames
+          } catch {
+            // ignore
+          }
+        }
+
+        await walkChildren(nestedChildren, {
+          frameId: fid,
+          url: frameUrl,
+          offsetX,
+          offsetY,
+          selectorChain,
+          sessionId: childSessionId,
+          depth: parent.depth + 1,
+        })
+      }
+    }
+
+    await walkChildren(rootTree.childFrames, {
+      frameId: rootTree.frame.id,
+      url: mainUrl,
+      offsetX: 0,
+      offsetY: 0,
+      selectorChain: [],
+      sessionId: undefined,
+      depth: 0,
+    })
+
+    // Site Isolation (OOPIF): cross-site iframes live in their own CDP target sessions
+    // and are omitted from the main session's Page.getFrameTree. Merge any attached OOPIF
+    // targets via their own Page.getFrameTree + parent DOM.getFrameOwner.
+    if (this.oopifSessions.size > 0 && discovered.length < MAX_DISCOVERED_FRAMES) {
+      const parentById = new Map<
+        string,
+        {
+          frameId: string
+          url: string
+          offsetX: number
+          offsetY: number
+          selectorChain: string[]
+          sessionId?: string
+          depth: number
+        }
+      >()
+      parentById.set(rootTree.frame.id, {
+        frameId: rootTree.frame.id,
+        url: mainUrl,
+        offsetX: 0,
+        offsetY: 0,
+        selectorChain: [],
+        sessionId: undefined,
+        depth: 0,
+      })
+      for (const f of discovered) {
+        parentById.set(f.frameId, {
+          frameId: f.frameId,
+          url: f.url,
+          offsetX: f.offsetX,
+          offsetY: f.offsetY,
+          selectorChain: f.selectorChain,
+          sessionId: f.sessionId,
+          depth: f.depth,
+        })
+      }
+
+      const pendingOopifs: Array<{ targetId: string; sessionId: string; subTree: CdpFrameTreeNode }> = []
+      for (const [targetId, sid] of this.oopifSessions) {
+        if (seen.has(targetId)) continue
+        try {
+          const res = await this.cdp.sendToSession<{ frameTree?: CdpFrameTreeNode }>(sid, 'Page.getFrameTree')
+          if (res.frameTree?.frame?.id) {
+            pendingOopifs.push({ targetId, sessionId: sid, subTree: res.frameTree })
+          }
+        } catch {
+          // OOPIF may have detached
+        }
+      }
+
+      let progress = true
+      while (progress && pendingOopifs.length > 0 && discovered.length < MAX_DISCOVERED_FRAMES) {
+        progress = false
+        for (let i = 0; i < pendingOopifs.length; i++) {
+          const item = pendingOopifs[i]!
+          const fid = item.subTree.frame.id
+          if (seen.has(fid)) {
+            pendingOopifs.splice(i, 1)
+            i -= 1
+            continue
+          }
+          const parentId = item.subTree.frame.parentId || rootTree.frame.id
+          const parent = parentById.get(parentId)
+          if (!parent) continue
+
+          progress = true
+          pendingOopifs.splice(i, 1)
+          i -= 1
+          seen.add(fid)
+
+          if (parent.depth >= MAX_FRAME_DEPTH) continue
+
+          const owner = await this.getFrameOwnerInfo(fid, parent.sessionId)
+          if (owner && !owner.visible) continue
+
+          const offsetX = parent.offsetX + (owner?.contentX ?? 0)
+          const offsetY = parent.offsetY + (owner?.contentY ?? 0)
+          const box = owner?.box ? offsetRect(owner.box, parent.offsetX, parent.offsetY) : undefined
+          const seg = owner?.selector || `frame:${fid}`
+          const selectorChain = [...parent.selectorChain, seg]
+          const frameUrl = item.subTree.frame.url || 'about:blank'
+
+          const entry: DiscoveredFrame = {
+            frameId: fid,
+            parentFrameId: parent.frameId,
+            url: frameUrl,
+            name: item.subTree.frame.name || owner?.name || undefined,
+            title: owner?.title || undefined,
+            selectorChain,
+            offsetX,
+            offsetY,
+            box,
+            sessionId: item.sessionId,
+            parentSessionId: parent.sessionId,
+            depth: parent.depth + 1,
+            crossOrigin: isCrossOriginUrl(mainUrl, frameUrl),
+          }
+          discovered.push(entry)
+          parentById.set(fid, {
+            frameId: fid,
+            url: frameUrl,
+            offsetX,
+            offsetY,
+            selectorChain,
+            sessionId: item.sessionId,
+            depth: parent.depth + 1,
+          })
+
+          await walkChildren(item.subTree.childFrames, {
+            frameId: fid,
+            url: frameUrl,
+            offsetX,
+            offsetY,
+            selectorChain,
+            sessionId: item.sessionId,
+            depth: parent.depth + 1,
+          })
+        }
+      }
+    }
+
+    return discovered
+  }
+
+  private async resolveFrameElementId(
+    segment: string,
+    parentFrameId: string | undefined,
+    parentSessionId: string | undefined,
+  ): Promise<string | null> {
+    const expr = `(() => {
+      ${SHADOW_DOM_QUERY_HELPER}
+      try {
+        return querySelectorDeep(${JSON.stringify(segment)});
+      } catch {
+        return null;
+      }
+    })()`
+
+    const oopifSession = parentFrameId ? this.oopifSessions.get(parentFrameId) : undefined
+    const targetSessionId = parentSessionId ?? oopifSession
+
+    const params: Record<string, unknown> = { expression: expr, returnByValue: false }
+    if (parentFrameId && parentFrameId !== this.mainFrameId && (!oopifSession || targetSessionId !== oopifSession)) {
+      const ctxKey = `${targetSessionId ?? ''}:${parentFrameId}`
+      const knownCtx = this.frameContexts.get(ctxKey)
+      if (knownCtx !== undefined) {
+        params.contextId = knownCtx
+      } else {
+        try {
+          const world = await this.cdp.sendToSession<{ executionContextId: number }>(
+            targetSessionId,
+            'Page.createIsolatedWorld',
+            { frameId: parentFrameId, worldName: 'troy-advanced' },
+          )
+          params.contextId = world.executionContextId
+        } catch {
+          return null
+        }
+      }
+    }
+
+    try {
+      const res = await this.cdp.sendToSession<{ result?: { objectId?: string } }>(
+        targetSessionId,
+        'Runtime.evaluate',
+        params,
+      )
+      const objectId = res.result?.objectId
+      if (!objectId) return null
+      try {
+        const desc = await this.cdp.sendToSession<{
+          node?: { frameId?: string; contentDocument?: { frameId?: string } }
+        }>(targetSessionId, 'DOM.describeNode', { objectId })
+        return desc.node?.frameId || desc.node?.contentDocument?.frameId || null
+      } finally {
+        void this.cdp.sendToSession(targetSessionId, 'Runtime.releaseObject', { objectId }).catch(() => {})
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private async resolveFrameTarget(
+    selector: string,
+  ): Promise<{ ok: true; frame: DiscoveredFrame | null; targetSelector: string } | { ok: false; error: string }> {
+    let parsed: ReturnType<typeof parseFrameSelector>
+    try {
+      parsed = parseFrameSelector(selector)
+    } catch (err) {
+      return { ok: false, error: `invalid selector: ${err instanceof Error ? err.message : String(err)}` }
+    }
+
+    if (!parsed.isFrameSelector) {
+      return { ok: true, frame: null, targetSelector: parsed.targetSelector }
+    }
+
+    const frames = await this.discoverFrames()
+
+    // Fast path 1: direct frame:<id> token
+    if (parsed.frameSegments.length === 1) {
+      const tokenFrameId = parseFrameIdToken(parsed.frameSegments[0]!)
+      if (tokenFrameId) {
+        const byId = frames.find((f) => f.frameId === tokenFrameId)
+        if (byId) return { ok: true, frame: byId, targetSelector: parsed.targetSelector }
+        return { ok: false, error: `iframe "${tokenFrameId}" not found` }
+      }
+    }
+
+    // Fast path 2: exact selectorChain match (all snapshot-generated eN refs hit this)
+    const exact = frames.find(
+      (f) =>
+        f.selectorChain.length === parsed.frameSegments.length &&
+        f.selectorChain.every((seg, i) => seg === parsed.frameSegments[i]),
+    )
+    if (exact) {
+      return { ok: true, frame: exact, targetSelector: parsed.targetSelector }
+    }
+
+    // Fallback: walk human-authored iframe CSS selectors step by step
+    let currentFrame: DiscoveredFrame | null = null
+    for (const seg of parsed.frameSegments) {
+      const tokenId = parseFrameIdToken(seg)
+      if (tokenId) {
+        const next = frames.find((f) => f.frameId === tokenId)
+        if (!next) return { ok: false, error: `iframe "${tokenId}" not found` }
+        currentFrame = next
+        continue
+      }
+
+      const childFrameId = await this.resolveFrameElementId(seg, currentFrame?.frameId, currentFrame?.sessionId)
+      if (!childFrameId) {
+        return { ok: false, error: `iframe matching "${seg}" not found` }
+      }
+      const next = frames.find((f) => f.frameId === childFrameId)
+      if (!next) {
+        return { ok: false, error: `iframe "${seg}" is hidden or detached` }
+      }
+      currentFrame = next
+    }
+
+    if (!currentFrame) {
+      return { ok: false, error: 'iframe not found' }
+    }
+    return { ok: true, frame: currentFrame, targetSelector: parsed.targetSelector }
   }
 
   async navigate(url: string): Promise<{ url: string; title: string }> {
@@ -717,38 +1238,78 @@ class ChromiumTab implements TabDriver {
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    const raw = await this.evalJson<{
-      url: string
-      title: string
-      viewport: PageSnapshot['viewport']
-      blocks: Array<ContentBlock & { selector?: string }>
-      elements: ElementDescriptor[]
-      text: string
-    }>(SNAPSHOT_SCRIPT)
+    const mainRaw = await this.evalJson<RawFrameSnapshot>(SNAPSHOT_SCRIPT)
+    this.url = mainRaw.url || this.url
+    this.title = mainRaw.title || this.title
 
-    this.url = raw.url || this.url
-    this.title = raw.title || this.title
+    const childFrames = await this.discoverFrames()
+    if (childFrames.length === 0) {
+      return {
+        tabId: this.id,
+        url: this.url,
+        title: this.title,
+        epoch: this.epoch,
+        viewport: mainRaw.viewport,
+        blocks: mainRaw.blocks,
+        elements: mainRaw.elements,
+        text: mainRaw.text,
+        capturedAt: Date.now(),
+      }
+    }
 
+    const childInputs: ChildFrameSnapshotInput[] = []
+    for (const frame of childFrames) {
+      try {
+        const sub = await this.evalInFrame<RawFrameSnapshot>(frame.frameId, frame.sessionId, SNAPSHOT_SCRIPT)
+        if (!sub) continue
+        if (sub.elements.length === 0 && sub.blocks.length === 0 && !(sub.text || '').trim()) {
+          continue
+        }
+        childInputs.push({
+          frameId: frame.frameId,
+          parentFrameId: frame.parentFrameId,
+          url: frame.url,
+          name: frame.name,
+          title: frame.title,
+          selectorChain: frame.selectorChain,
+          offsetX: frame.offsetX,
+          offsetY: frame.offsetY,
+          box: frame.box,
+          crossOrigin: frame.crossOrigin,
+          snapshot: sub,
+        })
+      } catch {
+        // Ignore detached or inaccessible child frames so the snapshot stays resilient
+      }
+    }
+
+    const flattened = flattenFrameSnapshots(mainRaw, childInputs)
     return {
       tabId: this.id,
       url: this.url,
       title: this.title,
       epoch: this.epoch,
-      viewport: raw.viewport,
-      blocks: raw.blocks,
-      elements: raw.elements,
-      text: raw.text,
+      viewport: mainRaw.viewport,
+      blocks: flattened.blocks,
+      elements: flattened.elements,
+      ...(flattened.frames ? { frames: flattened.frames } : {}),
+      text: flattened.text,
       capturedAt: Date.now(),
     }
   }
 
   async click(selector: string): Promise<{ ok: boolean; note?: string }> {
-    const res = await this.evalJson<{ ok: boolean; x?: number; y?: number; note?: string }>(
+    const target = await this.resolveFrameTarget(selector)
+    if (!target.ok) return { ok: false, note: target.error }
+
+    const res = await this.evalInFrame<{ ok: boolean; x?: number; y?: number; note?: string }>(
+      target.frame?.frameId,
+      target.frame?.sessionId,
       `(() => {
         ${SHADOW_DOM_QUERY_HELPER}
         let el;
         try {
-          el = querySelectorDeep(${JSON.stringify(selector)});
+          el = querySelectorDeep(${JSON.stringify(target.targetSelector)});
         } catch (err) {
           return { ok: false, note: 'invalid selector: ' + String((err && err.message) || err) };
         }
@@ -760,8 +1321,8 @@ class ChromiumTab implements TabDriver {
     )
     if (!res?.ok) return { ok: false, note: res?.note ?? 'not found' }
 
-    const x = Math.round(res.x ?? 0)
-    const y = Math.round(res.y ?? 0)
+    const x = Math.round((target.frame?.offsetX ?? 0) + (res.x ?? 0))
+    const y = Math.round((target.frame?.offsetY ?? 0) + (res.y ?? 0))
     await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y })
     await this.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
     await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
@@ -776,32 +1337,38 @@ class ChromiumTab implements TabDriver {
   }
 
   async fill(selector: string, text: string, clear = true): Promise<{ ok: boolean; value?: string }> {
-    const res = await this.evalJson<{ ok: boolean; value?: string }>(
+    const target = await this.resolveFrameTarget(selector)
+    if (!target.ok) return { ok: false }
+
+    const res = await this.evalInFrame<{ ok: boolean; value?: string }>(
+      target.frame?.frameId,
+      target.frame?.sessionId,
       `(() => {
         ${SHADOW_DOM_QUERY_HELPER}
         let el;
         try {
-          el = querySelectorDeep(${JSON.stringify(selector)});
+          el = querySelectorDeep(${JSON.stringify(target.targetSelector)});
         } catch {
           return { ok: false };
         }
         if (!el) return { ok: false };
+        const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
         if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center', inline: 'center' });
         if (typeof el.focus === 'function') el.focus();
         if (el.isContentEditable) {
           const nextVal = ${clear ? '""' : 'String(el.textContent ?? "")'} + ${JSON.stringify(text)};
           el.textContent = nextVal;
-          el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          el.dispatchEvent(new win.Event('input', { bubbles: true, composed: true }));
+          el.dispatchEvent(new win.Event('change', { bubbles: true, composed: true }));
           return { ok: true, value: String(el.textContent ?? '') };
         }
         const nextVal = ${clear ? '""' : 'String(el.value ?? "")'} + ${JSON.stringify(text)};
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const proto = el.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
         if (setter) setter.call(el, nextVal);
         else el.value = nextVal;
-        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        el.dispatchEvent(new win.Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new win.Event('change', { bubbles: true, composed: true }));
         return { ok: true, value: String(el.value ?? '') };
       })()`,
     )
@@ -809,22 +1376,28 @@ class ChromiumTab implements TabDriver {
   }
 
   async select(selector: string, value: string): Promise<{ ok: boolean; value?: string }> {
-    const res = await this.evalJson<{ ok: boolean; value?: string }>(
+    const target = await this.resolveFrameTarget(selector)
+    if (!target.ok) return { ok: false }
+
+    const res = await this.evalInFrame<{ ok: boolean; value?: string }>(
+      target.frame?.frameId,
+      target.frame?.sessionId,
       `(() => {
         ${SHADOW_DOM_QUERY_HELPER}
         let el;
         try {
-          el = querySelectorDeep(${JSON.stringify(selector)});
+          el = querySelectorDeep(${JSON.stringify(target.targetSelector)});
         } catch {
           return { ok: false };
         }
         if (!el || el.tagName !== 'SELECT') return { ok: false };
-        const target = ${JSON.stringify(value)}.toLowerCase();
-        const opt = Array.from(el.options).find((o) => o.value.toLowerCase() === target || (o.text || '').trim().toLowerCase() === target);
+        const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        const targetVal = ${JSON.stringify(value)}.toLowerCase();
+        const opt = Array.from(el.options).find((o) => o.value.toLowerCase() === targetVal || (o.text || '').trim().toLowerCase() === targetVal);
         if (!opt) return { ok: false };
         el.value = opt.value;
-        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        el.dispatchEvent(new win.Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new win.Event('change', { bubbles: true, composed: true }));
         return { ok: true, value: opt.text || opt.value };
       })()`,
     )
@@ -833,12 +1406,18 @@ class ChromiumTab implements TabDriver {
 
   async press(key: string, selector?: string): Promise<{ ok: boolean; normalized?: string; modifiers?: number; error?: string }> {
     if (selector) {
-      const focusRes = await this.evalJson<{ ok: boolean; error?: string }>(
+      const target = await this.resolveFrameTarget(selector)
+      if (!target.ok) {
+        return { ok: false, error: target.error }
+      }
+      const focusRes = await this.evalInFrame<{ ok: boolean; error?: string }>(
+        target.frame?.frameId,
+        target.frame?.sessionId,
         `(() => {
           ${SHADOW_DOM_QUERY_HELPER}
           let el;
           try {
-            el = querySelectorDeep(${JSON.stringify(selector)});
+            el = querySelectorDeep(${JSON.stringify(target.targetSelector)});
           } catch (err) {
             return { ok: false, error: 'invalid selector: ' + String((err && err.message) || err) };
           }
@@ -862,12 +1441,17 @@ class ChromiumTab implements TabDriver {
   }
 
   async hover(selector: string): Promise<{ ok: boolean }> {
-    const res = await this.evalJson<{ ok: boolean; x?: number; y?: number }>(
+    const target = await this.resolveFrameTarget(selector)
+    if (!target.ok) return { ok: false }
+
+    const res = await this.evalInFrame<{ ok: boolean; x?: number; y?: number }>(
+      target.frame?.frameId,
+      target.frame?.sessionId,
       `(() => {
         ${SHADOW_DOM_QUERY_HELPER}
         let el;
         try {
-          el = querySelectorDeep(${JSON.stringify(selector)});
+          el = querySelectorDeep(${JSON.stringify(target.targetSelector)});
         } catch {
           return { ok: false };
         }
@@ -878,7 +1462,11 @@ class ChromiumTab implements TabDriver {
       })()`,
     )
     if (!res?.ok) return { ok: false }
-    await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(res.x ?? 0), y: Math.round(res.y ?? 0) })
+    await this.cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: Math.round((target.frame?.offsetX ?? 0) + (res.x ?? 0)),
+      y: Math.round((target.frame?.offsetY ?? 0) + (res.y ?? 0)),
+    })
     return { ok: true }
   }
 
@@ -962,6 +1550,48 @@ class ChromiumTab implements TabDriver {
     const description = describeWaitCondition({ ...options, state: options.selector ? state : undefined })
     const startedAt = Date.now()
 
+    let parsedSel: ReturnType<typeof parseFrameSelector> | null = null
+    if (options.selector) {
+      try {
+        parsedSel = parseFrameSelector(options.selector)
+      } catch (err) {
+        return {
+          ok: false,
+          waitedMs: 0,
+          error: `invalid selector "${options.selector}": ${err instanceof Error ? err.message : String(err)}`,
+        }
+      }
+    }
+
+    const buildSelectorProbeExpr = (sel: string, targetState: WaitState) => `(() => {
+      ${SHADOW_DOM_QUERY_HELPER}
+      let els;
+      try {
+        els = querySelectorAllDeep(${JSON.stringify(sel)});
+      } catch (err) {
+        return { selectorError: String((err && err.message) || err) };
+      }
+      const isVisible = (el) => {
+        if (!el || !el.isConnected) return false;
+        if (el.hasAttribute('hidden')) return false;
+        if (el.tagName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'hidden') return false;
+        const st = window.getComputedStyle(el);
+        if (!st) return false;
+        if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse') return false;
+        if (Number(st.opacity) === 0) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 || r.height > 0 || el.getClientRects().length > 0;
+      };
+      const target = ${JSON.stringify(targetState)};
+      if (target === 'attached') {
+        return { selectorMatched: els.length > 0 };
+      }
+      if (target === 'visible') {
+        return { selectorMatched: els.some(isVisible) };
+      }
+      return { selectorMatched: els.length === 0 || els.every((el) => !isVisible(el)) };
+    })()`
+
     const condRes = await pollUntil(
       async () => {
         let probe: {
@@ -972,6 +1602,7 @@ class ChromiumTab implements TabDriver {
           selectorError?: string
         }
         try {
+          const checkMainSelector = Boolean(parsedSel && !parsedSel.isFrameSelector)
           probe = await this.evalJson(
             `(() => {
               const out = { url: String(location.href || ''), title: String(document.title || '') };
@@ -981,7 +1612,7 @@ class ChromiumTab implements TabDriver {
                   (document.documentElement && document.documentElement.textContent) || '';
                 out.bodyText = raw + '\\n' + out.title;
               }
-              const selector = ${JSON.stringify(options.selector ?? '')};
+              const selector = ${JSON.stringify(checkMainSelector ? (parsedSel?.targetSelector ?? '') : '')};
               const targetState = ${JSON.stringify(state)};
               if (selector) {
                 ${SHADOW_DOM_QUERY_HELPER}
@@ -1030,8 +1661,76 @@ class ChromiumTab implements TabDriver {
         }
 
         const urlOk = options.url ? matchesUrlPattern(probe.url || this.url, options.url) : true
-        const textOk = options.text ? matchesText(probe.bodyText ?? '', options.text) : true
-        const selectorOk = options.selector ? Boolean(probe.selectorMatched) : true
+        let textOk = options.text ? matchesText(probe.bodyText ?? '', options.text) : true
+        let selectorOk = parsedSel ? Boolean(probe.selectorMatched) : true
+
+        // Cross-frame selector check when explicit `iframe >> selector` is given
+        if (parsedSel && parsedSel.isFrameSelector) {
+          const target = await this.resolveFrameTarget(options.selector!)
+          if (!target.ok || !target.frame) {
+            selectorOk = state === 'hidden'
+          } else {
+            try {
+              const subProbe = await this.evalInFrame<{ selectorMatched?: boolean; selectorError?: string }>(
+                target.frame.frameId,
+                target.frame.sessionId,
+                buildSelectorProbeExpr(target.targetSelector, state),
+              )
+              if (subProbe?.selectorError) {
+                return { satisfied: false, fatalError: `invalid selector "${options.selector}": ${subProbe.selectorError}` }
+              }
+              selectorOk = Boolean(subProbe?.selectorMatched)
+            } catch {
+              selectorOk = state === 'hidden'
+            }
+          }
+        } else if (parsedSel && !parsedSel.isFrameSelector) {
+          // Plain selector fallback into child frames when needed
+          const needChildCheck = (state !== 'hidden' && !selectorOk) || (state === 'hidden' && selectorOk)
+          if (needChildCheck) {
+            const frames = await this.discoverFrames()
+            for (const f of frames) {
+              try {
+                const subProbe = await this.evalInFrame<{ selectorMatched?: boolean; selectorError?: string }>(
+                  f.frameId,
+                  f.sessionId,
+                  buildSelectorProbeExpr(parsedSel.targetSelector, state),
+                )
+                if (state === 'hidden') {
+                  if (!subProbe?.selectorMatched) {
+                    selectorOk = false
+                    break
+                  }
+                } else if (subProbe?.selectorMatched) {
+                  selectorOk = true
+                  break
+                }
+              } catch {
+                // ignore detached frame
+              }
+            }
+          }
+        }
+
+        // Cross-frame text check if main frame didn't match yet
+        if (options.text && !textOk) {
+          const frames = await this.discoverFrames()
+          for (const f of frames) {
+            try {
+              const subText = await this.evalInFrame<string>(
+                f.frameId,
+                f.sessionId,
+                `(() => ((document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '') || (document.documentElement && document.documentElement.textContent) || '') + '\\n' + String(document.title || ''))()`,
+              )
+              if (matchesText(subText ?? '', options.text)) {
+                textOk = true
+                break
+              }
+            } catch {
+              // ignore detached frame
+            }
+          }
+        }
 
         return {
           satisfied: urlOk && textOk && selectorOk,

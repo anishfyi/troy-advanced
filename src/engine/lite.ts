@@ -6,6 +6,7 @@ import type {
   ConsoleEntry,
   ContentBlock,
   ElementDescriptor,
+  FrameSummary,
   InlineLink,
   NetworkEntry,
   PageSnapshot,
@@ -17,6 +18,7 @@ import type {
 } from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
+import { flattenFrameSnapshots, prefixFrameSelector, type ChildFrameSnapshotInput } from './frames.js'
 import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
 import type { BrowserEngine, TabDriver } from './types.js'
@@ -74,13 +76,14 @@ function resolveHref(href: string | undefined, baseUrl: string): string | undefi
 
 interface ParsedDoc {
   title: string
-  blocks: ContentBlock[]
+  blocks: Array<ContentBlock & { selector?: string }>
   elements: ElementDescriptor[]
+  frames?: FrameSummary[]
   text: string
   forms: Map<string, { action: string; method: string; fieldSelectors: string[] }>
 }
 
-function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
+function parseHtmlDocument(html: string, baseUrl: string, depth = 0): ParsedDoc {
   // Remove scripts, styles, noscript, comments
   const cleaned = html
     .replace(/<!--[\s\S]*?-->/g, '')
@@ -92,7 +95,18 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
   const title = titleMatch ? stripTags(titleMatch[1]!) : ''
 
   const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(cleaned)
-  const bodyHtml = bodyMatch ? bodyMatch[1]! : cleaned
+  let bodyHtml = bodyMatch ? bodyMatch[1]! : cleaned
+
+  // Extract <iframe ...> tags with quote-aware attribute matching BEFORE main linear scan
+  // so `srcdoc="..."` HTML is never double-parsed as top-level elements.
+  const extractedIframes: Array<Record<string, string>> = []
+  if (depth < 4 && /<iframe\b/i.test(bodyHtml)) {
+    const iframeTagRe = /<iframe\b((?:"[^"]*"|'[^']*'|[^>])*)(?:\/>|>[\s\S]*?<\/iframe>)/gi
+    bodyHtml = bodyHtml.replace(iframeTagRe, (_match, attrStr: string) => {
+      extractedIframes.push(parseAttrs(attrStr ?? ''))
+      return ''
+    })
+  }
 
   // Extract <label for="..."> map
   const labelsByFor = new Map<string, string>()
@@ -492,6 +506,73 @@ function parseHtmlDocument(html: string, baseUrl: string): ParsedDoc {
     .filter(Boolean)
     .join('\n')
 
+  if (depth < 4 && extractedIframes.length > 0) {
+    const childInputs: ChildFrameSnapshotInput[] = []
+    let iframeCount = 0
+    for (const attrs of extractedIframes) {
+      if (childInputs.length >= 10) break
+      iframeCount += 1
+      if (!attrs.srcdoc) continue
+      const frameSeg = attrs.id
+        ? `#${attrs.id}`
+        : attrs.name
+          ? `iframe[name="${attrs.name}"]`
+          : `iframe:nth-of-type(${iframeCount})`
+      const childDoc = parseHtmlDocument(attrs.srcdoc, baseUrl, depth + 1)
+      if (childDoc.elements.length === 0 && childDoc.blocks.length === 0 && !childDoc.text.trim()) {
+        continue
+      }
+      const frameId = `lite-frame-${depth + 1}-${iframeCount}`
+      // Merge child forms with prefixed fieldSelectors so form submit works in Lite mode
+      for (const [fId, fMeta] of childDoc.forms) {
+        forms.set(`f${iframeCount}-${fId}`, {
+          action: fMeta.action,
+          method: fMeta.method,
+          fieldSelectors: fMeta.fieldSelectors.map((s) => prefixFrameSelector([frameSeg], s)),
+        })
+      }
+      childInputs.push({
+        frameId,
+        url: 'about:srcdoc',
+        name: attrs.name || undefined,
+        title: attrs.title || attrs['aria-label'] || childDoc.title || undefined,
+        selectorChain: [frameSeg],
+        offsetX: 0,
+        offsetY: 0,
+        crossOrigin: false,
+        snapshot: {
+          url: 'about:srcdoc',
+          title: childDoc.title,
+          blocks: childDoc.blocks,
+          elements: childDoc.elements,
+          text: childDoc.text,
+        },
+      })
+    }
+
+    if (childInputs.length > 0) {
+      const flattened = flattenFrameSnapshots(
+        {
+          url: baseUrl,
+          title,
+          viewport: { width: 1280, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 800 },
+          blocks,
+          elements,
+          text,
+        },
+        childInputs,
+      )
+      return {
+        title,
+        blocks: flattened.blocks,
+        elements: flattened.elements,
+        frames: flattened.frames,
+        text: flattened.text,
+        forms,
+      }
+    }
+  }
+
   return { title, blocks, elements, text, forms }
 }
 
@@ -669,6 +750,7 @@ class LiteTab implements TabDriver {
       },
       blocks: this.doc.blocks.map((b) => ({ ...b })),
       elements: this.doc.elements.map((e) => ({ ...e })),
+      ...(this.doc.frames ? { frames: this.doc.frames.map((f) => ({ ...f })) } : {}),
       text: this.doc.text,
       capturedAt: Date.now(),
     }

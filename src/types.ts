@@ -42,6 +42,9 @@ export interface ElementDescriptor {
   box?: Rect
   options?: Array<{ value: string; label: string; selected?: boolean }>
   signature?: string
+  frameId?: string
+  frameUrl?: string
+  frameName?: string
 }
 
 export interface InlineLink {
@@ -75,6 +78,21 @@ export interface ContentBlock {
   links?: InlineLink[]
   formId?: string
   formTitle?: string
+  frameId?: string
+  frameUrl?: string
+  frameName?: string
+}
+
+export interface FrameSummary {
+  frameId: string
+  parentFrameId?: string
+  name?: string
+  title?: string
+  url: string
+  selector?: string
+  box?: Rect
+  elementCount: number
+  crossOrigin?: boolean
 }
 
 export interface MediaSummaryItem {
@@ -98,6 +116,7 @@ export interface PageSnapshot {
   viewport: { width: number; height: number; scrollX: number; scrollY: number; scrollHeight: number }
   blocks: ContentBlock[]
   elements: ElementDescriptor[]
+  frames?: FrameSummary[]
   text: string
   capturedAt: number
 }
