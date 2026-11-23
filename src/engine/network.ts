@@ -44,6 +44,8 @@ export interface RecordNetworkInput {
   blocked?: boolean
   blockedReason?: string
   retries?: number
+  fromCache?: boolean
+  cacheStatus?: 'hit' | 'revalidated' | 'miss' | 'bypass'
   requestHeaders?: Record<string, string>
   responseHeaders?: Record<string, string>
   requestBody?: string
@@ -285,6 +287,8 @@ export class NetworkRecorder {
       ...(input.blocked ? { blocked: true } : {}),
       ...(input.blockedReason ? { blockedReason: input.blockedReason } : {}),
       ...(input.retries !== undefined && input.retries > 0 ? { retries: input.retries } : {}),
+      ...(input.fromCache ? { fromCache: true } : {}),
+      ...(input.cacheStatus ? { cacheStatus: input.cacheStatus } : {}),
       ...(hasRequestBody ? { hasRequestBody: true } : {}),
       ...(hasResponseBody ? { hasResponseBody: true } : {}),
     }

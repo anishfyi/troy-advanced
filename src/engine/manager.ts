@@ -87,6 +87,7 @@ import {
   redactStorageSnapshots,
 } from './storage.js'
 import { LiteBrowserEngine } from './lite.js'
+import type { ResponseCacheHooks, ResponseCacheOptions } from './response-cache.js'
 import type {
   RateLimitOptions,
   RetryPolicyOptions,
@@ -136,6 +137,8 @@ export interface BrowserManagerOptions {
   retry?: RetryPolicyOptions
   rateLimit?: RateLimitOptions
   robotsRetryHooks?: RobotsRetryHooks
+  cache?: ResponseCacheOptions
+  cacheHooks?: ResponseCacheHooks
 }
 
 export class BrowserManager {
@@ -197,6 +200,8 @@ export class BrowserManager {
         retry: opts.retry,
         rateLimit: opts.rateLimit,
         robotsRetryHooks: opts.robotsRetryHooks,
+        cache: opts.cache,
+        cacheHooks: opts.cacheHooks,
       })
     } else if (requested === 'chromium' || opts.cdpUrl) {
       // Explicit --engine chromium or explicit --cdp-url must fail loudly if unreachable
@@ -238,6 +243,8 @@ export class BrowserManager {
             retry: opts.retry,
             rateLimit: opts.rateLimit,
             robotsRetryHooks: opts.robotsRetryHooks,
+            cache: opts.cache,
+            cacheHooks: opts.cacheHooks,
           })
         }
       } else {
@@ -250,6 +257,8 @@ export class BrowserManager {
           retry: opts.retry,
           rateLimit: opts.rateLimit,
           robotsRetryHooks: opts.robotsRetryHooks,
+          cache: opts.cache,
+          cacheHooks: opts.cacheHooks,
         })
       }
     }

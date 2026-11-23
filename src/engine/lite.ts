@@ -86,6 +86,17 @@ import {
   type ParsedFeed,
 } from './feed-reader.js'
 import {
+  ResponseCache,
+  isCacheableMethod,
+  isUnsafeMethod,
+  type CacheStatus,
+  type ResolvedResponseCachePolicy,
+  type ResponseCacheEntry,
+  type ResponseCacheHooks,
+  type ResponseCacheOptions,
+  type ResponseCacheStats,
+} from './response-cache.js'
+import {
   RobotsDisallowedError,
   RobotsRetryController,
   computeBackoffDelayMs,
@@ -1506,6 +1517,7 @@ class LiteTab implements TabDriver {
   private dialogs?: DialogManager
   private maxMetaRefreshDelaySeconds: number
   private robotsRetry: RobotsRetryController
+  private responseCache: ResponseCache
 
   constructor(
     id: number,
@@ -1516,6 +1528,7 @@ class LiteTab implements TabDriver {
     dialogs?: DialogManager,
     maxMetaRefreshDelaySeconds = 5,
     robotsRetry?: RobotsRetryController,
+    responseCache?: ResponseCache,
   ) {
     this.id = id
     this.cookieJar = cookieJar
@@ -1525,6 +1538,7 @@ class LiteTab implements TabDriver {
     this.dialogs = dialogs
     this.maxMetaRefreshDelaySeconds = maxMetaRefreshDelaySeconds
     this.robotsRetry = robotsRetry ?? new RobotsRetryController()
+    this.responseCache = responseCache ?? new ResponseCache()
   }
 
   getEmulation(): EmulationProfile {
@@ -1560,7 +1574,12 @@ class LiteTab implements TabDriver {
     this.cookieJar.setFromHeaders(headers, targetUrl)
   }
 
-  private async fetchPage(targetUrl: string, init?: RequestInit, pushHistory = true): Promise<{ url: string; title: string }> {
+  private async fetchPage(
+    targetUrl: string,
+    init?: RequestInit,
+    pushHistory = true,
+    forceRevalidate = false,
+  ): Promise<{ url: string; title: string }> {
     if (isTrackerHost(targetUrl)) {
       throw new Error(`Blocked tracker host: ${targetUrl}`)
     }
@@ -1577,6 +1596,9 @@ class LiteTab implements TabDriver {
       let res: Response | null = null
       let preReadBody: string | null = null
       let preParsedDoc: ParsedDoc | null = null
+      let cachedEntryHit: ResponseCacheEntry | null = null
+      let finalCacheStatus: CacheStatus = 'bypass'
+      let finalFromCache = false
 
       const buildGetRedirectInit = (prevUrl: string, nextUrl: string, prevInit: RequestInit): RequestInit => {
         const prevOrigin = new URL(prevUrl).origin
@@ -1599,6 +1621,9 @@ class LiteTab implements TabDriver {
       for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
         preReadBody = null
         preParsedDoc = null
+        cachedEntryHit = null
+        finalCacheStatus = 'bypass'
+        finalFromCache = false
         if (isTrackerHost(currentUrl)) {
           throw new Error(`Blocked tracker host: ${currentUrl}`)
         }
@@ -1635,6 +1660,31 @@ class LiteTab implements TabDriver {
         if (!robotsDecision.allowed) {
           this.robotsRetry.recordRobotsBlocked()
           throw new RobotsDisallowedError(currentUrl, robotsDecision)
+        }
+
+        const hopMethod = (currentInit.method ?? 'GET').toUpperCase()
+        let staleEntryForHop: ResponseCacheEntry | null = null
+        if (isCacheableMethod(hopMethod)) {
+          const cacheLookup = this.responseCache.lookup(currentUrl, hopHeaders, { forceRevalidate })
+          if (cacheLookup.status === 'fresh') {
+            cachedEntryHit = cacheLookup.entry
+            finalCacheStatus = 'hit'
+            finalFromCache = true
+            res = null
+            break
+          }
+          if (cacheLookup.status === 'stale') {
+            staleEntryForHop = cacheLookup.entry
+            finalCacheStatus = 'miss'
+            for (const [hk, hv] of Object.entries(cacheLookup.conditionalHeaders)) {
+              hopHeaders.set(hk, hv)
+            }
+            requestHeadersMap = normalizeHeadersMap(hopHeaders)
+          } else {
+            finalCacheStatus = cacheLookup.status
+          }
+        } else {
+          finalCacheStatus = 'bypass'
         }
 
         await this.robotsRetry.acquireOriginSlot(hopOrigin, robotsDecision.crawlDelayMs)
@@ -1678,6 +1728,31 @@ class LiteTab implements TabDriver {
         }
         if (!res) {
           throw new Error(`No response received while fetching ${currentUrl}`)
+        }
+
+        if (isUnsafeMethod(hopMethod) && res.status >= 200 && res.status < 400) {
+          this.responseCache.invalidate(currentUrl)
+          const locHeader = res.headers.get('location')
+          if (locHeader) {
+            try {
+              this.responseCache.invalidate(new URL(locHeader, currentUrl).toString())
+            } catch {
+              // ignore invalid location URL
+            }
+          }
+        }
+
+        if (res.status === 304 && staleEntryForHop) {
+          try {
+            await res.body?.cancel()
+          } catch {
+            // ignore body cancellation errors
+          }
+          const revalidated = this.responseCache.revalidate304(currentUrl, hopHeaders, res.headers)
+          cachedEntryHit = revalidated ?? staleEntryForHop
+          finalCacheStatus = 'revalidated'
+          finalFromCache = true
+          break
         }
 
         const isRedirect = res.status >= 300 && res.status < 400
@@ -1772,16 +1847,16 @@ class LiteTab implements TabDriver {
         break
       }
 
-      if (!res) {
+      if (!cachedEntryHit && !res) {
         throw new Error(`No response received while fetching ${targetUrl}`)
       }
       const finalUrl = currentUrl
-      const contentType = res.headers.get('content-type') ?? ''
-      const contentDisposition = res.headers.get('content-disposition')
-      const responseHeadersMap = normalizeHeadersMap(res.headers)
+      const contentType = cachedEntryHit ? cachedEntryHit.contentType : (res!.headers.get('content-type') ?? '')
+      const contentDisposition = cachedEntryHit ? null : res!.headers.get('content-disposition')
+      const responseHeadersMap = cachedEntryHit ? { ...cachedEntryHit.headers } : normalizeHeadersMap(res!.headers)
       const mimeType = contentType.split(';')[0]?.trim() || undefined
 
-      if (this.downloads && isDownloadResponse(contentDisposition, contentType)) {
+      if (!cachedEntryHit && res && this.downloads && isDownloadResponse(contentDisposition, contentType)) {
         const data = Buffer.from(await res.arrayBuffer())
         const parsedDisp = parseContentDispositionFilename(contentDisposition)
         const entry = this.downloads.recordDirectBuffer({
@@ -1829,19 +1904,36 @@ class LiteTab implements TabDriver {
         return { url: this.url, title: this.title }
       }
 
-      const body = preReadBody ?? (await res.text())
+      const body = cachedEntryHit ? cachedEntryHit.body : (preReadBody ?? (await res!.text()))
+      if (!cachedEntryHit && res && isCacheableMethod(currentInit.method ?? init?.method)) {
+        this.responseCache.store({
+          url: finalUrl,
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers,
+          requestHeaders: requestHeadersMap,
+          body,
+        })
+      }
+
       this.networkRecorder.record({
         url: finalUrl,
         method: currentInit.method ?? init?.method ?? 'GET',
-        status: res.status,
-        statusText: res.statusText || undefined,
-        ok: res.ok,
+        status: cachedEntryHit
+          ? (finalCacheStatus === 'revalidated' ? 304 : cachedEntryHit.status)
+          : res!.status,
+        statusText: cachedEntryHit
+          ? (finalCacheStatus === 'revalidated' ? 'Not Modified' : cachedEntryHit.statusText || undefined)
+          : res!.statusText || undefined,
+        ok: cachedEntryHit ? true : res!.ok,
         resourceType: contentType.includes('application/json') ? 'fetch' : 'document',
         mimeType,
-        encodedDataLength: Buffer.byteLength(body, 'utf8'),
+        encodedDataLength: finalFromCache ? 0 : Buffer.byteLength(body, 'utf8'),
         durationMs: Date.now() - started,
         ts: Date.now(),
         ...(totalRetriesForPage > 0 ? { retries: totalRetriesForPage } : {}),
+        ...(finalFromCache ? { fromCache: true } : {}),
+        cacheStatus: finalCacheStatus,
         requestHeaders: requestHeadersMap,
         responseHeaders: responseHeadersMap,
         requestBody: requestBodyStr,
@@ -1933,7 +2025,7 @@ class LiteTab implements TabDriver {
   async history(direction: 'back' | 'forward' | 'reload'): Promise<{ url: string; title: string }> {
     if (direction === 'reload') {
       if (!this.url || this.url === 'about:blank') return { url: this.url, title: this.title }
-      return this.fetchPage(this.url, undefined, false)
+      return this.fetchPage(this.url, undefined, false, true)
     }
     if (direction === 'back') {
       if (this.historyIndex <= 0) return { url: this.url, title: this.title }
@@ -2674,6 +2766,10 @@ export interface LiteEngineOptions {
   rateLimit?: RateLimitOptions
   /** Optional clock/sleep/random/fetch hooks for deterministic testing. */
   robotsRetryHooks?: RobotsRetryHooks
+  /** HTTP response cache options (ETag / If-None-Match / Cache-Control). Default: enabled. */
+  cache?: ResponseCacheOptions
+  /** Optional clock hook for deterministic cache testing. */
+  cacheHooks?: ResponseCacheHooks
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -2687,6 +2783,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   private dialogs: DialogManager
   private maxMetaRefreshDelaySeconds: number
   private robotsRetry: RobotsRetryController
+  private responseCache: ResponseCache
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
@@ -2712,6 +2809,27 @@ export class LiteBrowserEngine implements BrowserEngine {
       rateLimit: opts.rateLimit,
       hooks: opts.robotsRetryHooks,
     })
+    this.responseCache = new ResponseCache(opts.cache, opts.cacheHooks)
+  }
+
+  getCachePolicy(): ResolvedResponseCachePolicy {
+    return this.responseCache.getPolicy()
+  }
+
+  setCachePolicy(opts: ResponseCacheOptions): ResolvedResponseCachePolicy {
+    return this.responseCache.setPolicy(opts)
+  }
+
+  getCacheStats(): ResponseCacheStats {
+    return this.responseCache.getStats()
+  }
+
+  clearCache(origin?: string): number {
+    return this.responseCache.clear(origin)
+  }
+
+  getResponseCache(): ResponseCache {
+    return this.responseCache
   }
 
   getRobotsPolicy(): ResolvedRobotsPolicy {
@@ -2833,6 +2951,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       this.dialogs,
       this.maxMetaRefreshDelaySeconds,
       this.robotsRetry,
+      this.responseCache,
     )
     if (initialUrl) {
       await tab.navigate(initialUrl)

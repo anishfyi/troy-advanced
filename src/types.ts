@@ -149,6 +149,8 @@ export interface NetworkEntry {
   blocked?: boolean
   blockedReason?: string
   retries?: number
+  fromCache?: boolean
+  cacheStatus?: 'hit' | 'revalidated' | 'miss' | 'bypass'
   hasRequestBody?: boolean
   hasResponseBody?: boolean
 }
