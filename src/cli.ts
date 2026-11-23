@@ -2,8 +2,15 @@
 
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import type { EngineKind, TrackerBlockingOptions, TrackerBlockMode } from './types.js'
+import type { BrowserCookie, EngineKind, TrackerBlockingOptions, TrackerBlockMode } from './types.js'
 import { BrowserManager } from './engine/manager.js'
+import {
+  filterCookies,
+  parseCookieBundle,
+  readCookieFile,
+  serializeCookieBundle,
+  writeCookieFile,
+} from './engine/cookies.js'
 import { readLiveEndpoint } from './bridge/endpoint.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
 import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
@@ -50,6 +57,11 @@ Client Commands (talk to running daemon, or use --oneshot):
   act <json-steps> [--allow-submit]       Run batched action list
   grant <origin>                          Extend origin autonomy boundary
   recall <query> | forget [origin]        Query or clear persistent page memory
+  cookies export [file] [--domain <host>] [--url <url>] [--include-expired] [--encrypt] [--passphrase <pass>]
+                                          Export cookies (0600 file or stdout) for secure EC2 transfer
+  cookies import [file|-] [--domain <host>] [--passphrase <pass>]
+                                          Import plain or AES-256-GCM encrypted cookies into daemon or profile
+  cookies clear [--domain <host>]         Clear cookies from daemon or profile
 
 Global Flags:
   --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --json  --ascii  --width <n>
@@ -81,7 +93,19 @@ const VALUE_FLAGS = new Set([
   '--state',
   '--timeout',
   '--ms',
+  '--domain',
+  '--passphrase',
+  '--out',
+  '--in',
 ])
+
+async function readStdinUtf8(): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of process.stdin) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
 
 function parseArgv(argv: string[]) {
   const positional: string[] = []
@@ -256,6 +280,185 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       await manager.close()
     }
     return
+  }
+
+  if (cmd === 'cookies') {
+    const sub = positional[1]
+    if (sub !== 'export' && sub !== 'import' && sub !== 'clear') {
+      console.error('Usage: troy-advanced cookies <export|import|clear> [file] [flags]')
+      process.exit(1)
+    }
+
+    const explicitProfile = typeof flags.profile === 'string' ? flags.profile : undefined
+    const useDaemon = !explicitProfile && !flags.oneshot
+    const live = useDaemon ? readLiveEndpoint(endpointFlag) : null
+    const domainFilter = typeof flags.domain === 'string' ? flags.domain : undefined
+    const urlFilter = typeof flags.url === 'string' ? flags.url : undefined
+
+    if (sub === 'export') {
+      const passphrase =
+        typeof flags.passphrase === 'string'
+          ? flags.passphrase
+          : flags.encrypt
+            ? process.env.TROY_COOKIE_PASSPHRASE
+            : undefined
+      if (flags.encrypt && !passphrase) {
+        console.error(
+          JSON.stringify(
+            { ok: false, error: '--encrypt requires --passphrase <pass> or TROY_COOKIE_PASSPHRASE env var' },
+            null,
+            2,
+          ),
+        )
+        process.exit(1)
+      }
+
+      let cookies: BrowserCookie[]
+      let exportEngine: 'chromium' | 'lite'
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/cookies/export', {
+          domain: domainFilter,
+          url: urlFilter,
+          includeExpired: Boolean(flags['include-expired']),
+        })
+        if (!res.ok) {
+          console.error(JSON.stringify(res, null, 2))
+          process.exit(1)
+        }
+        cookies = Array.isArray(res.cookies) ? (res.cookies as BrowserCookie[]) : []
+        exportEngine = res.engine === 'lite' ? 'lite' : 'chromium'
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          cookies = await manager.exportCookies({
+            domain: domainFilter,
+            url: urlFilter,
+            includeExpired: Boolean(flags['include-expired']),
+          })
+          exportEngine = manager.engine.kind
+        } finally {
+          await manager.close()
+        }
+      }
+
+      const serialized = serializeCookieBundle(cookies, { engine: exportEngine, passphrase })
+      const outFile = typeof flags.out === 'string' ? flags.out : positional[2]
+      if (outFile && outFile !== '-') {
+        const written = writeCookieFile(outFile, serialized)
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              file: written.path,
+              bytes: written.bytes,
+              mode: written.mode,
+              engine: exportEngine,
+              count: cookies.length,
+              encrypted: Boolean(passphrase),
+            },
+            null,
+            2,
+          ),
+        )
+      } else {
+        process.stdout.write(`${serialized}\n`)
+      }
+      return
+    }
+
+    if (sub === 'import') {
+      const inFile = typeof flags.in === 'string' ? flags.in : positional[2]
+      let rawJson: string
+      try {
+        rawJson = inFile && inFile !== '-' ? readCookieFile(inFile) : await readStdinUtf8()
+      } catch (err) {
+        console.error(JSON.stringify({ ok: false, error: `Failed to read cookie input: ${(err as Error).message}` }, null, 2))
+        process.exit(1)
+      }
+
+      const passphrase =
+        typeof flags.passphrase === 'string' ? flags.passphrase : process.env.TROY_COOKIE_PASSPHRASE
+
+      let parsed: { cookies: BrowserCookie[]; encrypted: boolean; skipped: number }
+      try {
+        parsed = parseCookieBundle(rawJson, { passphrase })
+      } catch (err) {
+        console.error(JSON.stringify({ ok: false, error: (err as Error).message }, null, 2))
+        process.exit(1)
+      }
+
+      const cookiesToImport = domainFilter
+        ? filterCookies(parsed.cookies, { domain: domainFilter, includeExpired: true })
+        : parsed.cookies
+
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/cookies/import', { cookies: cookiesToImport })
+        const merged = {
+          ...res,
+          skipped: Number(res.skipped ?? 0) + parsed.skipped,
+          encrypted: parsed.encrypted,
+        }
+        console.log(JSON.stringify(merged, null, 2))
+        if (!res.ok) process.exit(1)
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          const res = await manager.importCookies(cookiesToImport)
+          console.log(
+            JSON.stringify(
+              {
+                ok: true,
+                engine: manager.engine.kind,
+                imported: res.imported,
+                skipped: res.skipped + parsed.skipped,
+                encrypted: parsed.encrypted,
+                errors: res.errors,
+              },
+              null,
+              2,
+            ),
+          )
+        } finally {
+          await manager.close()
+        }
+      }
+      return
+    }
+
+    if (sub === 'clear') {
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/cookies/clear', { domain: domainFilter })
+        console.log(JSON.stringify(res, null, 2))
+        if (!res.ok) process.exit(1)
+      } else {
+        const manager = await BrowserManager.create({
+          engine,
+          profileDir: explicitProfile,
+          remoteCdpPort: flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined,
+          trackerBlocking,
+          memoryEnabled: false,
+        })
+        try {
+          const removed = await manager.clearCookies({ domain: domainFilter })
+          console.log(JSON.stringify({ ok: true, engine: manager.engine.kind, removed }, null, 2))
+        } finally {
+          await manager.close()
+        }
+      }
+      return
+    }
   }
 
   // One-shot ASCII / Markdown / Visual fetch without needing a running daemon

@@ -1,6 +1,9 @@
 import type {
   BlockedTrackerStats,
+  BrowserCookie,
   ConsoleEntry,
+  CookieExportOptions,
+  CookieImportResult,
   NetworkEntry,
   PageSnapshot,
   SettleOptions,
@@ -39,5 +42,8 @@ export interface BrowserEngine {
   readonly kind: 'chromium' | 'lite'
   readonly cdpPort: number
   createTab(initialUrl?: string): Promise<TabDriver>
+  exportCookies(opts?: CookieExportOptions): Promise<BrowserCookie[]>
+  importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult>
+  clearCookies?(opts?: { domain?: string }): Promise<number>
   close(): Promise<void>
 }

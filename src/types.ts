@@ -314,3 +314,48 @@ export interface EndpointDescriptor {
   agentToken: string
   profileDir: string
 }
+
+export type CookieSameSite = 'Strict' | 'Lax' | 'None'
+
+export interface BrowserCookie {
+  name: string
+  value: string
+  domain: string
+  path: string
+  expires?: number
+  httpOnly?: boolean
+  secure?: boolean
+  sameSite?: CookieSameSite
+}
+
+export interface CookieExportOptions {
+  domain?: string
+  url?: string
+  includeExpired?: boolean
+}
+
+export interface CookieImportResult {
+  imported: number
+  skipped: number
+  errors: string[]
+}
+
+export interface CookieExportBundle {
+  version: 1
+  exportedAt: string
+  engine: 'chromium' | 'lite'
+  count: number
+  cookies: BrowserCookie[]
+}
+
+export interface EncryptedCookieBundle {
+  version: 1
+  encrypted: true
+  kdf: 'scrypt'
+  cipher: 'aes-256-gcm'
+  salt: string
+  iv: string
+  authTag: string
+  ciphertext: string
+  exportedAt: string
+}

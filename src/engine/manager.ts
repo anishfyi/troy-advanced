@@ -7,6 +7,9 @@ import os from 'node:os'
 import type {
   ActStep,
   AsciiRenderOptions,
+  BrowserCookie,
+  CookieExportOptions,
+  CookieImportResult,
   ElementDescriptor,
   EngineKind,
   MarkdownRenderOptions,
@@ -1156,6 +1159,25 @@ export class BrowserManager {
       default:
         return { ok: false, error: `unknown tool: ${name}` }
     }
+  }
+
+  async exportCookies(opts: CookieExportOptions = {}): Promise<BrowserCookie[]> {
+    const cookies = await this.engine.exportCookies(opts)
+    this.emit({ type: 'cookies_exported', count: cookies.length, domain: opts.domain })
+    return cookies
+  }
+
+  async importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult> {
+    const result = await this.engine.importCookies(cookies)
+    this.emit({ type: 'cookies_imported', imported: result.imported, skipped: result.skipped })
+    return result
+  }
+
+  async clearCookies(opts: { domain?: string } = {}): Promise<number> {
+    if (!this.engine.clearCookies) return 0
+    const removed = await this.engine.clearCookies(opts)
+    this.emit({ type: 'cookies_cleared', removed, domain: opts.domain })
+    return removed
   }
 
   async close(): Promise<void> {

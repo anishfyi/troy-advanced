@@ -3,8 +3,11 @@
 // or offline tests without Chromium installed.
 
 import type {
+  BrowserCookie,
   ConsoleEntry,
   ContentBlock,
+  CookieExportOptions,
+  CookieImportResult,
   ElementDescriptor,
   FrameSummary,
   InlineLink,
@@ -18,6 +21,15 @@ import type {
 } from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
+import {
+  cookieMatchesUrl,
+  cookieStorageKey,
+  domainFilterMatches,
+  filterCookies,
+  isCookieExpired,
+  normalizeCookie,
+  parseSetCookieHeader,
+} from './cookies.js'
 import { flattenFrameSnapshots, prefixFrameSelector, type ChildFrameSnapshotInput } from './frames.js'
 import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
@@ -590,9 +602,9 @@ class LiteTab implements TabDriver {
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
   private networkLogs: NetworkEntry[] = []
-  private cookies: Map<string, string>
+  private cookies: Map<string, BrowserCookie>
 
-  constructor(id: number, cookies: Map<string, string>) {
+  constructor(id: number, cookies: Map<string, BrowserCookie>) {
     this.id = id
     this.cookies = cookies
   }
@@ -615,11 +627,15 @@ class LiteTab implements TabDriver {
 
   private cookieHeaderFor(targetUrl: string): string | undefined {
     try {
-      const host = new URL(targetUrl).hostname
+      const nowSec = Math.floor(Date.now() / 1000)
       const pairs: string[] = []
-      for (const [k, v] of this.cookies) {
-        if (k.startsWith(`${host}:`)) {
-          pairs.push(`${k.slice(host.length + 1)}=${v}`)
+      for (const [k, cookie] of this.cookies) {
+        if (isCookieExpired(cookie, nowSec)) {
+          this.cookies.delete(k)
+          continue
+        }
+        if (cookieMatchesUrl(cookie, targetUrl, nowSec)) {
+          pairs.push(`${cookie.name}=${cookie.value}`)
         }
       }
       return pairs.length > 0 ? pairs.join('; ') : undefined
@@ -630,14 +646,16 @@ class LiteTab implements TabDriver {
 
   private storeCookies(targetUrl: string, headers: Headers): void {
     try {
-      const host = new URL(targetUrl).hostname
+      const nowSec = Math.floor(Date.now() / 1000)
       const setCookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : []
       for (const raw of setCookies) {
-        const pair = raw.split(';')[0]?.trim()
-        if (!pair) continue
-        const eq = pair.indexOf('=')
-        if (eq > 0) {
-          this.cookies.set(`${host}:${pair.slice(0, eq).trim()}`, pair.slice(eq + 1).trim())
+        const parsed = parseSetCookieHeader(raw, targetUrl, nowSec)
+        if (!parsed) continue
+        const key = cookieStorageKey(parsed)
+        if (isCookieExpired(parsed, nowSec)) {
+          this.cookies.delete(key)
+        } else {
+          this.cookies.set(key, parsed)
         }
       }
     } catch {
@@ -1015,7 +1033,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   readonly kind = 'lite' as const
   readonly cdpPort = 0
   private nextId = 1
-  private cookies = new Map<string, string>()
+  private cookies = new Map<string, BrowserCookie>()
 
   async createTab(initialUrl?: string): Promise<TabDriver> {
     const tab = new LiteTab(this.nextId++, this.cookies)
@@ -1023,6 +1041,52 @@ export class LiteBrowserEngine implements BrowserEngine {
       await tab.navigate(initialUrl)
     }
     return tab
+  }
+
+  async exportCookies(opts: CookieExportOptions = {}): Promise<BrowserCookie[]> {
+    return filterCookies([...this.cookies.values()], opts)
+  }
+
+  async importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult> {
+    let imported = 0
+    let skipped = 0
+    const errors: string[] = []
+    const nowSec = Math.floor(Date.now() / 1000)
+
+    for (const raw of cookies) {
+      const cookie = normalizeCookie(raw as unknown as Partial<BrowserCookie> & Record<string, unknown>)
+      if (!cookie) {
+        skipped++
+        errors.push(`Invalid cookie skipped: ${String((raw as { name?: unknown })?.name ?? '<unnamed>')}`)
+        continue
+      }
+      const key = cookieStorageKey(cookie)
+      if (isCookieExpired(cookie, nowSec)) {
+        this.cookies.delete(key)
+        skipped++
+        continue
+      }
+      this.cookies.set(key, cookie)
+      imported++
+    }
+
+    return { imported, skipped, errors }
+  }
+
+  async clearCookies(opts: { domain?: string } = {}): Promise<number> {
+    if (!opts.domain) {
+      const count = this.cookies.size
+      this.cookies.clear()
+      return count
+    }
+    let removed = 0
+    for (const [key, cookie] of this.cookies) {
+      if (domainFilterMatches(cookie.domain, opts.domain)) {
+        this.cookies.delete(key)
+        removed++
+      }
+    }
+    return removed
   }
 
   async close(): Promise<void> {

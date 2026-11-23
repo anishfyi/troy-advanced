@@ -8,8 +8,11 @@ import os from 'node:os'
 import path from 'node:path'
 import type {
   BlockedTrackerStats,
+  BrowserCookie,
   ConsoleEntry,
   ContentBlock,
+  CookieExportOptions,
+  CookieImportResult,
   ElementDescriptor,
   NetworkEntry,
   PageSnapshot,
@@ -21,6 +24,14 @@ import type {
   WaitState,
 } from '../types.js'
 import { CdpClient } from './cdp-client.js'
+import {
+  domainFilterMatches,
+  filterCookies,
+  fromCdpCookie,
+  isCookieExpired,
+  normalizeCookie,
+  toCdpCookieParam,
+} from './cookies.js'
 import {
   IFRAME_OWNER_INFO_FUNCTION,
   flattenFrameSnapshots,
@@ -1897,6 +1908,102 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       await tab.navigate(initialUrl)
     }
     return tab
+  }
+
+  private async withBrowserCdp<T>(fn: (cdp: CdpClient) => Promise<T>): Promise<T> {
+    const res = await fetch(`http://127.0.0.1:${this.cdpPort}/json/version`)
+    if (!res.ok) {
+      throw new Error(`Failed to query Chromium CDP version (HTTP ${res.status})`)
+    }
+    const info = (await res.json()) as { webSocketDebuggerUrl?: string }
+    if (!info.webSocketDebuggerUrl) {
+      throw new Error('Chromium /json/version did not return webSocketDebuggerUrl')
+    }
+    const cdp = await CdpClient.connect(info.webSocketDebuggerUrl)
+    try {
+      return await fn(cdp)
+    } finally {
+      await cdp.close()
+    }
+  }
+
+  async exportCookies(opts: CookieExportOptions = {}): Promise<BrowserCookie[]> {
+    const rawCookies = await this.withBrowserCdp(async (cdp) => {
+      const res = await cdp.send<{ cookies?: Array<Record<string, unknown>> }>('Storage.getCookies')
+      return res.cookies ?? []
+    })
+    const normalized: BrowserCookie[] = []
+    for (const raw of rawCookies) {
+      const c = fromCdpCookie(raw)
+      if (c) normalized.push(c)
+    }
+    return filterCookies(normalized, opts)
+  }
+
+  async importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult> {
+    const valid: BrowserCookie[] = []
+    let skipped = 0
+    const errors: string[] = []
+    const nowSec = Math.floor(Date.now() / 1000)
+
+    for (const raw of cookies) {
+      const normalized = normalizeCookie(raw as unknown as Partial<BrowserCookie> & Record<string, unknown>)
+      if (!normalized) {
+        skipped++
+        errors.push(`Invalid cookie skipped: ${String((raw as { name?: unknown })?.name ?? '<unnamed>')}`)
+        continue
+      }
+      if (isCookieExpired(normalized, nowSec)) {
+        skipped++
+        continue
+      }
+      valid.push(normalized)
+    }
+
+    if (valid.length === 0) {
+      return { imported: 0, skipped, errors }
+    }
+
+    return this.withBrowserCdp(async (cdp) => {
+      try {
+        await cdp.send('Storage.setCookies', { cookies: valid.map(toCdpCookieParam) })
+        return { imported: valid.length, skipped, errors }
+      } catch {
+        // Fallback to per-cookie import so one rejected cookie does not block the rest
+        let imported = 0
+        for (const c of valid) {
+          try {
+            await cdp.send('Storage.setCookies', { cookies: [toCdpCookieParam(c)] })
+            imported++
+          } catch (err) {
+            skipped++
+            errors.push(`${c.name}@${c.domain}: ${String((err as Error)?.message ?? err)}`)
+          }
+        }
+        return { imported, skipped, errors }
+      }
+    })
+  }
+
+  async clearCookies(opts: { domain?: string } = {}): Promise<number> {
+    const all = await this.exportCookies({ includeExpired: true })
+    if (!opts.domain) {
+      await this.withBrowserCdp(async (cdp) => {
+        await cdp.send('Storage.clearCookies')
+      })
+      return all.length
+    }
+    const keep = all.filter((c) => !domainFilterMatches(c.domain, opts.domain!))
+    const removed = all.length - keep.length
+    if (removed > 0) {
+      await this.withBrowserCdp(async (cdp) => {
+        await cdp.send('Storage.clearCookies')
+        if (keep.length > 0) {
+          await cdp.send('Storage.setCookies', { cookies: keep.map(toCdpCookieParam) })
+        }
+      })
+    }
+    return removed
   }
 
   async close(): Promise<void> {

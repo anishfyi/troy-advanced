@@ -5,9 +5,11 @@
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { parseAsciiDensity } from '../ascii/layout.js'
+import type { BrowserCookie } from '../types.js'
 import type { BrowserManager } from '../engine/manager.js'
 
 const MAX_BODY = 128 * 1024
+const MAX_COOKIE_IMPORT_BODY = 1024 * 1024
 
 export interface AgentSocketServer {
   port: number
@@ -172,6 +174,38 @@ export async function createAgentSocket(
           payload: { ok: true, enabled: Boolean(manager.memory), ...(manager.memory?.stats() ?? {}) },
         }
       }
+      case '/cookies/export': {
+        const cookies = await manager.exportCookies({
+          domain: typeof body.domain === 'string' ? body.domain : undefined,
+          url: typeof body.url === 'string' ? body.url : undefined,
+          includeExpired: Boolean(body.includeExpired),
+        })
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            engine: manager.engine.kind,
+            count: cookies.length,
+            cookies,
+          },
+        }
+      }
+      case '/cookies/import': {
+        if (!Array.isArray(body.cookies)) {
+          return { status: 400, payload: { ok: false, error: 'cookies must be an array' } }
+        }
+        const result = await manager.importCookies(body.cookies as BrowserCookie[])
+        return {
+          status: 200,
+          payload: { ok: true, ...result },
+        }
+      }
+      case '/cookies/clear': {
+        const removed = await manager.clearCookies({
+          domain: typeof body.domain === 'string' ? body.domain : undefined,
+        })
+        return { status: 200, payload: { ok: true, removed } }
+      }
       default:
         return { status: 404, payload: { ok: false, error: `no route ${pathname}` } }
     }
@@ -221,11 +255,12 @@ export async function createAgentSocket(
       return respond(405, { ok: false, error: 'POST only' })
     }
 
+    const maxBody = url.pathname === '/cookies/import' ? MAX_COOKIE_IMPORT_BODY : MAX_BODY
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer) => {
       size += chunk.length
-      if (size > MAX_BODY) {
+      if (size > maxBody) {
         req.destroy()
         respond(413, { ok: false, error: 'body too large' })
         return
