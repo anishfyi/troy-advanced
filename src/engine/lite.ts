@@ -78,6 +78,14 @@ import {
   type StructuredKind,
 } from './structured-view.js'
 import {
+  buildFeedReaderDocument,
+  detectFeedKind,
+  discoverFeedsInHtml,
+  parseFeedXml,
+  type DiscoveredFeed,
+  type ParsedFeed,
+} from './feed-reader.js'
+import {
   filterStorageSnapshots,
   normalizeOriginStorageSnapshot,
   normalizeStorageArea,
@@ -402,6 +410,7 @@ export interface ParsedDoc {
   title: string
   baseUrl?: string
   metaRefresh?: MetaRefreshDirective
+  feeds?: DiscoveredFeed[]
   blocks: Array<ContentBlock & { selector?: string }>
   elements: ElementDescriptor[]
   frames?: FrameSummary[]
@@ -422,6 +431,7 @@ export function parseHtmlDocument(
   const resolvedBaseHref = extractBaseHref(cleaned, documentUrl)
   const effectiveBaseUrl = resolvedBaseHref ?? documentUrl
   const metaRefresh = extractMetaRefresh(cleaned, effectiveBaseUrl)
+  const discoveredFeeds = depth === 0 ? discoverFeedsInHtml(cleaned, effectiveBaseUrl) : []
 
   const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(cleaned)
   const title = titleMatch ? stripTags(titleMatch[1]!) : ''
@@ -1313,6 +1323,42 @@ export function parseHtmlDocument(
     }
   }
 
+  if (discoveredFeeds.length > 0) {
+    const feedInlineLinks: InlineLink[] = []
+    const segments: string[] = []
+    let cursor = 'Feeds: '.length
+    for (let i = 0; i < discoveredFeeds.length; i++) {
+      const feed = discoveredFeeds[i]!
+      const feedSelector = `feed-autodiscover:${i}`
+      const badge = feed.kind === 'atom' ? 'Atom' : 'RSS'
+      const label = feed.title ? `[${badge}] ${feed.title}` : `[${badge}] ${feed.url}`
+      if (i > 0) {
+        cursor += 2 // ', '
+      }
+      feedInlineLinks.push({
+        text: label,
+        href: feed.url,
+        selector: feedSelector,
+        start: cursor,
+        end: cursor + label.length,
+      })
+      elements.push({
+        selector: feedSelector,
+        tag: 'a',
+        type: 'link',
+        role: 'link',
+        text: label,
+        ariaLabel: `Subscribe to ${badge} feed: ${feed.title ?? feed.url}`,
+        href: feed.url,
+      })
+      segments.push(label)
+      cursor += label.length
+    }
+    const feedLine = `Feeds: ${segments.join(', ')}`
+    blocks.push({ kind: 'hr', text: '---', tag: 'hr' })
+    blocks.push({ kind: 'paragraph', text: feedLine, tag: 'p', links: feedInlineLinks })
+  }
+
   const text = blocks
     .map((b) => b.text)
     .filter(Boolean)
@@ -1386,6 +1432,7 @@ export function parseHtmlDocument(
         title,
         ...(resolvedBaseHref ? { baseUrl: resolvedBaseHref } : {}),
         ...(metaRefresh ? { metaRefresh } : {}),
+        ...(discoveredFeeds.length > 0 ? { feeds: discoveredFeeds } : {}),
         blocks: flattened.blocks,
         elements: flattened.elements,
         frames: flattened.frames,
@@ -1400,6 +1447,7 @@ export function parseHtmlDocument(
     title,
     ...(resolvedBaseHref ? { baseUrl: resolvedBaseHref } : {}),
     ...(metaRefresh ? { metaRefresh } : {}),
+    ...(discoveredFeeds.length > 0 ? { feeds: discoveredFeeds } : {}),
     blocks,
     elements,
     text,
@@ -1425,6 +1473,10 @@ class LiteTab implements TabDriver {
   private structuredFocusPath: string | null = null
   private structuredContainerPaths: string[] = []
   private structuredRootPath = '$'
+  private parsedFeed: ParsedFeed | null = null
+  private feedExpandedItems = new Set<number>()
+  private feedCategoryFilter: string | null = null
+  private feedPage = 0
   private historyStack: string[] = []
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
@@ -1734,34 +1786,44 @@ class LiteTab implements TabDriver {
       this.structuredFocusPath = null
       this.structuredContainerPaths = []
       this.structuredRootPath = '$'
+      this.parsedFeed = null
+      this.feedExpandedItems.clear()
+      this.feedCategoryFilter = null
+      this.feedPage = 0
 
-      const structuredKind = detectStructuredKind(contentType, body, finalUrl)
-      if (structuredKind) {
-        this.structuredKind = structuredKind
-        const parsed = parseStructuredDocument(structuredKind, body, finalUrl, {
-          collapsedPaths: this.structuredCollapsed,
-          focusPath: this.structuredFocusPath,
-        })
-        this.structuredContainerPaths = parsed.containerPaths
-        this.structuredRootPath = parsed.rootPath
-        this.doc = {
-          title: parsed.title,
-          blocks: parsed.blocks,
-          elements: parsed.elements,
-          text: parsed.text,
-          forms: new Map(),
-        }
-      } else if (contentType.toLowerCase().includes('text/plain')) {
-        const title = new URL(finalUrl).pathname || finalUrl
-        this.doc = {
-          title,
-          blocks: [{ kind: 'code', text: body.slice(0, 16000), tag: 'pre' }],
-          elements: [],
-          text: body.slice(0, 16000),
-          forms: new Map(),
-        }
+      const feedKind = detectFeedKind(contentType, body, finalUrl)
+      if (feedKind) {
+        this.parsedFeed = parseFeedXml(body, finalUrl, feedKind)
+        this.reparseFeedView()
       } else {
-        this.doc = preParsedDoc ?? parseHtmlDocument(body, finalUrl)
+        const structuredKind = detectStructuredKind(contentType, body, finalUrl)
+        if (structuredKind) {
+          this.structuredKind = structuredKind
+          const parsed = parseStructuredDocument(structuredKind, body, finalUrl, {
+            collapsedPaths: this.structuredCollapsed,
+            focusPath: this.structuredFocusPath,
+          })
+          this.structuredContainerPaths = parsed.containerPaths
+          this.structuredRootPath = parsed.rootPath
+          this.doc = {
+            title: parsed.title,
+            blocks: parsed.blocks,
+            elements: parsed.elements,
+            text: parsed.text,
+            forms: new Map(),
+          }
+        } else if (contentType.toLowerCase().includes('text/plain')) {
+          const title = new URL(finalUrl).pathname || finalUrl
+          this.doc = {
+            title,
+            blocks: [{ kind: 'code', text: body.slice(0, 16000), tag: 'pre' }],
+            elements: [],
+            text: body.slice(0, 16000),
+            forms: new Map(),
+          }
+        } else {
+          this.doc = preParsedDoc ?? parseHtmlDocument(body, finalUrl)
+        }
       }
 
       this.url = finalUrl
@@ -1980,6 +2042,24 @@ class LiteTab implements TabDriver {
     }
   }
 
+  private reparseFeedView(): void {
+    if (!this.parsedFeed) return
+    const rendered = buildFeedReaderDocument(this.parsedFeed, {
+      expandedItems: this.feedExpandedItems,
+      categoryFilter: this.feedCategoryFilter,
+      page: this.feedPage,
+    })
+    this.feedPage = rendered.page
+    this.doc = {
+      title: rendered.title,
+      blocks: rendered.blocks,
+      elements: rendered.elements,
+      text: rendered.text,
+      forms: new Map(),
+    }
+    this.title = this.doc.title || this.url
+  }
+
   private reparseStructuredView(): void {
     if (!this.structuredKind) return
     const parsed = parseStructuredDocument(this.structuredKind, this.rawHtml, this.url, {
@@ -2002,6 +2082,66 @@ class LiteTab implements TabDriver {
     const el = this.doc.elements.find((e) => e.selector === selector)
     if (!el) return { ok: false, note: `element ${selector} not found` }
     if (el.disabled) return { ok: false, note: `element ${selector} is disabled` }
+
+    if (this.parsedFeed) {
+      if (selector.startsWith('feed-toggle:')) {
+        const idx = Number.parseInt(selector.slice('feed-toggle:'.length), 10)
+        if (Number.isFinite(idx)) {
+          if (this.feedExpandedItems.has(idx)) {
+            this.feedExpandedItems.delete(idx)
+            this.reparseFeedView()
+            return { ok: true, note: `collapsed feed item ${idx + 1}` }
+          }
+          this.feedExpandedItems.add(idx)
+          this.reparseFeedView()
+          return { ok: true, note: `expanded feed item ${idx + 1}` }
+        }
+      }
+      if (selector === 'feed-action:expand-all') {
+        for (const item of this.parsedFeed.items) {
+          this.feedExpandedItems.add(item.index)
+        }
+        this.reparseFeedView()
+        return { ok: true, note: 'expanded all feed items' }
+      }
+      if (selector === 'feed-action:collapse-all') {
+        this.feedExpandedItems.clear()
+        this.reparseFeedView()
+        return { ok: true, note: 'collapsed all feed items' }
+      }
+      if (selector.startsWith('feed-filter:')) {
+        const cat = selector.slice('feed-filter:'.length)
+        this.feedCategoryFilter = cat === 'all' ? null : cat
+        this.feedPage = 0
+        this.scrollY = 0
+        this.reparseFeedView()
+        return {
+          ok: true,
+          note: this.feedCategoryFilter ? `filtered feed by #${this.feedCategoryFilter}` : 'cleared feed filter',
+        }
+      }
+      if (selector === 'feed-page:next') {
+        this.feedPage += 1
+        this.scrollY = 0
+        this.reparseFeedView()
+        return { ok: true, note: `feed page ${this.feedPage + 1}` }
+      }
+      if (selector === 'feed-page:prev') {
+        this.feedPage = Math.max(0, this.feedPage - 1)
+        this.scrollY = 0
+        this.reparseFeedView()
+        return { ok: true, note: `feed page ${this.feedPage + 1}` }
+      }
+      if (selector === 'feed-action:raw-xml') {
+        this.parsedFeed = null
+        this.structuredKind = 'xml'
+        this.structuredCollapsed.clear()
+        this.structuredFocusPath = null
+        this.scrollY = 0
+        this.reparseStructuredView()
+        return { ok: true, note: 'switched to raw XML view' }
+      }
+    }
 
     if (this.structuredKind) {
       if (selector.startsWith('json-toggle:') || selector.startsWith('xml-toggle:')) {

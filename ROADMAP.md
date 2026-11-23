@@ -44,7 +44,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M35: Support `multipart/form-data` and hidden `<input type="hidden">` form fields (CSRF tokens!) in Lite form submissions
 - [x] M36: Support `fieldset`/`legend`, `<details>`/`<summary>`, `<dialog>`, and ARIA `role="button"`/`role="link"` in Lite parser
 - [x] M37: JSON & XML pretty-formatter views in Lite engine with collapsible path navigation
-- [ ] M38: RSS / Atom feed auto-detection and structured ASCII feed reader rendering
+- [x] M38: RSS / Atom feed auto-detection and structured ASCII feed reader rendering
 - [ ] M39: Robots/rate-limit awareness + configurable retry with exponential backoff on HTTP 429/503
 - [ ] M40: Response caching (`ETag` / `If-None-Match`) for blazing-fast repeated reads in Lite mode
 - [ ] M41: Plain-text / Markdown / CSV document renderer when Lite fetches non-HTML content
