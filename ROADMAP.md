@@ -63,7 +63,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M52: Live pixel-preview toggle (`v` cycles Layout ASCII -> Pixel ASCII -> Braille -> Halfblock)
 - [x] M53: Export current page view to `.txt`, `.md`, or `.json` directly from TUI (`:save <file>`)
 - [x] M54: Built-in TUI help overlay (`?`) listing all keybindings in an ASCII modal box
-- [ ] M55: Headless PTY / simulated stream unit tests covering every TUI interaction
+- [x] M55: Headless PTY / simulated stream unit tests covering every TUI interaction
 
 ## Track 5: Deep AI Agent & Protocol Integration (Milestones 56–70)
 - [ ] M56: Full MCP resources (`troy://tabs`, `troy://active/ascii`, `troy://memory/stats`) and MCP prompts (`browse_and_extract`, `fill_form_safely`)
