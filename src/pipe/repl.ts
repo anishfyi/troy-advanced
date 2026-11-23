@@ -5,6 +5,7 @@
 
 import readline from 'node:readline'
 import type { BrowserManager } from '../engine/manager.js'
+import { parseDownloadMode } from '../engine/downloads.js'
 import { parseHeaderList } from '../engine/emulation.js'
 
 function tokenizePipeArgs(input: string): string[] {
@@ -342,6 +343,30 @@ export async function executePipeCommand(
             revealHeaders,
           })
         : manager.getEmulation(undefined, { revealHeaders })
+      return { output: format(res) }
+    }
+    case 'downloads': {
+      const tokens = tokenizePipeArgs(argStr)
+      let blockedOnly = false
+      let clear = false
+      let mode: string | undefined
+      let removeId: string | undefined
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok === '--blocked' || tok === 'blocked') blockedOnly = true
+        else if (tok === '--clear' || tok === 'clear') clear = true
+        else if ((tok === '--mode' || tok === 'mode') && tokens[i + 1]) mode = tokens[++i]
+        else if (tok.startsWith('--mode=')) mode = tok.slice('--mode='.length)
+        else if ((tok === '--remove' || tok === 'remove') && tokens[i + 1]) removeId = tokens[++i]
+        else if (tok.startsWith('--remove=')) removeId = tok.slice('--remove='.length)
+        else if (parseDownloadMode(tok)) mode = tok
+      }
+      const res = await manager.runTool(undefined, 'page_downloads', {
+        blockedOnly,
+        clear,
+        ...(mode ? { mode } : {}),
+        ...(removeId ? { removeId } : {}),
+      })
       return { output: format(res) }
     }
     default:

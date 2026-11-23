@@ -3,7 +3,13 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { CrashRecoveryOptions, EmulationOptions, EngineKind, TrackerBlockingOptions } from '../types.js'
+import type {
+  CrashRecoveryOptions,
+  DownloadPolicyOptions,
+  EmulationOptions,
+  EngineKind,
+  TrackerBlockingOptions,
+} from '../types.js'
 import { BrowserManager } from '../engine/manager.js'
 import { createAgentSocket } from '../bridge/agent-socket.js'
 import {
@@ -27,6 +33,7 @@ export interface DaemonOptions {
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
+  downloads?: DownloadPolicyOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -38,6 +45,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     trackerBlocking: opts.trackerBlocking,
     emulation: opts.emulation,
     crashRecovery: opts.crashRecovery,
+    downloads: opts.downloads,
   })
 
   if (opts.initialUrl) {
@@ -134,6 +142,8 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.trackerBlocking?.mode) args.push('--tracker-mode', opts.trackerBlocking.mode)
   if (opts.crashRecovery?.enabled === false) args.push('--no-crash-recovery')
   if (opts.crashRecovery?.maxRestarts !== undefined) args.push('--max-restarts', String(opts.crashRecovery.maxRestarts))
+  if (opts.downloads?.mode) args.push('--download-mode', opts.downloads.mode)
+  if (opts.downloads?.maxBytes !== undefined) args.push('--download-max-bytes', String(opts.downloads.maxBytes))
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport
     if (typeof vp === 'string') {

@@ -2,12 +2,19 @@
 // Runs anywhere Node.js runs — even tiny 512MB EC2 t4g.nano instances, Alpine containers,
 // or offline tests without Chromium installed.
 
+import os from 'node:os'
+import path from 'node:path'
 import type {
   BrowserCookie,
   ConsoleEntry,
   ContentBlock,
   CookieExportOptions,
   CookieImportResult,
+  DownloadEntry,
+  DownloadEvent,
+  DownloadPolicyOptions,
+  DownloadStats,
+  DownloadStatus,
   ElementDescriptor,
   EmulationOptions,
   EmulationProfile,
@@ -37,6 +44,11 @@ import {
   normalizeCookie,
   parseSetCookieHeader,
 } from './cookies.js'
+import {
+  DownloadQuarantineManager,
+  isDownloadResponse,
+  parseContentDispositionFilename,
+} from './downloads.js'
 import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import { flattenFrameSnapshots, prefixFrameSelector, type ChildFrameSnapshotInput } from './frames.js'
 import { parseKeyChord } from './keyboard.js'
@@ -622,17 +634,20 @@ class LiteTab implements TabDriver {
   private localStorageByOrigin: Map<string, Map<string, string>>
   private sessionStorageByOrigin = new Map<string, Map<string, string>>()
   private emulation: EmulationProfile
+  private downloads?: DownloadQuarantineManager
 
   constructor(
     id: number,
     cookies: Map<string, BrowserCookie>,
     localStorageByOrigin: Map<string, Map<string, string>>,
     initialEmulation?: EmulationProfile,
+    downloads?: DownloadQuarantineManager,
   ) {
     this.id = id
     this.cookies = cookies
     this.localStorageByOrigin = localStorageByOrigin
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
+    this.downloads = downloads
   }
 
   getEmulation(): EmulationProfile {
@@ -727,8 +742,52 @@ class LiteTab implements TabDriver {
     try {
       const res = await fetch(targetUrl, { ...init, headers, redirect: 'follow' })
       this.storeCookies(res.url || targetUrl, res.headers)
-      const body = await res.text()
       const finalUrl = res.url || targetUrl
+      const contentType = res.headers.get('content-type') ?? ''
+      const contentDisposition = res.headers.get('content-disposition')
+
+      if (this.downloads && isDownloadResponse(contentDisposition, contentType)) {
+        const data = Buffer.from(await res.arrayBuffer())
+        const parsedDisp = parseContentDispositionFilename(contentDisposition)
+        const entry = this.downloads.recordDirectBuffer({
+          tabId: this.id,
+          url: finalUrl,
+          suggestedFilename: parsedDisp.filename,
+          mimeType: contentType.split(';')[0]?.trim() || undefined,
+          data,
+        })
+        this.networkLogs.push({
+          url: finalUrl,
+          method: init?.method ?? 'GET',
+          status: res.status,
+          ok: res.ok && !entry.blocked,
+          resourceType: 'download',
+          durationMs: Date.now() - started,
+          ts: Date.now(),
+          ...(entry.blocked ? { blocked: true, blockedReason: entry.blockedReason } : {}),
+        })
+        const summary = entry.blocked
+          ? `Download blocked (${entry.blockedReason ?? 'policy'}): ${entry.suggestedFilename}`
+          : `Download quarantined (${entry.bytesReceived} bytes): ${entry.suggestedFilename} -> ${entry.quarantinePath ?? ''}`
+        this.rawHtml = ''
+        this.doc = {
+          title: entry.blocked ? `Blocked Download: ${entry.suggestedFilename}` : `Quarantined Download: ${entry.suggestedFilename}`,
+          blocks: [
+            { kind: 'heading', level: 1, text: entry.blocked ? 'Download Blocked' : 'Download Quarantined', tag: 'h1' },
+            { kind: 'paragraph', text: summary, tag: 'p' },
+          ],
+          elements: [],
+          text: summary,
+          forms: new Map(),
+        }
+        this.url = finalUrl
+        this.title = this.doc.title
+        this.epoch += 1
+        this.scrollY = 0
+        return { url: this.url, title: this.title }
+      }
+
+      const body = await res.text()
       this.networkLogs.push({
         url: finalUrl,
         method: init?.method ?? 'GET',
@@ -739,7 +798,6 @@ class LiteTab implements TabDriver {
         ts: Date.now(),
       })
 
-      const contentType = res.headers.get('content-type') ?? ''
       this.rawHtml = body
       if (contentType.includes('application/json') || contentType.includes('text/plain')) {
         const title = new URL(finalUrl).pathname || finalUrl
@@ -1169,6 +1227,8 @@ class LiteTab implements TabDriver {
 
 export interface LiteEngineOptions {
   emulation?: EmulationOptions
+  profileDir?: string
+  downloads?: DownloadPolicyOptions
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -1178,9 +1238,14 @@ export class LiteBrowserEngine implements BrowserEngine {
   private cookies = new Map<string, BrowserCookie>()
   private localStorageByOrigin = new Map<string, Map<string, string>>()
   private defaultEmulation: EmulationProfile
+  private downloads: DownloadQuarantineManager
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
+    const defaultQuarantineDir = opts.profileDir
+      ? path.join(opts.profileDir, 'quarantine')
+      : path.join(os.tmpdir(), `troy-advanced-lite-quarantine-${process.pid}`)
+    this.downloads = new DownloadQuarantineManager(opts.downloads, defaultQuarantineDir)
   }
 
   getDefaultEmulation(): EmulationProfile {
@@ -1192,8 +1257,38 @@ export class LiteBrowserEngine implements BrowserEngine {
     return cloneEmulationProfile(this.defaultEmulation)
   }
 
+  getDownloads(opts?: { status?: DownloadStatus; blockedOnly?: boolean; limit?: number }): DownloadEntry[] {
+    return this.downloads.list(opts)
+  }
+
+  getDownloadStats(): DownloadStats {
+    return this.downloads.getStats()
+  }
+
+  setDownloadPolicy(opts: DownloadPolicyOptions): DownloadStats {
+    return this.downloads.setPolicy(opts)
+  }
+
+  clearDownloads(opts?: { deleteFiles?: boolean }): { cleared: number; removedFiles: number } {
+    return this.downloads.clear(opts)
+  }
+
+  removeDownload(id: string): { ok: boolean; removedFile: boolean; error?: string } {
+    return this.downloads.remove(id)
+  }
+
+  onDownloadEvent(fn: (ev: DownloadEvent) => void): () => void {
+    return this.downloads.onEvent(fn)
+  }
+
   async createTab(initialUrl?: string): Promise<TabDriver> {
-    const tab = new LiteTab(this.nextId++, this.cookies, this.localStorageByOrigin, this.defaultEmulation)
+    const tab = new LiteTab(
+      this.nextId++,
+      this.cookies,
+      this.localStorageByOrigin,
+      this.defaultEmulation,
+      this.downloads,
+    )
     if (initialUrl) {
       await tab.navigate(initialUrl)
     }

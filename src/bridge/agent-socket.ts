@@ -5,7 +5,8 @@
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { parseAsciiDensity } from '../ascii/layout.js'
-import type { BrowserCookie, EmulationOptions, OriginStorageSnapshot } from '../types.js'
+import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnapshot } from '../types.js'
+import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 
@@ -48,6 +49,7 @@ export async function createAgentSocket(
             cdpPort: manager.engine.cdpPort,
             tabs: manager.listTabs().length,
             crashRecovery: manager.getCrashRecoveryStats(),
+            downloads: manager.getDownloadStats(),
           },
         }
       case '/tabs':
@@ -303,6 +305,58 @@ export async function createAgentSocket(
           revealHeaders: Boolean(body.revealHeaders),
         })
         return { status: 200, payload: result }
+      }
+      case '/downloads': {
+        if (typeof body.removeId === 'string' && body.removeId.trim()) {
+          const removed = manager.removeDownload(body.removeId.trim())
+          return { status: 200, payload: { ...removed, stats: manager.getDownloadStats() } }
+        }
+        if (body.clear) {
+          const cleared = manager.clearDownloads({ deleteFiles: body.deleteFiles !== false })
+          return { status: 200, payload: { ok: true, ...cleared, stats: manager.getDownloadStats() } }
+        }
+        const mode = parseDownloadMode(body.mode)
+        const hasPolicyUpdate =
+          Boolean(mode) ||
+          typeof body.maxBytes === 'number' ||
+          Array.isArray(body.extraBlockedExtensions) ||
+          Array.isArray(body.allowedExtensions)
+        if (hasPolicyUpdate) {
+          manager.setDownloadPolicy({
+            ...(mode ? { mode } : {}),
+            ...(typeof body.maxBytes === 'number' ? { maxBytes: body.maxBytes } : {}),
+            ...(Array.isArray(body.extraBlockedExtensions)
+              ? { extraBlockedExtensions: body.extraBlockedExtensions.map(String) }
+              : {}),
+            ...(Array.isArray(body.allowedExtensions)
+              ? { allowedExtensions: body.allowedExtensions.map(String) }
+              : {}),
+          })
+        }
+        const status =
+          body.status === 'in_progress' ||
+          body.status === 'quarantined' ||
+          body.status === 'blocked' ||
+          body.status === 'canceled' ||
+          body.status === 'failed'
+            ? (body.status as DownloadStatus)
+            : undefined
+        const entries = manager.getDownloads({
+          status,
+          blockedOnly: Boolean(body.blockedOnly),
+          limit: typeof body.limit === 'number' ? body.limit : 100,
+        })
+        const stats = manager.getDownloadStats()
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            count: entries.length,
+            entries,
+            stats,
+            ascii: formatDownloadsAscii(entries, stats),
+          },
+        }
       }
       default:
         return { status: 404, payload: { ok: false, error: `no route ${pathname}` } }

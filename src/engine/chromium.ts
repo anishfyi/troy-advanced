@@ -17,6 +17,11 @@ import type {
   CrashRecoveryOptions,
   CrashRecoveryStats,
   CrashRecoveryStatus,
+  DownloadEntry,
+  DownloadEvent,
+  DownloadPolicyOptions,
+  DownloadStats,
+  DownloadStatus,
   ElementDescriptor,
   EmulationOptions,
   EmulationProfile,
@@ -48,6 +53,7 @@ import {
   resolveCrashRecoveryOptions,
   shouldRestoreTabUrl,
 } from './crash-recovery.js'
+import { DownloadQuarantineManager } from './downloads.js'
 import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import {
   IFRAME_OWNER_INFO_FUNCTION,
@@ -601,6 +607,7 @@ class ChromiumTab implements TabDriver {
   private trackerBlocker: CdpTrackerBlocker
   private emulation: EmulationProfile
   private recoveryHost?: ChromiumTabRecoveryHost
+  private downloads?: DownloadQuarantineManager
 
   constructor(
     id: number,
@@ -610,6 +617,7 @@ class ChromiumTab implements TabDriver {
     trackerBlocking?: TrackerBlockingOptions,
     initialEmulation?: EmulationProfile,
     recoveryHost?: ChromiumTabRecoveryHost,
+    downloads?: DownloadQuarantineManager,
   ) {
     this.id = id
     this.targetId = targetId
@@ -617,6 +625,7 @@ class ChromiumTab implements TabDriver {
     this.cdpPort = cdpPort
     this.trackerBlocking = trackerBlocking
     this.recoveryHost = recoveryHost
+    this.downloads = downloads
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.trackerBlocker = this.createTrackerBlocker(cdp)
     this.bindCdpListeners()
@@ -782,6 +791,59 @@ class ChromiumTab implements TabDriver {
       })
       if (this.networkLogs.length > 300) this.networkLogs.shift()
     })
+    this.cdp.on('Browser.downloadWillBegin', (params) => {
+      if (!this.downloads) return
+      const guid = String(params.guid ?? '')
+      if (!guid) return
+      const url = String(params.url ?? '')
+      const suggestedFilename =
+        typeof params.suggestedFilename === 'string' ? params.suggestedFilename : undefined
+      const { shouldCancel } = this.downloads.recordWillBegin({
+        id: guid,
+        tabId: this.id,
+        url,
+        suggestedFilename,
+      })
+      if (shouldCancel) {
+        void this.cdp.send('Browser.cancelDownload', { guid }).catch(() => {})
+      }
+    })
+    this.cdp.on('Browser.downloadProgress', (params) => {
+      if (!this.downloads) return
+      const guid = String(params.guid ?? '')
+      if (!guid) return
+      const state = String(params.state ?? 'inProgress')
+      const receivedBytes = typeof params.receivedBytes === 'number' ? params.receivedBytes : undefined
+      const totalBytes = typeof params.totalBytes === 'number' ? params.totalBytes : undefined
+      const { shouldCancel } = this.downloads.recordProgress({
+        id: guid,
+        state,
+        receivedBytes,
+        totalBytes,
+      })
+      if (shouldCancel) {
+        void this.cdp.send('Browser.cancelDownload', { guid }).catch(() => {})
+      }
+    })
+  }
+
+  async applyDownloadBehavior(): Promise<void> {
+    if (!this.downloads) return
+    const downloadPath = this.downloads.ensureQuarantineDir()
+    try {
+      await this.cdp.send('Browser.setDownloadBehavior', {
+        behavior: 'allowAndName',
+        downloadPath,
+        eventsEnabled: true,
+      })
+    } catch {
+      await this.cdp
+        .send('Page.setDownloadBehavior', {
+          behavior: 'allow',
+          downloadPath,
+        })
+        .catch(() => {})
+    }
   }
 
   async init(): Promise<void> {
@@ -792,6 +854,7 @@ class ChromiumTab implements TabDriver {
       this.cdp.send('DOM.enable').catch(() => {}),
     ])
     await this.applyEmulation()
+    await this.applyDownloadBehavior()
     await this.cdp
       .send('Target.setAutoAttach', {
         autoAttach: true,
@@ -2149,6 +2212,7 @@ export interface ChromiumLaunchOptions {
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
+  downloads?: DownloadPolicyOptions
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
@@ -2162,6 +2226,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   private trackerBlocking?: TrackerBlockingOptions
   private defaultEmulation: EmulationProfile
   private recoveryOpts: Required<CrashRecoveryOptions>
+  private downloads: DownloadQuarantineManager
   private closing = false
   private status: CrashRecoveryStatus = 'healthy'
   private restartCount = 0
@@ -2186,6 +2251,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     trackerBlocking?: TrackerBlockingOptions
     defaultEmulation?: EmulationProfile
     crashRecovery?: CrashRecoveryOptions
+    downloads?: DownloadPolicyOptions
   }) {
     this._cdpPort = cfg.cdpPort
     this.preferredCdpPort = cfg.preferredCdpPort
@@ -2195,6 +2261,10 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     this.trackerBlocking = cfg.trackerBlocking
     this.defaultEmulation = cfg.defaultEmulation ? cloneEmulationProfile(cfg.defaultEmulation) : defaultEmulationProfile()
     this.recoveryOpts = resolveCrashRecoveryOptions(cfg.crashRecovery)
+    const defaultQuarantineDir = cfg.profileDir
+      ? path.join(cfg.profileDir, 'quarantine')
+      : path.join(os.tmpdir(), `troy-advanced-quarantine-${process.pid}`)
+    this.downloads = new DownloadQuarantineManager(cfg.downloads, defaultQuarantineDir)
     if (this.proc) {
       this.attachProcessExitHandler(this.proc)
     }
@@ -2363,6 +2433,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         trackerBlocking: opts.trackerBlocking,
         defaultEmulation: initialEmulation,
         crashRecovery: { ...opts.crashRecovery, enabled: false },
+        downloads: opts.downloads,
       })
     }
 
@@ -2390,6 +2461,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       trackerBlocking: opts.trackerBlocking,
       defaultEmulation: initialEmulation,
       crashRecovery: opts.crashRecovery,
+      downloads: opts.downloads,
     })
   }
 
@@ -2567,6 +2639,37 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     return cloneEmulationProfile(this.defaultEmulation)
   }
 
+  getDownloads(opts?: { status?: DownloadStatus; blockedOnly?: boolean; limit?: number }): DownloadEntry[] {
+    return this.downloads.list(opts)
+  }
+
+  getDownloadStats(): DownloadStats {
+    return this.downloads.getStats()
+  }
+
+  setDownloadPolicy(opts: DownloadPolicyOptions): DownloadStats {
+    const prevDir = this.downloads.getQuarantineDir()
+    const stats = this.downloads.setPolicy(opts)
+    if (stats.quarantineDir !== prevDir) {
+      for (const tab of this.liveTabs) {
+        void tab.applyDownloadBehavior().catch(() => {})
+      }
+    }
+    return stats
+  }
+
+  clearDownloads(opts?: { deleteFiles?: boolean }): { cleared: number; removedFiles: number } {
+    return this.downloads.clear(opts)
+  }
+
+  removeDownload(id: string): { ok: boolean; removedFile: boolean; error?: string } {
+    return this.downloads.remove(id)
+  }
+
+  onDownloadEvent(fn: (ev: DownloadEvent) => void): () => void {
+    return this.downloads.onEvent(fn)
+  }
+
   async createTab(initialUrl?: string): Promise<TabDriver> {
     const tab = await this.withRecovery(async () => {
       const target = await this.openNewTarget(this._cdpPort)
@@ -2584,6 +2687,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
             this.liveTabs.delete(t)
           },
         },
+        this.downloads,
       )
       await created.init()
       this.liveTabs.add(created)

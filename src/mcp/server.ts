@@ -182,6 +182,31 @@ const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: 'troy_downloads',
+    description:
+      'Inspect intercepted, quarantined, or blocked auto-downloads (including suggested filenames and quarantine paths), update download policy mode (quarantine|deny|allow), or purge quarantined files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        blockedOnly: { type: 'boolean', description: 'Only return downloads blocked by policy' },
+        status: {
+          type: 'string',
+          enum: ['in_progress', 'quarantined', 'blocked', 'canceled', 'failed'],
+          description: 'Filter downloads by status',
+        },
+        mode: {
+          type: 'string',
+          enum: ['quarantine', 'deny', 'allow'],
+          description: 'Update download interception policy mode',
+        },
+        maxBytes: { type: 'number', description: 'Update maximum permitted download size in bytes' },
+        clear: { type: 'boolean', description: 'Clear download history and delete quarantined files' },
+        removeId: { type: 'string', description: 'Remove a single download entry and its quarantined file by ID' },
+        limit: { type: 'number', description: 'Maximum entries to return (default 50)' },
+      },
+    },
+  },
 ]
 
 export async function handleMcpRequest(
@@ -335,6 +360,17 @@ export async function handleMcpRequest(
         }
         break
       }
+      case 'troy_downloads':
+        result = await manager.runTool(tabId, 'page_downloads', {
+          blockedOnly: args.blockedOnly,
+          status: args.status,
+          mode: args.mode,
+          maxBytes: args.maxBytes,
+          clear: args.clear,
+          removeId: args.removeId,
+          limit: args.limit,
+        })
+        break
       default:
         return {
           jsonrpc: '2.0',

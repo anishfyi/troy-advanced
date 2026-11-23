@@ -523,3 +523,67 @@ export interface CrashRecoveryStats {
   lastExitSignal: string | null
   lastError: string | null
 }
+
+export type DownloadPolicyMode = 'quarantine' | 'deny' | 'allow'
+
+export type DownloadStatus = 'in_progress' | 'quarantined' | 'blocked' | 'canceled' | 'failed'
+
+export interface DownloadPolicyOptions {
+  /**
+   * Download interception mode:
+   * - 'quarantine' (default): block unsafe/executable auto-downloads while quarantining safe files inside <profileDir>/quarantine (0600, non-executable).
+   * - 'deny': block all auto-downloads while still capturing suggested filenames & URLs for inspection.
+   * - 'allow': quarantine all downloads inside <profileDir>/quarantine (0600, non-executable).
+   */
+  mode?: DownloadPolicyMode
+  /** Custom quarantine directory (default: <profileDir>/quarantine). */
+  quarantineDir?: string
+  /** Maximum permitted download size in bytes (default: 50 MiB). */
+  maxBytes?: number
+  /** Extra lowercase file extensions (with leading dot, e.g. '.zip') to block in quarantine mode. */
+  extraBlockedExtensions?: string[]
+  /** File extensions explicitly allowed even if in the default unsafe list. */
+  allowedExtensions?: string[]
+}
+
+export interface DownloadEntry {
+  id: string
+  tabId?: number
+  url: string
+  suggestedFilename: string
+  safeFilename: string
+  extension: string
+  mimeType?: string
+  status: DownloadStatus
+  blocked: boolean
+  blockedReason?: string
+  quarantinePath?: string
+  bytesReceived: number
+  totalBytes?: number
+  sha256?: string
+  startedAt: number
+  completedAt?: number
+}
+
+export interface DownloadStats {
+  mode: DownloadPolicyMode
+  quarantineDir: string
+  maxBytes: number
+  total: number
+  quarantined: number
+  blocked: number
+  inProgress: number
+  failed: number
+}
+
+export type DownloadEventKind =
+  | 'download_started'
+  | 'download_blocked'
+  | 'download_quarantined'
+  | 'download_canceled'
+  | 'download_failed'
+
+export interface DownloadEvent {
+  kind: DownloadEventKind
+  entry: DownloadEntry
+}

@@ -5,6 +5,7 @@ import path from 'node:path'
 import type {
   BrowserCookie,
   CrashRecoveryOptions,
+  DownloadPolicyOptions,
   EmulationOptions,
   EngineKind,
   OriginStorageSnapshot,
@@ -12,6 +13,7 @@ import type {
   TrackerBlockMode,
 } from './types.js'
 import { BrowserManager } from './engine/manager.js'
+import { parseDownloadMode } from './engine/downloads.js'
 import { parseHeaderList } from './engine/emulation.js'
 import {
   filterCookies,
@@ -72,6 +74,8 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Wait for page condition or fixed delay
   back | forward | reload                 History navigation
   console | network | eval <expr>         Inspect tab diagnostics or evaluate JS
+  downloads [--blocked] [--clear] [--mode quarantine|deny|allow] [--remove <id>] [--json]
+                                          Inspect intercepted/quarantined/blocked auto-downloads or update policy
   act <json-steps> [--allow-submit]       Run batched action list
   grant <origin>                          Extend origin autonomy boundary
   recall <query> | forget [origin]        Query or clear persistent page memory
@@ -227,6 +231,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           maxRestarts: flags['max-restarts'] !== undefined ? Number(flags['max-restarts']) : undefined,
         }
       : undefined
+  const downloadModeFlag = parseDownloadMode(flags['download-mode'])
+  const downloadMaxBytesFlag =
+    flags['download-max-bytes'] !== undefined ? Number(flags['download-max-bytes']) : undefined
+  const downloadsOpts: DownloadPolicyOptions | undefined =
+    downloadModeFlag || downloadMaxBytesFlag !== undefined
+      ? {
+          ...(downloadModeFlag ? { mode: downloadModeFlag } : {}),
+          ...(downloadMaxBytesFlag !== undefined && Number.isFinite(downloadMaxBytesFlag)
+            ? { maxBytes: downloadMaxBytesFlag }
+            : {}),
+        }
+      : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -292,6 +308,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
+      downloads: downloadsOpts,
     }
 
     if (sub === 'run') {
@@ -329,6 +346,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
+      downloads: downloadsOpts,
     })
     try {
       await runTerminalBrowser(manager, {
@@ -349,6 +367,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
+      downloads: downloadsOpts,
     })
     try {
       await runMcpStdioServer(manager)
@@ -366,6 +385,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
+      downloads: downloadsOpts,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1097,12 +1117,29 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     }
+    case 'downloads': {
+      const modeArg = parseDownloadMode(flags.mode) ?? parseDownloadMode(args[0])
+      res = await callDaemon(live.endpoint, '/downloads', {
+        blockedOnly: Boolean(flags.blocked),
+        clear: Boolean(flags.clear),
+        ...(typeof flags.status === 'string' ? { status: flags.status } : {}),
+        ...(modeArg ? { mode: modeArg } : {}),
+        ...(typeof flags.remove === 'string' ? { removeId: flags.remove } : {}),
+        ...(flags['max-bytes'] !== undefined ? { maxBytes: Number(flags['max-bytes']) } : {}),
+        ...(flags.limit !== undefined ? { limit: Number(flags.limit) } : {}),
+      })
+      break
+    }
     default:
       console.error(`Unknown command: ${cmd}\nRun "troy-advanced help" for usage.`)
       process.exit(1)
   }
 
-  if (!flags.json && (cmd === 'ascii' || cmd === 'visual' || cmd === 'emulate' || cmd === 'viewport' || flags.ascii) && typeof res.ascii === 'string') {
+  if (
+    !flags.json &&
+    (cmd === 'ascii' || cmd === 'visual' || cmd === 'emulate' || cmd === 'viewport' || cmd === 'downloads' || flags.ascii) &&
+    typeof res.ascii === 'string'
+  ) {
     console.log(res.ascii)
   } else if (!flags.json && (cmd === 'markdown' || cmd === 'md') && typeof res.markdown === 'string') {
     console.log(res.markdown)

@@ -12,6 +12,10 @@ import type {
   CookieImportResult,
   CrashRecoveryOptions,
   CrashRecoveryStats,
+  DownloadEntry,
+  DownloadPolicyOptions,
+  DownloadStats,
+  DownloadStatus,
   ElementDescriptor,
   EmulationOptions,
   EmulationProfile,
@@ -55,6 +59,11 @@ import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { defaultDisabledCrashRecoveryStats } from './crash-recovery.js'
+import {
+  DEFAULT_DOWNLOAD_MAX_BYTES,
+  formatDownloadsAscii,
+  parseDownloadMode,
+} from './downloads.js'
 import {
   defaultEmulationProfile,
   formatEmulationAscii,
@@ -106,6 +115,7 @@ export interface BrowserManagerOptions {
   trackerBlocking?: TrackerBlockingOptions
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
+  downloads?: DownloadPolicyOptions
 }
 
 export class BrowserManager {
@@ -117,6 +127,7 @@ export class BrowserManager {
   private allowedOrigins = new Set<string>()
   private eventListeners = new Set<(event: Record<string, unknown>) => void>()
   private unsubscribeCrash?: () => void
+  private unsubscribeDownloads?: () => void
 
   private constructor(engine: BrowserEngine, profileDir: string, memory: PageMemory | null) {
     this.engine = engine
@@ -132,16 +143,26 @@ export class BrowserManager {
         this.emit({ type: ev.kind, ...ev })
       })
     }
+    if (engine.onDownloadEvent) {
+      this.unsubscribeDownloads = engine.onDownloadEvent((ev) => {
+        this.emit({ type: ev.kind, download: ev.entry })
+      })
+    }
   }
 
   static async create(opts: BrowserManagerOptions = {}): Promise<BrowserManager> {
     const profileDir =
       opts.profileDir || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'troy-advanced', 'profile')
 
+    const downloadsOpts: DownloadPolicyOptions = {
+      ...opts.downloads,
+      quarantineDir: opts.downloads?.quarantineDir || path.join(profileDir, 'quarantine'),
+    }
+
     let engine: BrowserEngine
     const requested = opts.engine ?? 'auto'
     if (requested === 'lite') {
-      engine = new LiteBrowserEngine({ emulation: opts.emulation })
+      engine = new LiteBrowserEngine({ emulation: opts.emulation, profileDir, downloads: downloadsOpts })
     } else if (requested === 'chromium') {
       engine = await ChromiumBrowserEngine.launch({
         chromeBin: opts.chromeBin,
@@ -151,6 +172,7 @@ export class BrowserManager {
         trackerBlocking: opts.trackerBlocking,
         emulation: opts.emulation,
         crashRecovery: opts.crashRecovery,
+        downloads: downloadsOpts,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -164,12 +186,13 @@ export class BrowserManager {
             trackerBlocking: opts.trackerBlocking,
             emulation: opts.emulation,
             crashRecovery: opts.crashRecovery,
+            downloads: downloadsOpts,
           })
         } catch {
-          engine = new LiteBrowserEngine({ emulation: opts.emulation })
+          engine = new LiteBrowserEngine({ emulation: opts.emulation, profileDir, downloads: downloadsOpts })
         }
       } else {
-        engine = new LiteBrowserEngine({ emulation: opts.emulation })
+        engine = new LiteBrowserEngine({ emulation: opts.emulation, profileDir, downloads: downloadsOpts })
       }
     }
 
@@ -1166,6 +1189,45 @@ export class BrowserManager {
         }
       }
 
+      case 'page_downloads': {
+        if (typeof args.removeId === 'string' && args.removeId.trim()) {
+          const removed = this.removeDownload(args.removeId.trim())
+          return { ...removed, stats: this.getDownloadStats() }
+        }
+        if (args.clear) {
+          const cleared = this.clearDownloads({ deleteFiles: args.deleteFiles !== false })
+          return { ok: true, ...cleared, stats: this.getDownloadStats() }
+        }
+        const mode = parseDownloadMode(args.mode)
+        if (mode || typeof args.maxBytes === 'number') {
+          this.setDownloadPolicy({
+            ...(mode ? { mode } : {}),
+            ...(typeof args.maxBytes === 'number' ? { maxBytes: args.maxBytes } : {}),
+          })
+        }
+        const status =
+          args.status === 'in_progress' ||
+          args.status === 'quarantined' ||
+          args.status === 'blocked' ||
+          args.status === 'canceled' ||
+          args.status === 'failed'
+            ? args.status
+            : undefined
+        const entries = this.getDownloads({
+          status,
+          blockedOnly: Boolean(args.blockedOnly),
+          limit: typeof args.limit === 'number' ? args.limit : 50,
+        })
+        const stats = this.getDownloadStats()
+        return {
+          ok: true,
+          count: entries.length,
+          entries,
+          stats,
+          ascii: formatDownloadsAscii(entries, stats),
+        }
+      }
+
       case 'page_eval': {
         const decision = authorizeAction({
           name: 'page_eval',
@@ -1650,9 +1712,50 @@ export class BrowserManager {
       : defaultDisabledCrashRecoveryStats(this.engine.cdpPort)
   }
 
+  getDownloads(opts?: { status?: DownloadStatus; blockedOnly?: boolean; limit?: number }): DownloadEntry[] {
+    return this.engine.getDownloads ? this.engine.getDownloads(opts) : []
+  }
+
+  getDownloadStats(): DownloadStats {
+    if (this.engine.getDownloadStats) {
+      return this.engine.getDownloadStats()
+    }
+    return {
+      mode: 'quarantine',
+      quarantineDir: path.join(this.profileDir, 'quarantine'),
+      maxBytes: DEFAULT_DOWNLOAD_MAX_BYTES,
+      total: 0,
+      quarantined: 0,
+      blocked: 0,
+      inProgress: 0,
+      failed: 0,
+    }
+  }
+
+  setDownloadPolicy(opts: DownloadPolicyOptions): DownloadStats {
+    if (this.engine.setDownloadPolicy) {
+      const stats = this.engine.setDownloadPolicy(opts)
+      this.emit({ type: 'download_policy_updated', stats })
+      return stats
+    }
+    return this.getDownloadStats()
+  }
+
+  clearDownloads(opts?: { deleteFiles?: boolean }): { cleared: number; removedFiles: number } {
+    return this.engine.clearDownloads ? this.engine.clearDownloads(opts) : { cleared: 0, removedFiles: 0 }
+  }
+
+  removeDownload(id: string): { ok: boolean; removedFile: boolean; error?: string } {
+    return this.engine.removeDownload
+      ? this.engine.removeDownload(id)
+      : { ok: false, removedFile: false, error: 'downloads not supported by engine' }
+  }
+
   async close(): Promise<void> {
     this.unsubscribeCrash?.()
     this.unsubscribeCrash = undefined
+    this.unsubscribeDownloads?.()
+    this.unsubscribeDownloads = undefined
     for (const s of this.tabs.values()) {
       await s.driver.close().catch(() => {})
     }

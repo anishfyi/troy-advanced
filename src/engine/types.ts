@@ -6,6 +6,11 @@ import type {
   CookieImportResult,
   CrashRecoveryEvent,
   CrashRecoveryStats,
+  DownloadEntry,
+  DownloadEvent,
+  DownloadPolicyOptions,
+  DownloadStats,
+  DownloadStatus,
   EmulationOptions,
   EmulationProfile,
   EmulationUpdateMode,
@@ -67,6 +72,12 @@ export interface BrowserEngine {
   setDefaultEmulation?(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile
   getCrashRecoveryStats?(): CrashRecoveryStats
   onCrashRecovery?(fn: (ev: CrashRecoveryEvent) => void): () => void
+  getDownloads?(opts?: { status?: DownloadStatus; blockedOnly?: boolean; limit?: number }): DownloadEntry[]
+  getDownloadStats?(): DownloadStats
+  setDownloadPolicy?(opts: DownloadPolicyOptions): DownloadStats
+  clearDownloads?(opts?: { deleteFiles?: boolean }): { cleared: number; removedFiles: number }
+  removeDownload?(id: string): { ok: boolean; removedFile: boolean; error?: string }
+  onDownloadEvent?(fn: (ev: DownloadEvent) => void): () => void
   exportCookies(opts?: CookieExportOptions): Promise<BrowserCookie[]>
   importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult>
   clearCookies?(opts?: { domain?: string }): Promise<number>

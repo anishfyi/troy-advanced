@@ -31,7 +31,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M24: LocalStorage / SessionStorage inspection & transfer helpers for EC2 session hydration
 - [x] M25: Custom HTTP headers & User-Agent / viewport preset profiles (`desktop`, `mobile`, `terminal`, custom `WxH`)
 - [x] M26: Automatic crash recovery: detect Chromium process exit and transparently relaunch with the same persistent profile
-- [ ] M27: Download interception & quarantine directory inside profile (blocks unsafe auto-downloads while letting user inspect filenames)
+- [x] M27: Download interception & quarantine directory inside profile (blocks unsafe auto-downloads while letting user inspect filenames)
 - [ ] M28: Dialog handling (`Page.javascriptDialogOpening`) — auto-dismiss/capture alert/confirm/prompt messages without hanging headless runs
 - [ ] M29: Request/Response body inspection (`troy-advanced network --body <reqId>`) for debugging APIs from terminal
 - [ ] M30: Remote CDP proxy support (`--cdp-url ws://...` or `http://...`) for driving Chrome on another EC2 node or SSH tunnel
