@@ -6,8 +6,10 @@ import path from 'node:path'
 import os from 'node:os'
 import type {
   ActStep,
+  AgentActivityEntry,
   AsciiRenderOptions,
   BrowserCookie,
+  ConsoleEntry,
   CookieExportOptions,
   CookieImportResult,
   CrashRecoveryOptions,
@@ -27,6 +29,7 @@ import type {
   EmulationUpdateMode,
   EngineKind,
   MarkdownRenderOptions,
+  NetworkEntry,
   OriginStorageSnapshot,
   PageSnapshot,
   PixelAsciiOptions,
@@ -150,6 +153,8 @@ export class BrowserManager {
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
   private eventListeners = new Set<(event: Record<string, unknown>) => void>()
+  private activityLog: AgentActivityEntry[] = []
+  private nextActivityId = 1
   private unsubscribeCrash?: () => void
   private unsubscribeDownloads?: () => void
   private unsubscribeDialogs?: () => void
@@ -283,6 +288,77 @@ export class BrowserManager {
     }
   }
 
+  private recordActivity(entry: Omit<AgentActivityEntry, 'id'>): void {
+    const item: AgentActivityEntry = { id: this.nextActivityId++, ...entry }
+    this.activityLog.push(item)
+    if (this.activityLog.length > 200) {
+      this.activityLog.splice(0, this.activityLog.length - 200)
+    }
+    this.emit({ type: 'agent_activity', activity: item })
+  }
+
+  private summarizeToolArgs(name: string, args: Record<string, unknown>): string {
+    const parts: string[] = []
+    if (typeof args.ref === 'string' && args.ref) parts.push(`ref=${args.ref}`)
+    if (typeof args.url === 'string' && args.url) parts.push(`url=${args.url}`)
+    if (typeof args.query === 'string' && args.query) parts.push(`q="${args.query}"`)
+    if (typeof args.selector === 'string' && args.selector) parts.push(`sel="${args.selector}"`)
+    if (typeof args.direction === 'string' && args.direction) parts.push(args.direction)
+    if (typeof args.key === 'string' && args.key) parts.push(`key=${args.key}`)
+    if (typeof args.value === 'string' && args.value) parts.push(`val="${args.value.slice(0, 24)}"`)
+    if (typeof args.text === 'string' && args.text) parts.push(`text="${args.text.slice(0, 24)}"`)
+    if (Array.isArray(args.steps)) parts.push(`steps=${args.steps.length}`)
+    if (parts.length === 0) return name
+    return parts.join(' ')
+  }
+
+  getAgentActivity(opts: { limit?: number; tabId?: number; clear?: boolean } = {}): AgentActivityEntry[] {
+    let entries = opts.tabId !== undefined
+      ? this.activityLog.filter((e) => e.tabId === opts.tabId)
+      : [...this.activityLog]
+    if (typeof opts.limit === 'number' && opts.limit > 0 && entries.length > opts.limit) {
+      entries = entries.slice(-opts.limit)
+    }
+    const snapshot = entries.map((e) => ({ ...e }))
+    if (opts.clear) {
+      if (opts.tabId !== undefined) {
+        this.activityLog = this.activityLog.filter((e) => e.tabId !== opts.tabId)
+      } else {
+        this.activityLog = []
+      }
+    }
+    return snapshot
+  }
+
+  getTabConsole(
+    tabId?: number,
+    opts: { limit?: number; level?: string; clear?: boolean } = {},
+  ): ConsoleEntry[] {
+    const session = this.resolveSession(tabId)
+    if (!session) return []
+    return session.driver.getConsole({
+      clear: Boolean(opts.clear),
+      level: opts.level,
+      limit: opts.limit ?? 100,
+    })
+  }
+
+  getTabNetwork(
+    tabId?: number,
+    opts: { limit?: number; failedOnly?: boolean; blockedOnly?: boolean; method?: string; urlFilter?: string; clear?: boolean } = {},
+  ): NetworkEntry[] {
+    const session = this.resolveSession(tabId)
+    if (!session) return []
+    return session.driver.getNetwork({
+      clear: Boolean(opts.clear),
+      failedOnly: Boolean(opts.failedOnly),
+      blockedOnly: Boolean(opts.blockedOnly),
+      method: opts.method,
+      urlFilter: opts.urlFilter,
+      limit: opts.limit ?? 100,
+    })
+  }
+
   listTabs(): TabSummary[] {
     return [...this.tabs.values()].map((s) => ({
       id: s.driver.id,
@@ -302,19 +378,48 @@ export class BrowserManager {
   }
 
   grantOrigin(originOrUrl: string): { ok: boolean; origin?: string; error?: string } {
+    const startedAt = Date.now()
     const origin = normalizeOrigin(originOrUrl)
-    if (!origin) return { ok: false, error: 'grant needs an http(s) origin' }
+    if (!origin) {
+      this.recordActivity({
+        ts: startedAt,
+        tool: 'origin_grant',
+        summary: originOrUrl || '(empty)',
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error: 'grant needs an http(s) origin',
+      })
+      return { ok: false, error: 'grant needs an http(s) origin' }
+    }
     this.allowedOrigins.add(origin)
     this.emit({ type: 'origin_granted', origin })
+    this.recordActivity({
+      ts: startedAt,
+      tool: 'origin_grant',
+      summary: origin,
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      url: origin,
+    })
     return { ok: true, origin }
   }
 
   async openTab(inputUrl?: string, opts: { activate?: boolean; ownedByBridge?: boolean } = {}) {
+    const startedAt = Date.now()
     let targetUrl: string | undefined
     if (inputUrl && inputUrl.trim()) {
       const resolved = resolveInput(inputUrl)
       if (resolved.kind === 'refused') {
-        return { ok: false, error: `${inputUrl} refused (${resolved.reason})` }
+        const error = `${inputUrl} refused (${resolved.reason})`
+        this.recordActivity({
+          ts: startedAt,
+          tool: 'tab_open',
+          summary: inputUrl,
+          ok: false,
+          durationMs: Date.now() - startedAt,
+          error,
+        })
+        return { ok: false, error }
       }
       targetUrl = resolved.url
       const origin = exactOrigin(targetUrl)
@@ -335,6 +440,15 @@ export class BrowserManager {
     const finalOrigin = exactOrigin(driver.getUrl())
     if (finalOrigin) this.allowedOrigins.add(finalOrigin)
     this.emit({ type: 'tab_opened', tabId: driver.id, url: driver.getUrl() })
+    this.recordActivity({
+      ts: startedAt,
+      tabId: driver.id,
+      tool: 'tab_open',
+      summary: driver.getUrl(),
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      url: driver.getUrl(),
+    })
     return { ok: true, id: driver.id, url: driver.getUrl(), title: driver.getTitle() }
   }
 
@@ -641,6 +755,38 @@ export class BrowserManager {
   }
 
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    const startedAt = Date.now()
+    const resolvedTabId = this.resolveSession(tabId)?.driver.id ?? tabId
+    try {
+      const res = await this.runToolImpl(tabId, name, args)
+      const sessionAfter = this.resolveSession(tabId)
+      this.recordActivity({
+        ts: startedAt,
+        tabId: sessionAfter?.driver.id ?? resolvedTabId,
+        tool: name,
+        summary: this.summarizeToolArgs(name, args),
+        ok: Boolean(res.ok),
+        durationMs: Date.now() - startedAt,
+        url: typeof res.url === 'string' ? res.url : sessionAfter?.driver.getUrl(),
+        error: !res.ok && typeof res.error === 'string' ? res.error : undefined,
+      })
+      return res
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.recordActivity({
+        ts: startedAt,
+        tabId: resolvedTabId,
+        tool: name,
+        summary: this.summarizeToolArgs(name, args),
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error: message,
+      })
+      throw err
+    }
+  }
+
+  private async runToolImpl(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const session = this.resolveSession(tabId)
     if (name === 'page_dialogs') {
       if (args.clearQueue) {

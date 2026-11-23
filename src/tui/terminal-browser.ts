@@ -7,6 +7,16 @@ import readline from 'node:readline'
 import { formatRefTooltip, renderPageAsciiWithMetrics } from '../ascii/layout.js'
 import type { BrowserManager } from '../engine/manager.js'
 import type { ElementDescriptor, PageSnapshot } from '../types.js'
+import {
+  composeSplitPaneFrame,
+  computeSplitPaneWidths,
+  cycleInspectorTab,
+  parseInspectorTab,
+  renderInspectorPane,
+  type ActivePane,
+  type InspectorData,
+  type InspectorTab,
+} from './inspector.js'
 
 export type TuiMode = 'normal' | 'search' | 'command'
 
@@ -45,6 +55,10 @@ export interface TuiOptions {
   height?: number
   /** Lines scrolled per j/k keypress (default: 1). */
   scrollStep?: number
+  /** Start with split-pane inspector open (default: false). */
+  splitPane?: boolean
+  /** Initial inspector tab when split-pane is open (default: 'console'). */
+  inspectorTab?: InspectorTab
 }
 
 export interface TuiSearchMatch {
@@ -70,6 +84,11 @@ export interface TuiState {
   searchQuery: string
   searchMatches: TuiSearchMatch[]
   searchMatchIndex: number
+  splitPane: boolean
+  inspectorTab: InspectorTab
+  activePane: ActivePane
+  inspectorScrollOffset: number
+  inspectorMaxScrollOffset: number
   exited: boolean
 }
 
@@ -97,6 +116,12 @@ export class TerminalBrowserController {
   private searchQuery = ''
   private searchMatches: TuiSearchMatch[] = []
   private searchMatchIndex = -1
+  private splitPane: boolean
+  private inspectorTab: InspectorTab
+  private activePane: ActivePane = 'page'
+  private inspectorScrollOffset = 0
+  private inspectorMaxScrollOffset = 0
+  private inspectorViewportRows = 12
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -107,9 +132,11 @@ export class TerminalBrowserController {
     this.scrollStep = Math.max(1, opts.scrollStep ?? 1)
     this.asciiOnly = opts.asciiOnly ?? false
     this.color = this.asciiOnly ? false : (opts.color ?? Boolean(this.output.isTTY))
+    this.splitPane = Boolean(opts.splitPane)
+    this.inspectorTab = opts.inspectorTab ?? 'console'
     this.statusMessage = this.isRawModeEnabled()
-      ? 'Keys: j/k scroll | g/G top/bottom | / search | : cmd | Tab focus | Enter activate | q quit'
-      : 'Type a command (open <url>, click e1, fill e2 txt, j/k scroll, ascii, visual, tabs, quit)'
+      ? 'Keys: j/k scroll | g/G top/bottom | / search | : cmd | Tab focus | Enter act | i inspector | q quit'
+      : 'Type a command (open <url>, click e1, fill e2 txt, split, console, network, refs, activity, quit)'
   }
 
   isRawModeEnabled(): boolean {
@@ -136,6 +163,11 @@ export class TerminalBrowserController {
       searchQuery: this.searchQuery,
       searchMatches: this.searchMatches.map((m) => ({ ...m })),
       searchMatchIndex: this.searchMatchIndex,
+      splitPane: this.splitPane,
+      inspectorTab: this.inspectorTab,
+      activePane: this.activePane,
+      inspectorScrollOffset: this.inspectorScrollOffset,
+      inspectorMaxScrollOffset: this.inspectorMaxScrollOffset,
       exited: this.exited,
     }
   }
@@ -155,9 +187,77 @@ export class TerminalBrowserController {
   private resolveDimensions(): { width: number; height: number } {
     const rawCols = this.opts.width ?? this.output.columns ?? 100
     const rawRows = this.opts.height ?? Math.max(14, (this.output.rows ?? 36) - 3)
-    const width = Math.max(60, Math.min(180, rawCols))
+    const width = Math.max(60, Math.min(240, rawCols))
     const height = Math.max(14, Math.min(80, rawRows))
     return { width, height }
+  }
+
+  private collectInspectorData(activeTabId?: number): InspectorData {
+    return {
+      consoleEntries: this.manager.getTabConsole(activeTabId, { limit: 100 }),
+      networkEntries: this.manager.getTabNetwork(activeTabId, { limit: 100 }),
+      elements: this.lastSnapshot?.elements ?? [],
+      activityEntries: this.manager.getAgentActivity({ limit: 100 }),
+      focusedRef: this.focusedRef,
+    }
+  }
+
+  private setSplitPane(enabled: boolean, customMessage?: string): void {
+    if (!enabled) {
+      this.splitPane = false
+      this.activePane = 'page'
+      this.inspectorScrollOffset = 0
+      this.statusMessage = customMessage ?? 'Split-pane inspector closed'
+      return
+    }
+    const { width } = this.resolveDimensions()
+    const layout = computeSplitPaneWidths(width)
+    if (!layout.canSplit) {
+      this.splitPane = false
+      this.activePane = 'page'
+      this.statusMessage = `Terminal too narrow for split-pane (${width} cols; need >= 72)`
+      return
+    }
+    this.splitPane = true
+    this.statusMessage = customMessage ?? `Split-pane inspector open (${this.inspectorTab})`
+  }
+
+  private toggleSplitPane(): void {
+    this.setSplitPane(!this.splitPane)
+  }
+
+  private toggleActivePane(): void {
+    if (!this.splitPane) {
+      this.setSplitPane(true)
+      if (!this.splitPane) return
+      this.activePane = 'inspector'
+      this.statusMessage = `Active pane: inspector (${this.inspectorTab})`
+      return
+    }
+    this.activePane = this.activePane === 'page' ? 'inspector' : 'page'
+    this.statusMessage =
+      this.activePane === 'inspector'
+        ? `Active pane: inspector (${this.inspectorTab})`
+        : 'Active pane: page viewport'
+  }
+
+  private clearCurrentInspectorBuffer(): void {
+    const activeTabId = this.manager.listTabs().find((t) => t.active)?.id ?? this.lastSnapshot?.tabId
+    if (this.inspectorTab === 'console') {
+      this.manager.getTabConsole(activeTabId, { clear: true })
+      this.inspectorScrollOffset = 0
+      this.statusMessage = 'Cleared console log'
+    } else if (this.inspectorTab === 'network') {
+      this.manager.getTabNetwork(activeTabId, { clear: true })
+      this.inspectorScrollOffset = 0
+      this.statusMessage = 'Cleared network log'
+    } else if (this.inspectorTab === 'activity') {
+      this.manager.getAgentActivity({ clear: true })
+      this.inspectorScrollOffset = 0
+      this.statusMessage = 'Cleared agent activity log'
+    } else {
+      this.statusMessage = 'Refs list reflects live DOM (cannot clear)'
+    }
   }
 
   getFocusedTooltip(): string | null {
@@ -211,14 +311,18 @@ export class TerminalBrowserController {
 
   async draw(opts: { refresh?: boolean; ensureFocusVisible?: boolean } = {}): Promise<string> {
     const { width, height } = this.resolveDimensions()
+    const splitLayout = this.splitPane
+      ? computeSplitPaneWidths(width)
+      : { canSplit: false, leftWidth: width, rightWidth: 0, gapWidth: 0 }
+    const pageWidth = splitLayout.leftWidth
     const shouldRefresh = opts.refresh ?? !this.lastSnapshot
-    let frame: string
+    let leftFrame: string
 
     if (!shouldRefresh && this.lastSnapshot) {
       const tabs = this.manager.listTabs()
       const activeTab = tabs.find((t) => t.active)
       let rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
-        width,
+        width: pageWidth,
         height,
         asciiOnly: this.asciiOnly,
         color: this.color,
@@ -240,7 +344,7 @@ export class TerminalBrowserController {
           Math.min(rendered.maxScrollOffset, rendered.focusedLineIndex - Math.floor(rendered.viewportRows / 3)),
         )
         rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
-          width,
+          width: pageWidth,
           height,
           asciiOnly: this.asciiOnly,
           color: this.color,
@@ -255,10 +359,10 @@ export class TerminalBrowserController {
       this.maxScrollOffset = rendered.maxScrollOffset
       this.totalLines = rendered.totalLines
       this.viewportRows = rendered.viewportRows
-      frame = rendered.ascii
+      leftFrame = rendered.ascii
     } else {
       const res = await this.manager.renderAscii(undefined, {
-        width,
+        width: pageWidth,
         height,
         asciiOnly: this.asciiOnly,
         color: this.color,
@@ -277,7 +381,35 @@ export class TerminalBrowserController {
           this.viewportRows = res.scroll.viewportRows
         }
       }
-      frame = res.ascii ?? res.error ?? '(no tab)'
+      leftFrame = res.ascii ?? res.error ?? '(no tab)'
+    }
+
+    let frame = leftFrame
+    if (splitLayout.canSplit) {
+      const activeTabId = this.manager.listTabs().find((t) => t.active)?.id ?? this.lastSnapshot?.tabId
+      const inspectorData = this.collectInspectorData(activeTabId)
+      const leftRowCount = leftFrame.split('\n').length
+      const inspectorRendered = renderInspectorPane(inspectorData, {
+        width: splitLayout.rightWidth,
+        height: leftRowCount,
+        activeTab: this.inspectorTab,
+        scrollOffset: this.inspectorScrollOffset,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+        activePane: this.activePane,
+      })
+      this.inspectorScrollOffset = inspectorRendered.scrollOffset
+      this.inspectorMaxScrollOffset = inspectorRendered.maxScrollOffset
+      this.inspectorViewportRows = inspectorRendered.viewportRows
+      frame = composeSplitPaneFrame(leftFrame, inspectorRendered.lines, {
+        leftWidth: splitLayout.leftWidth,
+        rightWidth: splitLayout.rightWidth,
+        gapWidth: splitLayout.gapWidth,
+        asciiOnly: this.asciiOnly,
+      })
+    } else {
+      this.inspectorScrollOffset = 0
+      this.inspectorMaxScrollOffset = 0
     }
 
     if (this.output.isTTY) {
@@ -501,9 +633,36 @@ export class TerminalBrowserController {
           return { shouldExit: false, skipDraw: true }
         }
         this.statusMessage = `Visual error: ${res.error}`
+      } else if (cmd === 'split' || cmd === 'inspector') {
+        const sub = (rest[0] ?? '').toLowerCase()
+        if (!sub || sub === 'toggle') {
+          this.toggleSplitPane()
+        } else if (sub === 'on' || sub === 'open') {
+          this.setSplitPane(true)
+        } else if (sub === 'off' || sub === 'close') {
+          this.setSplitPane(false)
+        } else if (sub === 'focus') {
+          this.toggleActivePane()
+        } else if (sub === 'clear') {
+          this.clearCurrentInspectorBuffer()
+        } else {
+          const parsedTab = parseInspectorTab(sub)
+          if (parsedTab) {
+            this.inspectorTab = parsedTab
+            this.inspectorScrollOffset = 0
+            this.setSplitPane(true, `Inspector: ${parsedTab}`)
+          } else {
+            this.statusMessage = `Unknown inspector arg "${sub}". Use on|off|console|network|refs|activity|focus|clear`
+          }
+        }
+      } else if (cmd === 'console' || cmd === 'network' || cmd === 'refs' || cmd === 'activity') {
+        const targetTab = parseInspectorTab(cmd)!
+        this.inspectorTab = targetTab
+        this.inspectorScrollOffset = 0
+        this.setSplitPane(true, `Inspector: ${targetTab}`)
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
-          'Keys: j/k g/G / : Tab Enter q | Cmds: open <url> | click eN [--submit] | fill eN <txt> | find <q> | ascii | back | reload | tab N | quit'
+          'Keys: j/k g/G / : Tab Enter i [/] I q | Cmds: open <url> | click eN | fill eN <txt> | split | console|network|refs|activity | quit'
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`
@@ -590,46 +749,114 @@ export class TerminalBrowserController {
       return { shouldExit: true, drawn: false }
     }
 
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'i') {
+      this.toggleSplitPane()
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && (seq === 'I' || (k.shift && name === 'i'))) {
+      this.toggleActivePane()
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && (seq === '[' || seq === ']')) {
+      const delta: 1 | -1 = seq === ']' ? 1 : -1
+      this.inspectorTab = cycleInspectorTab(this.inspectorTab, delta)
+      this.inspectorScrollOffset = 0
+      if (!this.splitPane) {
+        this.setSplitPane(true, `Inspector: ${this.inspectorTab}`)
+      } else {
+        this.statusMessage = `Inspector tab: ${this.inspectorTab}`
+      }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (this.splitPane && this.activePane === 'inspector' && !k.ctrl && !k.meta && ['1', '2', '3', '4'].includes(seq)) {
+      const tab = parseInspectorTab(seq)
+      if (tab) {
+        this.inspectorTab = tab
+        this.inspectorScrollOffset = 0
+        this.statusMessage = `Inspector tab: ${tab}`
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+    }
+
     if ((!k.ctrl && !k.meta && seq === 'j') || name === 'down') {
-      this.scrollOffset = Math.min(this.maxScrollOffset, this.scrollOffset + this.scrollStep)
-      this.statusMessage = `Scrolled down to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      if (this.splitPane && this.activePane === 'inspector') {
+        this.inspectorScrollOffset = Math.min(this.inspectorMaxScrollOffset, this.inspectorScrollOffset + this.scrollStep)
+        this.statusMessage = `Inspector scrolled to line ${this.inspectorScrollOffset}/${this.inspectorMaxScrollOffset}`
+      } else {
+        this.scrollOffset = Math.min(this.maxScrollOffset, this.scrollOffset + this.scrollStep)
+        this.statusMessage = `Scrolled down to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
 
     if ((!k.ctrl && !k.meta && seq === 'k') || name === 'up') {
-      this.scrollOffset = Math.max(0, this.scrollOffset - this.scrollStep)
-      this.statusMessage = `Scrolled up to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      if (this.splitPane && this.activePane === 'inspector') {
+        this.inspectorScrollOffset = Math.max(0, this.inspectorScrollOffset - this.scrollStep)
+        this.statusMessage = `Inspector scrolled to line ${this.inspectorScrollOffset}/${this.inspectorMaxScrollOffset}`
+      } else {
+        this.scrollOffset = Math.max(0, this.scrollOffset - this.scrollStep)
+        this.statusMessage = `Scrolled up to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
 
     if (name === 'pagedown' || (k.ctrl && name === 'd')) {
-      const halfPage = Math.max(5, Math.floor(this.viewportRows / 2))
-      this.scrollOffset = Math.min(this.maxScrollOffset, this.scrollOffset + halfPage)
-      this.statusMessage = `Page down to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      if (this.splitPane && this.activePane === 'inspector') {
+        const halfPage = Math.max(4, Math.floor(this.inspectorViewportRows / 2))
+        this.inspectorScrollOffset = Math.min(this.inspectorMaxScrollOffset, this.inspectorScrollOffset + halfPage)
+        this.statusMessage = `Inspector page down to line ${this.inspectorScrollOffset}/${this.inspectorMaxScrollOffset}`
+      } else {
+        const halfPage = Math.max(5, Math.floor(this.viewportRows / 2))
+        this.scrollOffset = Math.min(this.maxScrollOffset, this.scrollOffset + halfPage)
+        this.statusMessage = `Page down to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
 
     if (name === 'pageup' || (k.ctrl && name === 'u')) {
-      const halfPage = Math.max(5, Math.floor(this.viewportRows / 2))
-      this.scrollOffset = Math.max(0, this.scrollOffset - halfPage)
-      this.statusMessage = `Page up to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      if (this.splitPane && this.activePane === 'inspector') {
+        const halfPage = Math.max(4, Math.floor(this.inspectorViewportRows / 2))
+        this.inspectorScrollOffset = Math.max(0, this.inspectorScrollOffset - halfPage)
+        this.statusMessage = `Inspector page up to line ${this.inspectorScrollOffset}/${this.inspectorMaxScrollOffset}`
+      } else {
+        const halfPage = Math.max(5, Math.floor(this.viewportRows / 2))
+        this.scrollOffset = Math.max(0, this.scrollOffset - halfPage)
+        this.statusMessage = `Page up to line ${this.scrollOffset}/${this.maxScrollOffset}`
+      }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
 
     if ((!k.ctrl && !k.meta && !k.shift && seq === 'g') || name === 'home') {
-      this.scrollOffset = 0
-      this.statusMessage = 'Top of page (line 0)'
+      if (this.splitPane && this.activePane === 'inspector') {
+        this.inspectorScrollOffset = 0
+        this.statusMessage = 'Inspector top (line 0)'
+      } else {
+        this.scrollOffset = 0
+        this.statusMessage = 'Top of page (line 0)'
+      }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
 
     if ((!k.ctrl && !k.meta && (seq === 'G' || (k.shift && name === 'g'))) || name === 'end') {
-      this.scrollOffset = this.maxScrollOffset
-      this.statusMessage = `Bottom of page (line ${this.scrollOffset}/${this.maxScrollOffset})`
+      if (this.splitPane && this.activePane === 'inspector') {
+        this.inspectorScrollOffset = this.inspectorMaxScrollOffset
+        this.statusMessage = `Inspector bottom (line ${this.inspectorScrollOffset}/${this.inspectorMaxScrollOffset})`
+      } else {
+        this.scrollOffset = this.maxScrollOffset
+        this.statusMessage = `Bottom of page (line ${this.scrollOffset}/${this.maxScrollOffset})`
+      }
       await this.draw()
       return { shouldExit: false, drawn: true }
     }

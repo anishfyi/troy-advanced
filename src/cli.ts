@@ -39,6 +39,7 @@ import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
 import { runMcpStdioServer } from './mcp/server.js'
 import { runPipeRepl } from './pipe/repl.js'
 import { runTerminalBrowser } from './tui/terminal-browser.js'
+import { parseInspectorTab } from './tui/inspector.js'
 
 const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI browser
 
@@ -48,8 +49,8 @@ Daemon & Modes:
   daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
-  browse [url] [--ascii] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
-                                                         Interactive ASCII terminal browser
+  browse [url] [--ascii] [--split] [--inspector console|network|refs|activity] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
+                                                         Interactive ASCII terminal browser (with optional split-pane inspector)
   mcp          [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Model Context Protocol stdio server
   pipe         [--json] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -389,9 +390,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       dialogs: dialogsOpts,
     })
     try {
+      const inspectorTabFlag =
+        typeof flags.inspector === 'string' ? parseInspectorTab(flags.inspector) : undefined
+      const splitPaneFlag = Boolean(flags.split) || Boolean(flags.inspector)
       await runTerminalBrowser(manager, {
         initialUrl: positional[1],
         asciiOnly: Boolean(flags.ascii),
+        splitPane: splitPaneFlag,
+        inspectorTab: inspectorTabFlag,
       })
     } finally {
       await manager.close()

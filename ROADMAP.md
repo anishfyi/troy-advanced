@@ -53,7 +53,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 ## Track 4: Interactive Terminal Browser TUI (Milestones 43–55)
 - [x] M43: Raw-mode keypress navigation in `terminal-browser.ts` (single-key `j/k` scroll, `g/G` top/bottom, `/` search, `:` command bar, `Tab` focus next ref, `Enter` activate focused ref)
 - [x] M44: Highlighted active element focus cursor in ASCII/ANSI TUI with live ref tooltip in status bar
-- [ ] M45: Split-pane TUI mode: left pane ASCII page viewport, right pane live Console / Network / Refs / Agent Activity inspector
+- [x] M45: Split-pane TUI mode: left pane ASCII page viewport, right pane live Console / Network / Refs / Agent Activity inspector
 - [ ] M46: Inline form-filling modal prompt in TUI when pressing `Enter` on an `<input>` or `<select>` ref
 - [ ] M47: Quick link-hint jump mode (`f` key highlights `[e1]`..`[e99]`, type digits + Enter to click, vimium-style!)
 - [ ] M48: Tab bar switching (`1`-`9`, `t` new tab, `w` close tab) and command palette (`Ctrl+P`)

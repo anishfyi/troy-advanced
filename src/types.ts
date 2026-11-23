@@ -155,6 +155,18 @@ export interface NetworkEntry {
   hasResponseBody?: boolean
 }
 
+export interface AgentActivityEntry {
+  id: number
+  ts: number
+  tabId?: number
+  tool: string
+  summary: string
+  ok: boolean
+  durationMs: number
+  url?: string
+  error?: string
+}
+
 export interface NetworkListOptions {
   clear?: boolean
   failedOnly?: boolean
