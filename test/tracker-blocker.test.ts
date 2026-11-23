@@ -280,7 +280,7 @@ describe.skipIf(!hasChrome)('Headless Chromium CDP automatic tracker & ad-beacon
 
   afterAll(async () => {
     await new Promise<void>((r) => server?.close(() => r()))
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
+    fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   })
 
   it('blocks tracker hosts and ad-beacons automatically via Fetch.enable while allowing legitimate requests', async () => {

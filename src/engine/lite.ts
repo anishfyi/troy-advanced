@@ -155,13 +155,13 @@ function stripTags(html: string): string {
  */
 export function extractLabelText(innerHtml: string): string {
   const withoutControls = innerHtml
-    .replace(/<select\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/select>/gi, ' ')
-    .replace(/<textarea\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/textarea>/gi, ' ')
-    .replace(/<button\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/button>/gi, ' ')
-    .replace(/<meter\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/meter>/gi, ' ')
-    .replace(/<output\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/output>/gi, ' ')
-    .replace(/<progress\b(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?<\/progress>/gi, ' ')
-    .replace(/<input\b(?:"[^"]*"|'[^']*'|[^>])*\/?>/gi, ' ')
+    .replace(/<select\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/select>/gi, ' ')
+    .replace(/<textarea\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/textarea>/gi, ' ')
+    .replace(/<button\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/button>/gi, ' ')
+    .replace(/<meter\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/meter>/gi, ' ')
+    .replace(/<output\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/output>/gi, ' ')
+    .replace(/<progress\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/progress>/gi, ' ')
+    .replace(/<input\b(?:"[^"]*"|'[^']*'|[^>"'])*\/?>/gi, ' ')
   return stripTags(withoutControls)
 }
 
@@ -267,7 +267,7 @@ function findMatchingCloseTag(
 }
 
 function parseAttrs(attrString: string): Record<string, string> {
-  const attrs: Record<string, string> = {}
+  const attrs = Object.create(null) as Record<string, string>
   const regex = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g
   let m: RegExpExecArray | null
   while ((m = regex.exec(attrString)) !== null) {
@@ -298,10 +298,11 @@ const ALLOWED_REFRESH_PROTOCOLS = new Set(['http:', 'https:'])
 
 function stripIgnoredHtmlBlocks(html: string): string {
   return html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, '')
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+    .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script\s*>|$)/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style\s*>|$)/gi, '')
+    .replace(/<svg\b[^>]*\/>/gi, '')
+    .replace(/<svg\b[^>]*>[\s\S]*?(?:<\/svg\s*>|$)/gi, '')
 }
 
 export interface MetaRefreshDirective {
@@ -317,7 +318,7 @@ export interface MetaRefreshDirective {
  */
 export function extractBaseHref(html: string, documentUrl: string): string | undefined {
   const cleaned = stripIgnoredHtmlBlocks(html)
-  const baseRe = /<base\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+  const baseRe = /<base\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi
   let m: RegExpExecArray | null
   while ((m = baseRe.exec(cleaned)) !== null) {
     const attrs = parseAttrs(m[1] ?? '')
@@ -402,7 +403,7 @@ export function parseMetaRefreshContent(content: string, baseUrl: string): MetaR
  */
 export function extractMetaRefresh(html: string, baseUrl: string): MetaRefreshDirective | undefined {
   const cleaned = stripIgnoredHtmlBlocks(html)
-  const metaRe = /<meta\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+  const metaRe = /<meta\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi
   let m: RegExpExecArray | null
   while ((m = metaRe.exec(cleaned)) !== null) {
     const attrs = parseAttrs(m[1] ?? '')
@@ -477,7 +478,7 @@ export function parseHtmlDocument(
   // so `srcdoc="..."` HTML is never double-parsed as top-level elements.
   const extractedIframes: Array<Record<string, string>> = []
   if (depth < 4 && /<iframe\b/i.test(bodyHtml)) {
-    const iframeTagRe = /<iframe\b((?:"[^"]*"|'[^']*'|[^>])*)(?:\/>|>[\s\S]*?<\/iframe>)/gi
+    const iframeTagRe = /<iframe\b((?:"[^"]*"|'[^']*'|[^>"'])*)(?:\/>|>[\s\S]*?<\/iframe>)/gi
     bodyHtml = bodyHtml.replace(iframeTagRe, (_match, attrStr: string) => {
       extractedIframes.push(parseAttrs(attrStr ?? ''))
       return ''
@@ -491,7 +492,7 @@ export function parseHtmlDocument(
   //   `type="hidden"`, `<textarea>`, `<select>`, `<button>`).
   const labelsByFor = new Map<string, string>()
   const implicitLabelSpans: ImplicitLabelSpan[] = []
-  const labelRe = /<label\b((?:"[^"]*"|'[^']*'|[^>])*)>([\s\S]*?)<\/label>/gi
+  const labelRe = /<label\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/label>/gi
   let lm: RegExpExecArray | null
   while ((lm = labelRe.exec(bodyHtml)) !== null) {
     const attrs = parseAttrs(lm[1] ?? '')
@@ -581,7 +582,7 @@ export function parseHtmlDocument(
 
   const extractHiddenInputsFromFragment = (fragment: string): void => {
     if (!/<input\b/i.test(fragment)) return
-    const hiddenInputRe = /<input\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+    const hiddenInputRe = /<input\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi
     let hm: RegExpExecArray | null
     while ((hm = hiddenInputRe.exec(fragment)) !== null) {
       const attrs = parseAttrs(hm[1] ?? '')

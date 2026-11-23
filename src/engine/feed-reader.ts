@@ -190,7 +190,7 @@ export function detectFeedKind(contentType: string, body: string, url?: string):
 }
 
 function parseXmlAttrs(rawAttrs: string): Record<string, string> {
-  const attrs: Record<string, string> = {}
+  const attrs = Object.create(null) as Record<string, string>
   const re = /([A-Za-z_][\w:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g
   let m: RegExpExecArray | null
   while ((m = re.exec(rawAttrs)) !== null) {
@@ -222,12 +222,13 @@ function resolveSafeUrl(rawHref: string | undefined, baseUrl: string): string | 
  */
 export function discoverFeedsInHtml(html: string, baseUrl: string): DiscoveredFeed[] {
   const cleaned = html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, '')
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+    .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script\s*>|$)/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style\s*>|$)/gi, '')
+    .replace(/<svg\b[^>]*\/>/gi, '')
+    .replace(/<svg\b[^>]*>[\s\S]*?(?:<\/svg\s*>|$)/gi, '')
 
-  const linkRe = /<link\b((?:"[^"]*"|'[^']*'|[^>])*)\/?>/gi
+  const linkRe = /<link\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi
   const seen = new Set<string>()
   const feeds: DiscoveredFeed[] = []
 

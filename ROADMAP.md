@@ -48,7 +48,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M39: Robots/rate-limit awareness + configurable retry with exponential backoff on HTTP 429/503
 - [x] M40: Response caching (`ETag` / `If-None-Match`) for blazing-fast repeated reads in Lite mode
 - [x] M41: Plain-text / Markdown / CSV document renderer when Lite fetches non-HTML content
-- [ ] M42: Comprehensive Lite engine fuzz & malformed-HTML resilience test suite
+- [x] M42: Comprehensive Lite engine fuzz & malformed-HTML resilience test suite
 
 ## Track 4: Interactive Terminal Browser TUI (Milestones 43–55)
 - [ ] M43: Raw-mode keypress navigation in `terminal-browser.ts` (single-key `j/k` scroll, `g/G` top/bottom, `/` search, `:` command bar, `Tab` focus next ref, `Enter` activate focused ref)

@@ -117,6 +117,8 @@ export function formatJsonPathSegment(parentPath: string, key: string | number):
   return `${parentPath}[${JSON.stringify(key)}]`
 }
 
+const MAX_STRUCTURED_DEPTH = 64
+
 function buildJsonTree(
   value: unknown,
   path: string,
@@ -126,6 +128,18 @@ function buildJsonTree(
 ): JsonTreeNode {
   if (value === null) {
     return { path, key, type: 'null', value: null, children: [], depth, parentPath, size: 0 }
+  }
+  if (depth >= MAX_STRUCTURED_DEPTH && typeof value === 'object') {
+    return {
+      path,
+      key,
+      type: 'string',
+      value: '[Max nesting depth reached]',
+      children: [],
+      depth,
+      parentPath,
+      size: 0,
+    }
   }
   if (Array.isArray(value)) {
     const children = value.map((item, idx) =>
@@ -630,6 +644,18 @@ export function parseXmlTree(rawXml: string): { root: XmlTreeNode | null; error?
     depth: number,
     parentPath: string | null,
   ): XmlTreeNode => {
+    if (depth >= MAX_STRUCTURED_DEPTH) {
+      parseError ??= `XML nesting exceeded maximum depth (${MAX_STRUCTURED_DEPTH})`
+      return {
+        path,
+        tag: raw.tag,
+        attributes: raw.attributes,
+        text: raw.textParts.join(' ').trim() || '[Max nesting depth reached]',
+        children: [],
+        depth,
+        parentPath,
+      }
+    }
     // Count sibling tag frequencies so repeated siblings get 1-based XPath indices
     const tagTotals = new Map<string, number>()
     for (const c of raw.children) {
