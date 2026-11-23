@@ -25,8 +25,17 @@ import {
   type InspectorData,
   type InspectorTab,
 } from './inspector.js'
+import {
+  cloneLinkHintState,
+  createLinkHintState,
+  formatLinkHintStatus,
+  highlightLinkHintsInFrame,
+  resolveLinkHintTarget,
+  updateLinkHintDigits,
+  type LinkHintState,
+} from './link-hints.js'
 
-export type TuiMode = 'normal' | 'search' | 'command' | 'modal'
+export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint'
 
 export interface TuiKeyEvent {
   name?: string
@@ -98,6 +107,7 @@ export interface TuiState {
   inspectorScrollOffset: number
   inspectorMaxScrollOffset: number
   formModal: FormModalState | null
+  linkHint: LinkHintState | null
   exited: boolean
 }
 
@@ -132,6 +142,7 @@ export class TerminalBrowserController {
   private inspectorMaxScrollOffset = 0
   private inspectorViewportRows = 12
   private formModal: FormModalState | null = null
+  private linkHint: LinkHintState | null = null
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -145,7 +156,7 @@ export class TerminalBrowserController {
     this.splitPane = Boolean(opts.splitPane)
     this.inspectorTab = opts.inspectorTab ?? 'console'
     this.statusMessage = this.isRawModeEnabled()
-      ? 'Keys: j/k scroll | g/G top/bottom | / search | : cmd | Tab focus | Enter act | i inspector | q quit'
+      ? 'Keys: j/k scroll | g/G top/bottom | f jump | / search | : cmd | Tab focus | Enter act | i inspector | q quit'
       : 'Type a command (open <url>, click e1, fill e2 txt, split, console, network, refs, activity, quit)'
   }
 
@@ -179,6 +190,7 @@ export class TerminalBrowserController {
       inspectorScrollOffset: this.inspectorScrollOffset,
       inspectorMaxScrollOffset: this.inspectorMaxScrollOffset,
       formModal: cloneFormModalState(this.formModal),
+      linkHint: cloneLinkHintState(this.linkHint),
       exited: this.exited,
     }
   }
@@ -286,6 +298,11 @@ export class TerminalBrowserController {
       const action = this.formModal.kind === 'select' ? 'Select' : 'Edit'
       return `MODAL ${action} [${this.formModal.ref}] <${this.formModal.tag}> | Enter: submit | Esc: cancel`
     }
+    if (this.mode === 'hint' && this.linkHint) {
+      return formatLinkHintStatus(this.linkHint, this.lastSnapshot?.elements ?? [], {
+        asciiOnly: this.asciiOnly,
+      })
+    }
     if (this.mode === 'search') {
       return `SEARCH /${this.inputBuffer}`
     }
@@ -333,6 +350,8 @@ export class TerminalBrowserController {
     const shouldRefresh = opts.refresh ?? !this.lastSnapshot
     let leftFrame: string
 
+    const effectiveFocusedRef = this.mode === 'hint' ? undefined : (this.focusedRef ?? undefined)
+
     if (!shouldRefresh && this.lastSnapshot) {
       const tabs = this.manager.listTabs()
       const activeTab = tabs.find((t) => t.active)
@@ -343,32 +362,67 @@ export class TerminalBrowserController {
         color: this.color,
         scrollOffset: this.scrollOffset,
         statusMessage: this.buildStatusLine(),
-        focusedRef: this.focusedRef ?? undefined,
+        focusedRef: effectiveFocusedRef,
         tabs,
         activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
       })
-      this.focusedLineIndex = rendered.focusedLineIndex ?? null
-      if (
-        opts.ensureFocusVisible &&
-        rendered.focusedLineIndex !== undefined &&
-        (rendered.focusedLineIndex < rendered.scrollOffset ||
-          rendered.focusedLineIndex >= rendered.scrollOffset + rendered.viewportRows)
-      ) {
-        const targetOffset = Math.max(
-          0,
-          Math.min(rendered.maxScrollOffset, rendered.focusedLineIndex - Math.floor(rendered.viewportRows / 3)),
-        )
-        rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
+      if (this.mode === 'hint' && opts.ensureFocusVisible && this.focusedRef) {
+        const probe = renderPageAsciiWithMetrics(this.lastSnapshot, {
           width: pageWidth,
           height,
           asciiOnly: this.asciiOnly,
-          color: this.color,
-          scrollOffset: targetOffset,
-          statusMessage: this.buildStatusLine(),
-          focusedRef: this.focusedRef ?? undefined,
+          color: false,
+          scrollOffset: this.scrollOffset,
+          focusedRef: this.focusedRef,
           tabs,
           activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
         })
+        this.focusedLineIndex = probe.focusedLineIndex ?? null
+        if (
+          probe.focusedLineIndex !== undefined &&
+          (probe.focusedLineIndex < rendered.scrollOffset ||
+            probe.focusedLineIndex >= rendered.scrollOffset + rendered.viewportRows)
+        ) {
+          const targetOffset = Math.max(
+            0,
+            Math.min(rendered.maxScrollOffset, probe.focusedLineIndex - Math.floor(rendered.viewportRows / 3)),
+          )
+          rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
+            width: pageWidth,
+            height,
+            asciiOnly: this.asciiOnly,
+            color: this.color,
+            scrollOffset: targetOffset,
+            statusMessage: this.buildStatusLine(),
+            focusedRef: undefined,
+            tabs,
+            activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
+          })
+        }
+      } else {
+        this.focusedLineIndex = rendered.focusedLineIndex ?? null
+        if (
+          opts.ensureFocusVisible &&
+          rendered.focusedLineIndex !== undefined &&
+          (rendered.focusedLineIndex < rendered.scrollOffset ||
+            rendered.focusedLineIndex >= rendered.scrollOffset + rendered.viewportRows)
+        ) {
+          const targetOffset = Math.max(
+            0,
+            Math.min(rendered.maxScrollOffset, rendered.focusedLineIndex - Math.floor(rendered.viewportRows / 3)),
+          )
+          rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
+            width: pageWidth,
+            height,
+            asciiOnly: this.asciiOnly,
+            color: this.color,
+            scrollOffset: targetOffset,
+            statusMessage: this.buildStatusLine(),
+            focusedRef: effectiveFocusedRef,
+            tabs,
+            activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
+          })
+        }
       }
       this.scrollOffset = rendered.scrollOffset
       this.maxScrollOffset = rendered.maxScrollOffset
@@ -383,7 +437,7 @@ export class TerminalBrowserController {
         color: this.color,
         scrollOffset: this.scrollOffset,
         statusMessage: this.buildStatusLine(),
-        focusedRef: this.focusedRef ?? undefined,
+        focusedRef: effectiveFocusedRef,
       })
 
       if (res.ok) {
@@ -397,6 +451,13 @@ export class TerminalBrowserController {
         }
       }
       leftFrame = res.ascii ?? res.error ?? '(no tab)'
+    }
+
+    if (this.mode === 'hint' && this.linkHint) {
+      leftFrame = highlightLinkHintsInFrame(leftFrame, this.linkHint, {
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+      })
     }
 
     let frame = leftFrame
@@ -447,6 +508,8 @@ export class TerminalBrowserController {
         this.output.write(`/${this.inputBuffer}`)
       } else if (this.mode === 'command') {
         this.output.write(`:${this.inputBuffer}`)
+      } else if (this.mode === 'hint' && this.linkHint) {
+        this.output.write(`f:${this.linkHint.digits}`)
       }
     }
 
@@ -687,6 +750,110 @@ export class TerminalBrowserController {
     return { shouldExit: false, drawn: false }
   }
 
+  private enterHintMode(): boolean {
+    const state = createLinkHintState(this.availableRefs)
+    if (state.allRefs.length === 0) {
+      this.statusMessage = 'No interactive refs on page'
+      return false
+    }
+    this.linkHint = state
+    this.mode = 'hint'
+    this.inputBuffer = ''
+    this.statusMessage = formatLinkHintStatus(state, this.lastSnapshot?.elements ?? [], {
+      asciiOnly: this.asciiOnly,
+    })
+    return true
+  }
+
+  private syncFocusedRefFromHint(state: LinkHintState): void {
+    const target = resolveLinkHintTarget(state)
+    if (target) {
+      this.focusRefByName(target)
+    } else if (state.digits.length === 0) {
+      // Keep existing focus untouched when no digits are typed yet
+    } else if (state.matchingRefs.length > 0 && state.matchingRefs[0]) {
+      this.focusRefByName(state.matchingRefs[0])
+    } else {
+      this.focusedRef = null
+      this.focusedRefIndex = -1
+    }
+  }
+
+  private async handleHintKeypress(
+    seq: string,
+    k: TuiKeyEvent,
+  ): Promise<{ shouldExit: boolean; drawn: boolean }> {
+    const hint = this.linkHint
+    if (!hint) {
+      this.mode = 'normal'
+      return { shouldExit: false, drawn: false }
+    }
+    const name = k.name ?? ''
+
+    if (name === 'escape' || (!k.ctrl && !k.meta && !k.shift && seq === 'f' && hint.digits.length === 0)) {
+      this.linkHint = null
+      this.mode = 'normal'
+      this.statusMessage = 'Link-hint jump cancelled'
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'return' || name === 'enter') {
+      if (hint.digits.length === 0) {
+        this.linkHint = null
+        this.mode = 'normal'
+        this.statusMessage = 'Link-hint jump cancelled (no digits entered)'
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      const target = resolveLinkHintTarget(hint)
+      if (!target) {
+        this.statusMessage =
+          hint.matchingRefs.length === 0
+            ? `No ref matching e${hint.digits}`
+            : `Ambiguous hint "${hint.digits}": matches ${hint.matchingRefs.slice(0, 4).join(', ')}`
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      this.linkHint = null
+      this.mode = 'normal'
+      this.focusRefByName(target)
+      const { refresh } = await this.activateFocusedRef()
+      await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'backspace') {
+      if (hint.digits.length === 0) {
+        this.linkHint = null
+        this.mode = 'normal'
+        this.statusMessage = 'Link-hint jump cancelled'
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      const next = updateLinkHintDigits(hint, hint.digits.slice(0, -1))
+      this.linkHint = next
+      this.syncFocusedRefFromHint(next)
+      await this.draw({ ensureFocusVisible: next.digits.length > 0 })
+      return { shouldExit: false, drawn: true }
+    }
+
+    // Allow optional leading 'e'/'E' (so typing `fe3` works seamlessly just like `f3`)
+    if (!k.ctrl && !k.meta && hint.digits.length === 0 && (seq === 'e' || seq === 'E')) {
+      return { shouldExit: false, drawn: false }
+    }
+
+    if (!k.ctrl && !k.meta && /^[0-9]$/.test(seq)) {
+      const next = updateLinkHintDigits(hint, hint.digits + seq)
+      this.linkHint = next
+      this.syncFocusedRefFromHint(next)
+      await this.draw({ ensureFocusVisible: true })
+      return { shouldExit: false, drawn: true }
+    }
+
+    return { shouldExit: false, drawn: false }
+  }
+
   private async runSearch(query: string): Promise<void> {
     const trimmed = query.trim()
     this.searchQuery = trimmed
@@ -865,9 +1032,25 @@ export class TerminalBrowserController {
         this.inspectorTab = targetTab
         this.inspectorScrollOffset = 0
         this.setSplitPane(true, `Inspector: ${targetTab}`)
+      } else if (cmd === 'hint' || cmd === 'hints' || cmd === 'jump') {
+        const rawTarget = rest[0]?.trim() ?? ''
+        if (!rawTarget) {
+          this.enterHintMode()
+        } else {
+          const digits = rawTarget.replace(/^e/i, '')
+          const tempState = createLinkHintState(this.availableRefs, digits)
+          const targetRef = resolveLinkHintTarget(tempState)
+          if (!targetRef) {
+            this.statusMessage = `No ref matching ${rawTarget}`
+          } else {
+            this.focusRefByName(targetRef)
+            const activated = await this.activateFocusedRef()
+            refresh = activated.refresh
+          }
+        }
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
-          'Keys: j/k g/G / : Tab Enter i [/] I q | Cmds: open <url> | click eN | fill eN <txt> | split | console|network|refs|activity | quit'
+          'Keys: j/k g/G f / : Tab Enter i [/] I q | Cmds: open <url> | click eN | fill eN <txt> | hint [N] | split | console|network|refs|activity | quit'
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`
@@ -899,6 +1082,11 @@ export class TerminalBrowserController {
     // Inline form-filling modal mode
     if (this.mode === 'modal') {
       return this.handleModalKeypress(seq, k)
+    }
+
+    // Vimium-style quick link-hint jump mode
+    if (this.mode === 'hint') {
+      return this.handleHintKeypress(seq, k)
     }
 
     // Search or Command input mode
@@ -1074,6 +1262,12 @@ export class TerminalBrowserController {
     if (!k.ctrl && !k.meta && seq === '/') {
       this.mode = 'search'
       this.inputBuffer = ''
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'f') {
+      this.enterHintMode()
       await this.draw()
       return { shouldExit: false, drawn: true }
     }
