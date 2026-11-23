@@ -3,6 +3,7 @@
 // Supports raw-mode single-key navigation (j/k, g/G, /, :, Tab, Enter, q)
 // as well as line-based fallback when stdin is non-TTY / piped.
 
+import path from 'node:path'
 import readline from 'node:readline'
 import { formatRefTooltip, renderPageAsciiWithMetrics } from '../ascii/layout.js'
 import type { BrowserManager } from '../engine/manager.js'
@@ -44,8 +45,25 @@ import {
   updateLinkHintDigits,
   type LinkHintState,
 } from './link-hints.js'
+import {
+  BookmarkHistoryStore,
+  cloneSidebarState,
+  composeSidebarFrame,
+  computeSidebarLayout,
+  createSidebarState,
+  formatSidebarStatus,
+  getSidebarItems,
+  moveSidebarSelection,
+  renderSidebarPane,
+  toggleSidebarTab,
+  type BookmarkEntry,
+  type HistoryEntry,
+  type SidebarData,
+  type SidebarState,
+  type SidebarTab,
+} from './sidebar.js'
 
-export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint' | 'palette'
+export type TuiMode = 'normal' | 'search' | 'command' | 'modal' | 'hint' | 'palette' | 'sidebar'
 
 export interface TuiKeyEvent {
   name?: string
@@ -86,6 +104,16 @@ export interface TuiOptions {
   splitPane?: boolean
   /** Initial inspector tab when split-pane is open (default: 'console'). */
   inspectorTab?: InspectorTab
+  /** Start with Bookmark/History sidebar open (default: false). */
+  sidebarOpen?: boolean
+  /** Initial sidebar tab when sidebar is open (default: 'bookmarks'). */
+  sidebarTab?: SidebarTab
+  /** Path to persist bookmarks/history JSON. Pass null for in-memory only; defaults to <profileDir>/tui-library.json. */
+  libraryPath?: string | null
+  /** Optional initial bookmarks to seed the sidebar store. */
+  initialBookmarks?: BookmarkEntry[]
+  /** Optional initial history entries to seed the sidebar store. */
+  initialHistory?: HistoryEntry[]
 }
 
 export interface TuiSearchMatch {
@@ -119,6 +147,12 @@ export interface TuiState {
   formModal: FormModalState | null
   linkHint: LinkHintState | null
   palette: CommandPaletteState | null
+  sidebarOpen: boolean
+  sidebarTab: SidebarTab
+  sidebar: SidebarState | null
+  bookmarkCount: number
+  historyCount: number
+  currentPageBookmarked: boolean
   exited: boolean
 }
 
@@ -128,6 +162,7 @@ export class TerminalBrowserController {
   private readonly output: TuiOutputStream
   private readonly opts: TuiOptions
   private readonly scrollStep: number
+  private readonly library: BookmarkHistoryStore
 
   private mode: TuiMode = 'normal'
   private scrollOffset = 0
@@ -155,6 +190,9 @@ export class TerminalBrowserController {
   private formModal: FormModalState | null = null
   private linkHint: LinkHintState | null = null
   private palette: CommandPaletteState | null = null
+  private sidebar: SidebarState | null = null
+  private sidebarViewportRows = 12
+  private lastRecordedUrlByTab = new Map<number, string>()
   private exited = false
 
   constructor(manager: BrowserManager, opts: TuiOptions = {}) {
@@ -167,9 +205,24 @@ export class TerminalBrowserController {
     this.color = this.asciiOnly ? false : (opts.color ?? Boolean(this.output.isTTY))
     this.splitPane = Boolean(opts.splitPane)
     this.inspectorTab = opts.inspectorTab ?? 'console'
+    const defaultLibraryPath = manager.profileDir ? path.join(manager.profileDir, 'tui-library.json') : null
+    const libraryPath = opts.libraryPath === undefined ? defaultLibraryPath : opts.libraryPath
+    this.library = new BookmarkHistoryStore({
+      filePath: libraryPath,
+      initialBookmarks: opts.initialBookmarks,
+      initialHistory: opts.initialHistory,
+    })
+    if (opts.sidebarOpen) {
+      this.sidebar = createSidebarState(opts.sidebarTab ?? 'bookmarks')
+      this.mode = 'sidebar'
+    }
     this.statusMessage = this.isRawModeEnabled()
-      ? 'Keys: j/k scroll | 1-9/t/w tabs | f jump | Ctrl+P palette | / search | : cmd | Tab focus | Enter act | i inspector | q quit'
-      : 'Type a command (open <url>, newtab, close, tabs, palette, click e1, fill e2 txt, split, quit)'
+      ? 'Keys: j/k scroll | 1-9/t/w tabs | b/H library | f jump | Ctrl+P palette | / search | : cmd | Tab focus | i inspector | q quit'
+      : 'Type a command (open <url>, bookmarks, history, newtab, close, tabs, palette, click e1, split, quit)'
+  }
+
+  getLibrary(): BookmarkHistoryStore {
+    return this.library
   }
 
   isRawModeEnabled(): boolean {
@@ -204,6 +257,12 @@ export class TerminalBrowserController {
       formModal: cloneFormModalState(this.formModal),
       linkHint: cloneLinkHintState(this.linkHint),
       palette: cloneCommandPaletteState(this.palette),
+      sidebarOpen: this.sidebar !== null,
+      sidebarTab: this.sidebar?.tab ?? 'bookmarks',
+      sidebar: cloneSidebarState(this.sidebar),
+      bookmarkCount: this.library.getCounts().bookmarks,
+      historyCount: this.library.getCounts().history,
+      currentPageBookmarked: Boolean(this.lastSnapshot?.url && this.library.isBookmarked(this.lastSnapshot.url)),
       exited: this.exited,
     }
   }
@@ -306,9 +365,21 @@ export class TerminalBrowserController {
     })
   }
 
+  private collectSidebarData(): SidebarData {
+    return {
+      bookmarks: this.library.listBookmarks(),
+      history: this.library.listHistory(),
+      currentUrl: this.lastSnapshot?.url,
+    }
+  }
+
   private buildStatusLine(): string {
     if (this.mode === 'palette' && this.palette) {
       return formatCommandPaletteStatus(this.palette, { asciiOnly: this.asciiOnly })
+    }
+    if (this.mode === 'sidebar' && this.sidebar) {
+      const items = getSidebarItems(this.sidebar, this.collectSidebarData())
+      return formatSidebarStatus(this.sidebar, items, { asciiOnly: this.asciiOnly })
     }
     if (this.mode === 'modal' && this.formModal) {
       const action = this.formModal.kind === 'select' ? 'Select' : 'Edit'
@@ -337,6 +408,13 @@ export class TerminalBrowserController {
 
   private syncSnapshotRefs(snapshot: PageSnapshot | undefined): void {
     this.lastSnapshot = snapshot
+    if (snapshot?.url) {
+      const tabKey = snapshot.tabId ?? 0
+      if (this.lastRecordedUrlByTab.get(tabKey) !== snapshot.url) {
+        this.lastRecordedUrlByTab.set(tabKey, snapshot.url)
+        this.library.recordHistory(snapshot.url, snapshot.title)
+      }
+    }
     const refs = (snapshot?.elements ?? [])
       .map((el) => el.ref)
       .filter((r): r is string => typeof r === 'string' && r.length > 0)
@@ -359,9 +437,13 @@ export class TerminalBrowserController {
 
   async draw(opts: { refresh?: boolean; ensureFocusVisible?: boolean } = {}): Promise<string> {
     const { width, height } = this.resolveDimensions()
+    const sidebarLayout = this.sidebar
+      ? computeSidebarLayout(width)
+      : { canShow: false, sidebarWidth: 0, pageWidth: width, gapWidth: 0 }
+    const remainingWidth = sidebarLayout.canShow ? sidebarLayout.pageWidth : width
     const splitLayout = this.splitPane
-      ? computeSplitPaneWidths(width)
-      : { canSplit: false, leftWidth: width, rightWidth: 0, gapWidth: 0 }
+      ? computeSplitPaneWidths(remainingWidth)
+      : { canSplit: false, leftWidth: remainingWidth, rightWidth: 0, gapWidth: 0 }
     const pageWidth = splitLayout.leftWidth
     const shouldRefresh = opts.refresh ?? !this.lastSnapshot
     let leftFrame: string
@@ -504,6 +586,30 @@ export class TerminalBrowserController {
       this.inspectorMaxScrollOffset = 0
     }
 
+    if (this.sidebar && sidebarLayout.canShow) {
+      const sidebarData = this.collectSidebarData()
+      const mainRowCount = frame.split('\n').length
+      const sidebarRendered = renderSidebarPane(this.sidebar, sidebarData, {
+        width: sidebarLayout.sidebarWidth,
+        height: mainRowCount,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+      })
+      this.sidebar = {
+        ...this.sidebar,
+        selectedIndex: sidebarRendered.selectedIndex,
+        scrollOffset: sidebarRendered.scrollOffset,
+      }
+      this.sidebarViewportRows = sidebarRendered.viewportRows
+      frame = composeSidebarFrame(sidebarRendered.lines, frame, {
+        sidebarWidth: sidebarLayout.sidebarWidth,
+        pageWidth: sidebarLayout.pageWidth,
+        gapWidth: sidebarLayout.gapWidth,
+        asciiOnly: this.asciiOnly,
+        color: this.color,
+      })
+    }
+
     if (this.mode === 'modal' && this.formModal) {
       const modalLines = renderFormModalBox(this.formModal, {
         maxWidth: width,
@@ -534,6 +640,8 @@ export class TerminalBrowserController {
         this.output.write(`:${this.inputBuffer}`)
       } else if (this.mode === 'hint' && this.linkHint) {
         this.output.write(`f:${this.linkHint.digits}`)
+      } else if (this.mode === 'sidebar' && this.sidebar?.filtering) {
+        this.output.write(`/${this.sidebar.filterQuery}`)
       }
     }
 
@@ -975,6 +1083,286 @@ export class TerminalBrowserController {
     return { refresh: true }
   }
 
+  private openSidebar(tab: SidebarTab): boolean {
+    const { width } = this.resolveDimensions()
+    const layout = computeSidebarLayout(width)
+    if (!layout.canShow) {
+      this.sidebar = null
+      if (this.mode === 'sidebar') this.mode = 'normal'
+      this.statusMessage = `Terminal too narrow for sidebar (${width} cols; need >= 72)`
+      return false
+    }
+    if (this.sidebar && this.sidebar.tab === tab) {
+      this.closeSidebar(`${tab === 'bookmarks' ? 'Bookmarks' : 'History'} sidebar closed`)
+      return false
+    }
+    if (this.sidebar) {
+      this.sidebar = {
+        ...this.sidebar,
+        tab,
+        selectedIndex: 0,
+        scrollOffset: 0,
+        filtering: false,
+      }
+      this.mode = 'sidebar'
+      this.statusMessage = `Switched sidebar to ${tab}`
+      return true
+    }
+    this.sidebar = createSidebarState(tab)
+    this.mode = 'sidebar'
+    this.statusMessage = `Opened ${tab} sidebar`
+    return true
+  }
+
+  private closeSidebar(message?: string): void {
+    this.sidebar = null
+    if (this.mode === 'sidebar') {
+      this.mode = 'normal'
+    }
+    this.statusMessage = message ?? 'Sidebar closed'
+  }
+
+  private addCurrentPageBookmark(customTitle?: string): boolean {
+    const url = this.lastSnapshot?.url
+    if (!url || url.toLowerCase() === 'about:blank') {
+      this.statusMessage = 'Cannot bookmark blank page'
+      return false
+    }
+    const title = customTitle?.trim() || this.lastSnapshot?.title || url
+    const { entry, added } = this.library.addBookmark(url, title)
+    if (!entry) {
+      this.statusMessage = 'Cannot bookmark current page'
+      return false
+    }
+    this.statusMessage = added ? `Bookmarked: ${entry.title}` : `Updated bookmark: ${entry.title}`
+    return true
+  }
+
+  private toggleCurrentPageBookmark(customTitle?: string): boolean {
+    const url = this.lastSnapshot?.url
+    if (!url || url.toLowerCase() === 'about:blank') {
+      this.statusMessage = 'Cannot bookmark blank page'
+      return false
+    }
+    const title = customTitle?.trim() || this.lastSnapshot?.title || url
+    const res = this.library.toggleBookmark(url, title)
+    this.statusMessage = res.bookmarked
+      ? `Bookmarked: ${res.entry?.title ?? url}`
+      : `Removed bookmark: ${title}`
+    return res.bookmarked
+  }
+
+  private async handleSidebarKeypress(
+    seq: string,
+    k: TuiKeyEvent,
+  ): Promise<{ shouldExit: boolean; drawn: boolean }> {
+    const sidebar = this.sidebar
+    if (!sidebar) {
+      this.mode = 'normal'
+      return { shouldExit: false, drawn: false }
+    }
+    const name = k.name ?? ''
+
+    // Inline filter typing inside sidebar
+    if (sidebar.filtering) {
+      if (name === 'escape') {
+        if (sidebar.filterQuery.length > 0) {
+          this.sidebar = { ...sidebar, filterQuery: '', filtering: false, selectedIndex: 0, scrollOffset: 0 }
+          this.statusMessage = 'Sidebar filter cleared'
+        } else {
+          this.sidebar = { ...sidebar, filtering: false }
+        }
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if (name === 'return' || name === 'enter') {
+        this.sidebar = { ...sidebar, filtering: false }
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if (k.ctrl && name === 'u') {
+        this.sidebar = { ...sidebar, filterQuery: '', selectedIndex: 0, scrollOffset: 0 }
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if (name === 'backspace') {
+        if (sidebar.filterQuery.length === 0) {
+          this.sidebar = { ...sidebar, filtering: false }
+        } else {
+          this.sidebar = {
+            ...sidebar,
+            filterQuery: sidebar.filterQuery.slice(0, -1),
+            selectedIndex: 0,
+            scrollOffset: 0,
+          }
+        }
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if (!k.ctrl && !k.meta && seq.length > 0 && seq >= ' ' && seq !== '\x7f') {
+        this.sidebar = {
+          ...sidebar,
+          filterQuery: sidebar.filterQuery + seq,
+          selectedIndex: 0,
+          scrollOffset: 0,
+        }
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      return { shouldExit: false, drawn: false }
+    }
+
+    if (name === 'escape' || (!k.ctrl && !k.meta && seq === 'q')) {
+      this.closeSidebar()
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'b') {
+      this.openSidebar('bookmarks')
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && (seq === 'H' || (k.shift && name === 'h'))) {
+      this.openSidebar('history')
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (
+      name === 'tab' ||
+      name === 'left' ||
+      name === 'right' ||
+      (!k.ctrl && !k.meta && (seq === '[' || seq === ']'))
+    ) {
+      const nextTab = toggleSidebarTab(sidebar.tab)
+      this.sidebar = {
+        ...sidebar,
+        tab: nextTab,
+        selectedIndex: 0,
+        scrollOffset: 0,
+      }
+      this.statusMessage = `Sidebar: ${nextTab}`
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && seq === '/') {
+      this.sidebar = { ...sidebar, filtering: true }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && ((!k.shift && seq === 'a') || seq === 'B' || (k.shift && name === 'b'))) {
+      this.addCurrentPageBookmark()
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    const items = getSidebarItems(sidebar, this.collectSidebarData())
+
+    if ((!k.ctrl && !k.meta && seq === 'j') || name === 'down') {
+      this.sidebar = moveSidebarSelection(sidebar, items.length, 1, true)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && seq === 'k') || name === 'up') {
+      this.sidebar = moveSidebarSelection(sidebar, items.length, -1, true)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'pagedown' || (k.ctrl && name === 'd')) {
+      const step = Math.max(3, Math.floor(this.sidebarViewportRows / 2))
+      this.sidebar = moveSidebarSelection(sidebar, items.length, step, false)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'pageup' || (k.ctrl && name === 'u')) {
+      const step = Math.max(3, Math.floor(this.sidebarViewportRows / 2))
+      this.sidebar = moveSidebarSelection(sidebar, items.length, -step, false)
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && !k.shift && seq === 'g') || name === 'home') {
+      this.sidebar = { ...sidebar, selectedIndex: 0, scrollOffset: 0 }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if ((!k.ctrl && !k.meta && (seq === 'G' || (k.shift && name === 'g'))) || name === 'end') {
+      this.sidebar = { ...sidebar, selectedIndex: Math.max(0, items.length - 1) }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (
+      (!k.ctrl && !k.meta && !k.shift && seq === 'd') ||
+      name === 'delete' ||
+      name === 'backspace'
+    ) {
+      const selected = items[sidebar.selectedIndex]
+      if (!selected) {
+        this.statusMessage = `No ${sidebar.tab === 'bookmarks' ? 'bookmark' : 'history entry'} selected`
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      if (sidebar.tab === 'bookmarks') {
+        this.library.removeBookmark(selected.id)
+        this.statusMessage = `Deleted bookmark: ${selected.title}`
+      } else {
+        this.library.removeHistory(selected.id)
+        this.statusMessage = `Deleted history entry: ${selected.title}`
+      }
+      const remaining = Math.max(0, items.length - 1)
+      this.sidebar = {
+        ...sidebar,
+        selectedIndex: remaining === 0 ? 0 : Math.min(sidebar.selectedIndex, remaining - 1),
+      }
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (name === 'return' || name === 'enter') {
+      const selected = items[sidebar.selectedIndex]
+      if (!selected) {
+        this.statusMessage = `No ${sidebar.tab === 'bookmarks' ? 'bookmark' : 'history entry'} to open`
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      this.closeSidebar()
+      const res = await this.manager.runTool(undefined, 'page_navigate', { url: selected.url })
+      if (res.ok) {
+        this.resetTabViewState()
+        this.statusMessage = `Navigated: ${res.url}`
+        await this.draw({ refresh: true })
+      } else {
+        this.statusMessage = `Refused: ${res.error}`
+        await this.draw()
+      }
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'o') {
+      const selected = items[sidebar.selectedIndex]
+      if (!selected) {
+        this.statusMessage = `No ${sidebar.tab === 'bookmarks' ? 'bookmark' : 'history entry'} to open`
+        await this.draw()
+        return { shouldExit: false, drawn: true }
+      }
+      this.closeSidebar()
+      const { refresh } = await this.openNewTab(selected.url)
+      await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
+    }
+
+    return { shouldExit: false, drawn: false }
+  }
+
   private enterCommandPalette(initialQuery = ''): void {
     const state = createCommandPaletteState(
       {
@@ -982,6 +1370,8 @@ export class TerminalBrowserController {
         splitPane: this.splitPane,
         asciiOnly: this.asciiOnly,
         hasFocusedRef: Boolean(this.focusedRef),
+        sidebarOpen: this.sidebar !== null,
+        currentPageBookmarked: Boolean(this.lastSnapshot?.url && this.library.isBookmarked(this.lastSnapshot.url)),
       },
       initialQuery,
     )
@@ -1027,6 +1417,12 @@ export class TerminalBrowserController {
         this.focusedRef = null
         this.focusedRefIndex = -1
         this.statusMessage = 'Focus cleared'
+        return { shouldExit: false, refresh: false }
+      case 'open-sidebar':
+        this.openSidebar(cmd.action.tab)
+        return { shouldExit: false, refresh: false }
+      case 'toggle-bookmark':
+        this.toggleCurrentPageBookmark()
         return { shouldExit: false, refresh: false }
       case 'prompt':
         this.mode = 'command'
@@ -1310,6 +1706,54 @@ export class TerminalBrowserController {
         this.statusMessage = `Tabs (${tabs.length}): ${summary || '(none)'}`
       } else if (cmd === 'palette') {
         this.enterCommandPalette(arg)
+      } else if (cmd === 'bookmarks' || cmd === 'bm') {
+        const sub = (rest[0] ?? '').toLowerCase()
+        if (!sub || sub === 'open' || sub === 'toggle') {
+          this.openSidebar('bookmarks')
+        } else if (sub === 'close' || sub === 'off') {
+          this.closeSidebar('Bookmarks sidebar closed')
+        } else if (sub === 'add') {
+          this.addCurrentPageBookmark(rest.slice(1).join(' '))
+        } else if (sub === 'del' || sub === 'rm' || sub === 'remove') {
+          const target = rest.slice(1).join(' ').trim() || this.lastSnapshot?.url || ''
+          const removed = this.library.removeBookmark(target)
+          this.statusMessage = removed ? `Removed bookmark: ${target}` : `No bookmark matching "${target}"`
+        } else if (sub === 'clear') {
+          this.library.clearBookmarks()
+          this.statusMessage = 'Cleared all bookmarks'
+        } else if (sub === 'list') {
+          const list = this.library.listBookmarks()
+          this.statusMessage =
+            list.length === 0
+              ? 'Bookmarks (0): none'
+              : `Bookmarks (${list.length}): ${list.slice(0, 4).map((b) => b.title).join(' | ')}`
+        } else {
+          this.statusMessage = `Unknown bookmarks arg "${sub}". Use open|close|add|del|clear|list`
+        }
+      } else if (cmd === 'bookmark') {
+        if (arg) {
+          this.addCurrentPageBookmark(arg)
+        } else {
+          this.toggleCurrentPageBookmark()
+        }
+      } else if (cmd === 'history' || cmd === 'hist') {
+        const sub = (rest[0] ?? '').toLowerCase()
+        if (!sub || sub === 'open' || sub === 'toggle') {
+          this.openSidebar('history')
+        } else if (sub === 'close' || sub === 'off') {
+          this.closeSidebar('History sidebar closed')
+        } else if (sub === 'clear') {
+          this.library.clearHistory()
+          this.statusMessage = 'Cleared browsing history'
+        } else if (sub === 'list') {
+          const list = this.library.listHistory()
+          this.statusMessage =
+            list.length === 0
+              ? 'History (0): empty'
+              : `History (${list.length}): ${list.slice(0, 4).map((h) => h.title).join(' | ')}`
+        } else {
+          this.statusMessage = `Unknown history arg "${sub}". Use open|close|clear|list`
+        }
       } else if (cmd === 'visual' || cmd === 'v') {
         const res = await this.manager.runTool(undefined, 'page_screenshot_ascii', {
           width: Math.max(40, Math.min(120, (this.output.columns || 80) - 4)),
@@ -1373,7 +1817,7 @@ export class TerminalBrowserController {
         }
       } else if (cmd === 'help' || cmd === '?') {
         this.statusMessage =
-          'Keys: j/k g/G 1-9/t/w Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | newtab | close | tabs | palette | click eN | fill eN <txt> | hint [N] | split | quit'
+          'Keys: j/k g/G 1-9/t/w b/H/B Ctrl+P f / : Tab Enter i [/] I q | Cmds: open <url> | bookmarks | history | newtab | close | tabs | palette | split | quit'
       } else if (/^e\d+$/.test(cmd)) {
         const res = await this.manager.runTool(undefined, 'page_click', { ref: cmd })
         this.statusMessage = res.ok ? `Clicked ${cmd}` : `Refused: ${res.error}`
@@ -1405,6 +1849,11 @@ export class TerminalBrowserController {
     // Command palette mode (Ctrl+P)
     if (this.mode === 'palette') {
       return this.handlePaletteKeypress(seq, k)
+    }
+
+    // Bookmark & History sidebar mode (b / H)
+    if (this.mode === 'sidebar') {
+      return this.handleSidebarKeypress(seq, k)
     }
 
     // Inline form-filling modal mode
@@ -1490,6 +1939,24 @@ export class TerminalBrowserController {
     if (!k.ctrl && !k.meta && !k.shift && seq === 'w') {
       const { refresh } = await this.closeActiveTab()
       await this.draw({ refresh })
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && !k.shift && seq === 'b') {
+      this.openSidebar('bookmarks')
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && (seq === 'H' || (k.shift && name === 'h'))) {
+      this.openSidebar('history')
+      await this.draw()
+      return { shouldExit: false, drawn: true }
+    }
+
+    if (!k.ctrl && !k.meta && (seq === 'B' || (k.shift && name === 'b'))) {
+      this.toggleCurrentPageBookmark()
+      await this.draw()
       return { shouldExit: false, drawn: true }
     }
 

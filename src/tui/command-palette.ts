@@ -4,7 +4,7 @@
 import { sanitizeAscii, stripAnsi } from '../ascii/sanitize.js'
 import type { TabSummary } from '../types.js'
 
-export type PaletteCategory = 'Tab' | 'Navigate' | 'Page' | 'Inspector' | 'View' | 'Session'
+export type PaletteCategory = 'Tab' | 'Navigate' | 'Page' | 'Library' | 'Inspector' | 'View' | 'Session'
 
 export type PaletteAction =
   | { type: 'command'; command: string }
@@ -15,6 +15,8 @@ export type PaletteAction =
   | { type: 'enter-hint' }
   | { type: 'enter-search' }
   | { type: 'clear-focus' }
+  | { type: 'open-sidebar'; tab: 'bookmarks' | 'history' }
+  | { type: 'toggle-bookmark' }
   | { type: 'quit' }
 
 export interface PaletteCommand {
@@ -32,6 +34,8 @@ export interface CommandPaletteContext {
   splitPane: boolean
   asciiOnly: boolean
   hasFocusedRef: boolean
+  sidebarOpen?: boolean
+  currentPageBookmarked?: boolean
 }
 
 export interface CommandPaletteState {
@@ -204,6 +208,42 @@ export function buildPaletteCommands(ctx: CommandPaletteContext): PaletteCommand
       description: ctx.hasFocusedRef ? 'Clear the active focus cursor' : 'No element currently focused',
       keywords: ['unfocus', 'blur', 'cursor'],
       action: { type: 'clear-focus' },
+    },
+    {
+      id: 'library.bookmarks',
+      label: 'Open Bookmarks Sidebar',
+      category: 'Library',
+      shortcut: 'b',
+      description: 'Open or switch to the Bookmarks sidebar panel',
+      keywords: ['bookmark', 'favorites', 'saved', 'sidebar'],
+      action: { type: 'open-sidebar', tab: 'bookmarks' },
+    },
+    {
+      id: 'library.history',
+      label: 'Open History Sidebar',
+      category: 'Library',
+      shortcut: 'H',
+      description: 'Open or switch to the Browsing History sidebar panel',
+      keywords: ['history', 'recent', 'visited', 'sidebar'],
+      action: { type: 'open-sidebar', tab: 'history' },
+    },
+    {
+      id: 'library.toggle-bookmark',
+      label: ctx.currentPageBookmarked ? 'Remove Current Page Bookmark' : 'Bookmark Current Page',
+      category: 'Library',
+      shortcut: 'B',
+      description: 'Toggle bookmark for the active page URL',
+      keywords: ['bookmark', 'star', 'save', 'favorite'],
+      action: { type: 'toggle-bookmark' },
+    },
+    {
+      id: 'library.clear-history',
+      label: 'Clear Browsing History',
+      category: 'Library',
+      shortcut: ':history clear',
+      description: 'Clear all recorded browsing history entries',
+      keywords: ['history', 'wipe', 'reset', 'clear'],
+      action: { type: 'command', command: 'history clear' },
     },
     {
       id: 'inspector.toggle',

@@ -57,7 +57,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M46: Inline form-filling modal prompt in TUI when pressing `Enter` on an `<input>` or `<select>` ref
 - [x] M47: Quick link-hint jump mode (`f` key highlights `[e1]`..`[e99]`, type digits + Enter to click, vimium-style!)
 - [x] M48: Tab bar switching (`1`-`9`, `t` new tab, `w` close tab) and command palette (`Ctrl+P`)
-- [ ] M49: Bookmark & History sidebar panel inside TUI (`b` bookmarks, `H` history)
+- [x] M49: Bookmark & History sidebar panel inside TUI (`b` bookmarks, `H` history)
 - [ ] M50: Terminal resize (`SIGWINCH`) live reflow handler so TUI adapts smoothly inside tmux/screen panes
 - [ ] M51: Non-TTY / piped fallback detection so TUI never corrupts output when stdin/stdout is redirected
 - [ ] M52: Live pixel-preview toggle (`v` cycles Layout ASCII -> Pixel ASCII -> Braille -> Halfblock)
