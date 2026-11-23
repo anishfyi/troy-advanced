@@ -249,6 +249,7 @@ export interface AsciiRenderOptions {
   tabs?: TabSummary[]
   activeTabId?: number
   statusMessage?: string
+  focusedRef?: string
 }
 
 export interface MarkdownRenderOptions {

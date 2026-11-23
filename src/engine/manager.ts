@@ -510,6 +510,7 @@ export class BrowserManager {
       totalLines: number
       viewportRows: number
     }
+    focusedLineIndex?: number
     error?: string
   }> {
     const session = this.resolveSession(tabId)
@@ -551,6 +552,7 @@ export class BrowserManager {
         totalLines: rendered.totalLines,
         viewportRows: rendered.viewportRows,
       },
+      ...(rendered.focusedLineIndex !== undefined ? { focusedLineIndex: rendered.focusedLineIndex } : {}),
       ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
       ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),

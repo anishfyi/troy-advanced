@@ -4,7 +4,7 @@
 // as well as line-based fallback when stdin is non-TTY / piped.
 
 import readline from 'node:readline'
-import { renderPageAsciiWithMetrics } from '../ascii/layout.js'
+import { formatRefTooltip, renderPageAsciiWithMetrics } from '../ascii/layout.js'
 import type { BrowserManager } from '../engine/manager.js'
 import type { ElementDescriptor, PageSnapshot } from '../types.js'
 
@@ -64,18 +64,13 @@ export interface TuiState {
   inputBuffer: string
   focusedRef: string | null
   focusedRefIndex: number
+  focusedTooltip: string | null
+  focusedLineIndex: number | null
   availableRefs: string[]
   searchQuery: string
   searchMatches: TuiSearchMatch[]
   searchMatchIndex: number
   exited: boolean
-}
-
-function describeRef(el: ElementDescriptor | undefined, ref: string): string {
-  if (!el) return `[${ref}]`
-  const label = (el.text || el.label || el.ariaLabel || el.placeholder || el.name || el.href || '').trim()
-  const tag = el.type ? `${el.tag}:${el.type}` : el.tag
-  return label ? `[${ref}] <${tag}> "${label.slice(0, 40)}"` : `[${ref}] <${tag}>`
 }
 
 export class TerminalBrowserController {
@@ -96,6 +91,7 @@ export class TerminalBrowserController {
   private inputBuffer = ''
   private focusedRef: string | null = null
   private focusedRefIndex = -1
+  private focusedLineIndex: number | null = null
   private availableRefs: string[] = []
   private lastSnapshot: PageSnapshot | undefined
   private searchQuery = ''
@@ -134,6 +130,8 @@ export class TerminalBrowserController {
       inputBuffer: this.inputBuffer,
       focusedRef: this.focusedRef,
       focusedRefIndex: this.focusedRefIndex,
+      focusedTooltip: this.getFocusedTooltip(),
+      focusedLineIndex: this.focusedLineIndex,
       availableRefs: [...this.availableRefs],
       searchQuery: this.searchQuery,
       searchMatches: this.searchMatches.map((m) => ({ ...m })),
@@ -162,6 +160,16 @@ export class TerminalBrowserController {
     return { width, height }
   }
 
+  getFocusedTooltip(): string | null {
+    if (!this.focusedRef) return null
+    const el = this.findElementByRef(this.focusedRef)
+    return formatRefTooltip(el, this.focusedRef, {
+      index: this.focusedRefIndex >= 0 ? this.focusedRefIndex : undefined,
+      total: this.availableRefs.length > 0 ? this.availableRefs.length : undefined,
+      asciiOnly: this.asciiOnly,
+    })
+  }
+
   private buildStatusLine(): string {
     if (this.mode === 'search') {
       return `SEARCH /${this.inputBuffer}`
@@ -169,8 +177,14 @@ export class TerminalBrowserController {
     if (this.mode === 'command') {
       return `CMD :${this.inputBuffer}`
     }
-    const focusPrefix = this.focusedRef ? `focus:${this.focusedRef} | ` : ''
-    return `${focusPrefix}${this.statusMessage}`
+    const tooltip = this.getFocusedTooltip()
+    if (tooltip) {
+      if (!this.statusMessage || this.statusMessage === tooltip) {
+        return tooltip
+      }
+      return `${tooltip} | ${this.statusMessage}`
+    }
+    return this.statusMessage
   }
 
   private syncSnapshotRefs(snapshot: PageSnapshot | undefined): void {
@@ -195,7 +209,7 @@ export class TerminalBrowserController {
     return this.lastSnapshot.elements.find((e) => e.ref === ref)
   }
 
-  async draw(opts: { refresh?: boolean } = {}): Promise<string> {
+  async draw(opts: { refresh?: boolean; ensureFocusVisible?: boolean } = {}): Promise<string> {
     const { width, height } = this.resolveDimensions()
     const shouldRefresh = opts.refresh ?? !this.lastSnapshot
     let frame: string
@@ -203,16 +217,40 @@ export class TerminalBrowserController {
     if (!shouldRefresh && this.lastSnapshot) {
       const tabs = this.manager.listTabs()
       const activeTab = tabs.find((t) => t.active)
-      const rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
+      let rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
         width,
         height,
         asciiOnly: this.asciiOnly,
         color: this.color,
         scrollOffset: this.scrollOffset,
         statusMessage: this.buildStatusLine(),
+        focusedRef: this.focusedRef ?? undefined,
         tabs,
         activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
       })
+      this.focusedLineIndex = rendered.focusedLineIndex ?? null
+      if (
+        opts.ensureFocusVisible &&
+        rendered.focusedLineIndex !== undefined &&
+        (rendered.focusedLineIndex < rendered.scrollOffset ||
+          rendered.focusedLineIndex >= rendered.scrollOffset + rendered.viewportRows)
+      ) {
+        const targetOffset = Math.max(
+          0,
+          Math.min(rendered.maxScrollOffset, rendered.focusedLineIndex - Math.floor(rendered.viewportRows / 3)),
+        )
+        rendered = renderPageAsciiWithMetrics(this.lastSnapshot, {
+          width,
+          height,
+          asciiOnly: this.asciiOnly,
+          color: this.color,
+          scrollOffset: targetOffset,
+          statusMessage: this.buildStatusLine(),
+          focusedRef: this.focusedRef ?? undefined,
+          tabs,
+          activeTabId: activeTab?.id ?? this.lastSnapshot.tabId,
+        })
+      }
       this.scrollOffset = rendered.scrollOffset
       this.maxScrollOffset = rendered.maxScrollOffset
       this.totalLines = rendered.totalLines
@@ -226,10 +264,12 @@ export class TerminalBrowserController {
         color: this.color,
         scrollOffset: this.scrollOffset,
         statusMessage: this.buildStatusLine(),
+        focusedRef: this.focusedRef ?? undefined,
       })
 
       if (res.ok) {
         this.syncSnapshotRefs(res.snapshot)
+        this.focusedLineIndex = res.focusedLineIndex ?? null
         if (res.scroll) {
           this.scrollOffset = res.scroll.offset
           this.maxScrollOffset = res.scroll.maxOffset
@@ -281,10 +321,7 @@ export class TerminalBrowserController {
       this.focusedRefIndex = (this.focusedRefIndex + delta + len) % len
     }
     this.focusedRef = this.availableRefs[this.focusedRefIndex] ?? null
-    const el = this.findElementByRef(this.focusedRef)
-    this.statusMessage = this.focusedRef
-      ? `Focused ${describeRef(el, this.focusedRef)} (${this.focusedRefIndex + 1}/${len}) — press Enter to activate`
-      : 'No interactive refs on page'
+    this.statusMessage = this.getFocusedTooltip() ?? 'No interactive refs on page'
   }
 
   private async activateFocusedRef(): Promise<void> {
@@ -513,7 +550,7 @@ export class TerminalBrowserController {
         this.inputBuffer = ''
         if (activeMode === 'search') {
           await this.runSearch(text)
-          await this.draw()
+          await this.draw({ ensureFocusVisible: true })
           return { shouldExit: false, drawn: true }
         } else {
           const result = await this.executeCommand(text)
@@ -613,19 +650,19 @@ export class TerminalBrowserController {
 
     if (!k.ctrl && !k.meta && !k.shift && seq === 'n') {
       this.cycleSearchMatch(1)
-      await this.draw()
+      await this.draw({ ensureFocusVisible: true })
       return { shouldExit: false, drawn: true }
     }
 
     if (!k.ctrl && !k.meta && (seq === 'N' || (k.shift && name === 'n'))) {
       this.cycleSearchMatch(-1)
-      await this.draw()
+      await this.draw({ ensureFocusVisible: true })
       return { shouldExit: false, drawn: true }
     }
 
     if (name === 'tab') {
       this.cycleFocus(k.shift ? -1 : 1)
-      await this.draw()
+      await this.draw({ ensureFocusVisible: true })
       return { shouldExit: false, drawn: true }
     }
 

@@ -2,7 +2,16 @@
 // Designed so both AI agents (even in strict 7-bit ASCII mode) and humans over SSH/EC2
 // can inspect and drive any live web page directly inside a terminal.
 
-import type { AsciiDensity, AsciiLayoutMode, AsciiRenderOptions, ContentBlock, InlineLink, PageSnapshot, Rect } from '../types.js'
+import type {
+  AsciiDensity,
+  AsciiLayoutMode,
+  AsciiRenderOptions,
+  ContentBlock,
+  ElementDescriptor,
+  InlineLink,
+  PageSnapshot,
+  Rect,
+} from '../types.js'
 import { formatMediaMeta, renderMediaSummaryAscii, resolveBlockCanvasPreview } from './media.js'
 import { sanitizeAscii, stripAnsi } from './sanitize.js'
 
@@ -1368,12 +1377,157 @@ export function cropPageSnapshot(snapshot: PageSnapshot, crop: Rect): PageSnapsh
   }
 }
 
+export interface FormatRefTooltipOptions {
+  index?: number
+  total?: number
+  asciiOnly?: boolean
+  maxLength?: number
+}
+
+/**
+ * Formats a concise, live status-bar tooltip describing the currently focused
+ * interactive element ref (tag, type/role, label, href/value/options, action hint).
+ */
+export function formatRefTooltip(
+  el: ElementDescriptor | undefined,
+  ref: string,
+  options: FormatRefTooltipOptions = {},
+): string {
+  const asciiOnly = options.asciiOnly ?? true
+  const clean = (s: string) => (asciiOnly ? sanitizeAscii(s) : stripAnsi(s)).replace(/\s+/g, ' ').trim()
+  const posPart =
+    options.index !== undefined && options.total !== undefined && options.total > 0
+      ? ` (${options.index + 1}/${options.total})`
+      : ''
+
+  if (!el) {
+    const fallback = `FOCUS [${ref}]${posPart}`
+    return options.maxLength ? truncateVisible(fallback, options.maxLength) : fallback
+  }
+
+  const tagBase = el.type && el.type !== el.tag ? `${el.tag}:${el.type}` : el.tag
+  const rolePart = el.role && el.role !== el.tag ? ` role=${el.role}` : ''
+  const tagDesc = `<${tagBase}${rolePart}>`
+
+  const rawLabel = el.text || el.label || el.ariaLabel || el.placeholder || el.name || ''
+  const label = clean(rawLabel)
+  const labelPart = label ? ` "${truncateVisible(label, 28)}"` : ''
+
+  const metaParts: string[] = []
+  if (el.href) {
+    const hrefClean = clean(el.href)
+    if (hrefClean) metaParts.push(`-> ${truncateVisible(hrefClean, 36)}`)
+  }
+  if (el.tag === 'select' && el.options && el.options.length > 0) {
+    const selected = el.options.find((o) => o.selected)
+    if (selected) {
+      metaParts.push(`val="${truncateVisible(clean(selected.label || selected.value), 18)}"`)
+    }
+    metaParts.push(`opts:${el.options.length}`)
+  } else if (el.type === 'checkbox' || el.type === 'radio') {
+    metaParts.push(el.checked ? '[checked]' : '[unchecked]')
+  } else if (el.valueRedacted) {
+    metaParts.push('val=[REDACTED]')
+  } else if (el.value) {
+    metaParts.push(`val="${truncateVisible(clean(el.value), 18)}"`)
+  }
+  if (el.disabled) metaParts.push('[disabled]')
+  if (el.readOnly) metaParts.push('[readonly]')
+  if (el.defaultSubmit) metaParts.push('[submit]')
+
+  let hint: string
+  if (el.disabled) {
+    hint = 'disabled'
+  } else if (el.tag === 'a' || el.href) {
+    hint = 'Enter:open'
+  } else if (el.tag === 'select') {
+    hint = `:select ${ref} <val>`
+  } else if (
+    el.tag === 'textarea' ||
+    (el.tag === 'input' && !['button', 'submit', 'reset', 'checkbox', 'radio'].includes(el.type))
+  ) {
+    hint = `:fill ${ref} <txt>`
+  } else if (el.defaultSubmit) {
+    hint = `:click ${ref} --submit`
+  } else {
+    hint = 'Enter:click'
+  }
+
+  const metaStr = metaParts.length > 0 ? ` ${metaParts.join(' ')}` : ''
+  const raw = `FOCUS [${ref}]${posPart} ${tagDesc}${labelPart}${metaStr} | ${hint}`
+  const sanitized = asciiOnly ? sanitizeAscii(raw) : stripAnsi(raw)
+  return options.maxLength ? truncateVisible(sanitized, options.maxLength) : sanitized
+}
+
+export interface HighlightFocusedRefResult {
+  lines: string[]
+  focusedLineIndex?: number
+  matchCount: number
+}
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Highlights every occurrence of `[focusedRef]` or `[focusedRef: ...]` in rendered
+ * ASCII/ANSI body lines without matching prefix collisions (e.g. `e1` will never match `e10`).
+ */
+export function highlightFocusedRefInLines(
+  lines: string[],
+  focusedRef: string,
+  options: { asciiOnly?: boolean; color?: boolean; maxWidth?: number } = {},
+): HighlightFocusedRefResult {
+  const trimmed = focusedRef.trim()
+  if (!trimmed) return { lines, focusedLineIndex: undefined, matchCount: 0 }
+
+  const asciiOnly = options.asciiOnly ?? true
+  const color = asciiOnly ? false : (options.color ?? false)
+  const maxWidth = options.maxWidth
+  const escaped = escapeRegExp(trimmed)
+  // Match optional ANSI prefix/suffix around [eN] or [eN: text] while preventing e1 matching e10
+  const tokenRe = new RegExp(`(?:\\x1b\\[[0-9;]*m)*\\[${escaped}(?::[^\\]]*)?\\](?:\\x1b\\[[0-9;]*m)*`, 'g')
+
+  let focusedLineIndex: number | undefined
+  let matchCount = 0
+
+  const out = lines.map((line, idx) => {
+    if (!line.includes(`[${trimmed}]`) && !line.includes(`[${trimmed}:`)) {
+      return line
+    }
+    let lineMatched = false
+    const currentVisibleLen = visibleLength(line)
+    const replaced = line.replace(tokenRe, (match) => {
+      lineMatched = true
+      matchCount += 1
+      const plain = stripAnsi(match)
+      if (color) {
+        const paddedDecor = `▸ ${plain} ◂`
+        const fitsDecor = maxWidth === undefined || currentVisibleLen + 4 <= maxWidth
+        const inner = fitsDecor ? paddedDecor : plain
+        return `${ANSI.bold}${ANSI.inverse}${ANSI.yellow}${inner}${ANSI.reset}`
+      }
+      const fitsWide = maxWidth === undefined || currentVisibleLen + 4 <= maxWidth
+      if (fitsWide) return `>>${plain}<<`
+      const fitsNarrow = maxWidth === undefined || currentVisibleLen + 2 <= maxWidth
+      return fitsNarrow ? `>${plain}<` : plain
+    })
+    if (lineMatched && focusedLineIndex === undefined) {
+      focusedLineIndex = idx
+    }
+    return replaced
+  })
+
+  return { lines: out, focusedLineIndex, matchCount }
+}
+
 export interface AsciiRenderMetrics {
   ascii: string
   totalLines: number
   viewportRows: number
   scrollOffset: number
   maxScrollOffset: number
+  focusedLineIndex?: number
 }
 
 export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
@@ -1406,8 +1560,8 @@ export function renderPageAsciiWithMetrics(
   const topBorder = `${box.tl}${box.h.repeat(width - 2)}${box.tr}`
   const midBorder = `${box.ml}${box.h.repeat(width - 2)}${box.mr}`
   const botBorder = `${box.bl}${box.h.repeat(width - 2)}${box.br}`
-  const frameLine = (content: string, rightEdge: string = box.v) =>
-    `${box.v} ${padLine(content, innerWidth, asciiOnly)} ${rightEdge}`
+  const frameLine = (content: string, rightEdge: string = box.v, leftCursor?: string) =>
+    `${box.v}${leftCursor ?? ' '}${padLine(content, innerWidth, asciiOnly)} ${rightEdge}`
 
   // Render content blocks into lines first so header scroll% and right-edge scrollbar stay in sync
   const bodyLines: string[] = []
@@ -1474,6 +1628,18 @@ export function renderPageAsciiWithMetrics(
 
   if (bodyLines.length === 0) {
     bodyLines.push('(empty page)')
+  }
+
+  let focusedLineIndex: number | undefined
+  const focusedRef = options.focusedRef?.trim() || undefined
+  if (focusedRef && showRefs) {
+    const highlighted = highlightFocusedRefInLines(bodyLines, focusedRef, {
+      asciiOnly,
+      color,
+      maxWidth: innerWidth,
+    })
+    bodyLines.splice(0, bodyLines.length, ...highlighted.lines)
+    focusedLineIndex = highlighted.focusedLineIndex
   }
 
   const chromeOverhead = showChrome ? 6 : showCompactHeader ? 1 : 0
@@ -1551,9 +1717,15 @@ export function renderPageAsciiWithMetrics(
   const rowCount = trimUnframedCompact ? visible.length : viewportRows
   for (let i = 0; i < rowCount; i++) {
     const line = visible[i] ?? ''
+    const isFocusedRow = focusedLineIndex !== undefined && start + i === focusedLineIndex
+    const leftCursor = isFocusedRow
+      ? color
+        ? `${ANSI.bold}${ANSI.yellow}▸${ANSI.reset}`
+        : '>'
+      : undefined
     const gutterChar = showScrollbar ? (scrollbar.chars[i] ?? box.v) : box.v
     if (showChrome) {
-      output.push(frameLine(line, gutterChar))
+      output.push(frameLine(line, gutterChar, leftCursor))
     } else if (showScrollbar) {
       output.push(`${padLine(line, innerWidth, asciiOnly)} ${gutterChar}`)
     } else if (trimUnframedCompact) {
@@ -1575,10 +1747,23 @@ export function renderPageAsciiWithMetrics(
         ? ` | zoom:${options.cropLabel}`
         : ` | crop:${Math.round(activeCrop.x)},${Math.round(activeCrop.y)},${Math.round(activeCrop.width)}x${Math.round(activeCrop.height)}`
       : ''
-    const status = options.statusMessage
+    const focusedEl = focusedRef ? snapshot.elements.find((e) => e.ref === focusedRef) : undefined
+    const rawStatus = options.statusMessage
       ? `${options.statusMessage} | refs:${refCount}${layoutTag}${densityTag}${cropTag} | ${lineRange}`
-      : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag}${densityTag}${cropTag} | ${lineRange} | cmds: open click fill find scroll`
-    output.push(frameLine(status))
+      : focusedRef
+        ? `${formatRefTooltip(focusedEl, focusedRef, { asciiOnly })} | refs:${refCount}${layoutTag}${densityTag}${cropTag} | ${lineRange}`
+        : `refs:${refCount} | epoch:${snapshot.epoch}${layoutTag}${densityTag}${cropTag} | ${lineRange} | cmds: open click fill find scroll`
+    let renderedStatus = truncateVisible(asciiOnly ? sanitizeAscii(stripAnsi(rawStatus)) : stripAnsi(rawStatus), innerWidth)
+    if (color && !asciiOnly && focusedRef) {
+      const badge = `FOCUS [${focusedRef}]`
+      if (renderedStatus.includes(badge)) {
+        renderedStatus = renderedStatus.replace(
+          badge,
+          `${ANSI.bold}${ANSI.inverse}${ANSI.yellow}${badge}${ANSI.reset}`,
+        )
+      }
+    }
+    output.push(frameLine(renderedStatus))
     output.push(botBorder)
   }
 
@@ -1589,6 +1774,7 @@ export function renderPageAsciiWithMetrics(
     viewportRows,
     scrollOffset: start,
     maxScrollOffset: maxOffset,
+    ...(focusedLineIndex !== undefined ? { focusedLineIndex } : {}),
   }
 }
 
