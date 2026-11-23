@@ -253,6 +253,35 @@ const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: 'troy_network',
+    description:
+      'List captured HTTP network requests for a tab (with req-N IDs) or inspect full request/response headers and body for a specific request ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        body: {
+          type: 'string',
+          description: 'Request ID (e.g. "req-1") to inspect full request/response headers and body',
+        },
+        requestId: {
+          type: 'string',
+          description: 'Alias for body: request ID to inspect',
+        },
+        failedOnly: { type: 'boolean', description: 'List only failed requests' },
+        blockedOnly: { type: 'boolean', description: 'List only blocked tracker/policy requests' },
+        method: { type: 'string', description: 'Filter list by HTTP method (e.g. GET, POST)' },
+        urlFilter: { type: 'string', description: 'Filter list by URL substring' },
+        clear: { type: 'boolean', description: 'Clear captured network log after listing' },
+        limit: { type: 'number', description: 'Maximum entries to list (default 50)' },
+        maxBodyChars: { type: 'number', description: 'Max characters per body when inspecting (default 32768)' },
+        prettyJson: { type: 'boolean', description: 'Pretty-print JSON bodies (default true)' },
+        revealHeaders: { type: 'boolean', description: 'Include unmasked sensitive headers (default false)' },
+        includeBinary: { type: 'boolean', description: 'Include base64 payload for binary responses (default false)' },
+      },
+    },
+  },
 ]
 
 export async function handleMcpRequest(
@@ -430,6 +459,22 @@ export async function handleMcpRequest(
           clearQueue: args.clearQueue,
           clear: args.clear,
           limit: args.limit,
+        })
+        break
+      case 'troy_network':
+        result = await manager.runTool(tabId, 'page_network', {
+          body: args.body,
+          requestId: args.requestId,
+          failedOnly: args.failedOnly,
+          blockedOnly: args.blockedOnly,
+          method: args.method,
+          urlFilter: args.urlFilter,
+          clear: args.clear,
+          limit: args.limit,
+          maxBodyChars: args.maxBodyChars,
+          prettyJson: args.prettyJson,
+          revealHeaders: args.revealHeaders,
+          includeBinary: args.includeBinary,
         })
         break
       default:

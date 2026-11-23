@@ -27,7 +27,10 @@ import type {
   EmulationUpdateMode,
   FrameSummary,
   InlineLink,
+  NetworkBodyInspectionOptions,
+  NetworkBodyResult,
   NetworkEntry,
+  NetworkListOptions,
   OriginStorageSnapshot,
   PageSnapshot,
   SettleOptions,
@@ -51,6 +54,12 @@ import {
   parseSetCookieHeader,
 } from './cookies.js'
 import { DialogManager } from './dialogs.js'
+import {
+  NetworkRecorder,
+  buildNetworkBodyResult,
+  normalizeHeadersMap,
+  serializeRequestInitBody,
+} from './network.js'
 import {
   DownloadQuarantineManager,
   isDownloadResponse,
@@ -636,7 +645,7 @@ class LiteTab implements TabDriver {
   private historyStack: string[] = []
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
-  private networkLogs: NetworkEntry[] = []
+  private networkRecorder = new NetworkRecorder()
   private cookies: Map<string, BrowserCookie>
   private localStorageByOrigin: Map<string, Map<string, string>>
   private sessionStorageByOrigin = new Map<string, Map<string, string>>()
@@ -749,12 +758,17 @@ class LiteTab implements TabDriver {
     const cookie = this.cookieHeaderFor(targetUrl)
     if (cookie) headers.set('cookie', cookie)
 
+    const requestHeadersMap = normalizeHeadersMap(headers)
+    const requestBodyStr = serializeRequestInitBody(init?.body)
+
     try {
       const res = await fetch(targetUrl, { ...init, headers, redirect: 'follow' })
       this.storeCookies(res.url || targetUrl, res.headers)
       const finalUrl = res.url || targetUrl
       const contentType = res.headers.get('content-type') ?? ''
       const contentDisposition = res.headers.get('content-disposition')
+      const responseHeadersMap = normalizeHeadersMap(res.headers)
+      const mimeType = contentType.split(';')[0]?.trim() || undefined
 
       if (this.downloads && isDownloadResponse(contentDisposition, contentType)) {
         const data = Buffer.from(await res.arrayBuffer())
@@ -763,18 +777,25 @@ class LiteTab implements TabDriver {
           tabId: this.id,
           url: finalUrl,
           suggestedFilename: parsedDisp.filename,
-          mimeType: contentType.split(';')[0]?.trim() || undefined,
+          mimeType,
           data,
         })
-        this.networkLogs.push({
+        this.networkRecorder.record({
           url: finalUrl,
           method: init?.method ?? 'GET',
           status: res.status,
+          statusText: res.statusText || undefined,
           ok: res.ok && !entry.blocked,
           resourceType: 'download',
+          mimeType,
+          encodedDataLength: data.byteLength,
           durationMs: Date.now() - started,
           ts: Date.now(),
           ...(entry.blocked ? { blocked: true, blockedReason: entry.blockedReason } : {}),
+          requestHeaders: requestHeadersMap,
+          responseHeaders: responseHeadersMap,
+          requestBody: requestBodyStr,
+          cachedResponseBody: { body: data.toString('base64'), base64Encoded: true },
         })
         const summary = entry.blocked
           ? `Download blocked (${entry.blockedReason ?? 'policy'}): ${entry.suggestedFilename}`
@@ -798,14 +819,21 @@ class LiteTab implements TabDriver {
       }
 
       const body = await res.text()
-      this.networkLogs.push({
+      this.networkRecorder.record({
         url: finalUrl,
         method: init?.method ?? 'GET',
         status: res.status,
+        statusText: res.statusText || undefined,
         ok: res.ok,
-        resourceType: 'document',
+        resourceType: contentType.includes('application/json') ? 'fetch' : 'document',
+        mimeType,
+        encodedDataLength: Buffer.byteLength(body, 'utf8'),
         durationMs: Date.now() - started,
         ts: Date.now(),
+        requestHeaders: requestHeadersMap,
+        responseHeaders: responseHeadersMap,
+        requestBody: requestBodyStr,
+        cachedResponseBody: { body, base64Encoded: false },
       })
 
       this.rawHtml = body
@@ -833,13 +861,15 @@ class LiteTab implements TabDriver {
       }
       return { url: this.url, title: this.title }
     } catch (err) {
-      this.networkLogs.push({
+      this.networkRecorder.record({
         url: targetUrl,
         method: init?.method ?? 'GET',
         ok: false,
         durationMs: Date.now() - started,
         ts: Date.now(),
         error: String((err as Error)?.message ?? err),
+        requestHeaders: requestHeadersMap,
+        requestBody: requestBodyStr,
       })
       throw err
     } finally {
@@ -1129,12 +1159,45 @@ class LiteTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
-  getNetwork(opts: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number } = {}): NetworkEntry[] {
-    let items = [...this.networkLogs]
-    if (opts.failedOnly) items = items.filter((i) => !i.ok)
-    if (opts.blockedOnly) items = items.filter((i) => Boolean(i.blocked))
-    if (opts.clear) this.networkLogs = []
-    return items.slice(-(opts.limit ?? 50))
+  getNetwork(opts: NetworkListOptions = {}): NetworkEntry[] {
+    return this.networkRecorder.list(opts)
+  }
+
+  async getNetworkBody(reqId: string, opts: NetworkBodyInspectionOptions = {}): Promise<NetworkBodyResult> {
+    const record = this.networkRecorder.get(reqId)
+    if (!record) {
+      return {
+        ok: false,
+        requestId: reqId,
+        error: `Network request "${reqId}" not found. Run "network" to list captured request IDs.`,
+      }
+    }
+
+    let responseBody: string | undefined
+    let responseBase64Encoded = false
+    let responseBodyUnavailableReason: string | undefined
+
+    if (record.cachedResponseBody) {
+      responseBody = record.cachedResponseBody.body
+      responseBase64Encoded = record.cachedResponseBody.base64Encoded
+    } else if (record.entry.blocked) {
+      responseBodyUnavailableReason = `request blocked (${record.entry.blockedReason ?? 'policy'})`
+    } else if (record.entry.error) {
+      responseBodyUnavailableReason = `request failed (${record.entry.error})`
+    } else {
+      responseBodyUnavailableReason = 'response body unavailable'
+    }
+
+    return buildNetworkBodyResult(
+      record,
+      {
+        requestBody: record.requestBody,
+        responseBody,
+        responseBase64Encoded,
+        responseBodyUnavailableReason,
+      },
+      opts,
+    )
   }
 
   getDialogs(opts: { type?: DialogType; limit?: number; clear?: boolean } = {}): DialogEntry[] {

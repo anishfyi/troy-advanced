@@ -75,7 +75,9 @@ Client Commands (talk to running daemon, or use --oneshot):
   wait [ms] [--text <str>] [--selector <css>] [--url <pattern>] [--state visible|hidden|attached] [--timeout <ms>]
                                           Wait for page condition or fixed delay
   back | forward | reload                 History navigation
-  console | network | eval <expr>         Inspect tab diagnostics or evaluate JS
+  console | eval <expr>                   Inspect console logs or evaluate JS
+  network [--body <reqId>] [--failed] [--blocked] [--method <M>] [--url-filter <str>] [--reveal] [--raw] [--binary] [--max-chars <N>] [--clear] [--ascii] [--json]
+                                          List network requests or inspect request/response headers & body by reqId
   downloads [--blocked] [--clear] [--mode quarantine|deny|allow] [--remove <id>] [--json]
                                           Inspect intercepted/quarantined/blocked auto-downloads or update policy
   dialogs [--type alert|confirm|prompt|beforeunload] [--mode dismiss|accept] [--next accept|dismiss] [--prompt-text <str>] [--clear] [--clear-queue] [--json]
@@ -143,6 +145,10 @@ const VALUE_FLAGS = new Set([
   '--platform',
   '--header',
   '--remove-header',
+  '--body',
+  '--max-chars',
+  '--method',
+  '--url-filter',
 ])
 
 const REPEATABLE_FLAGS = new Set(['--header', '--remove-header'])
@@ -1089,18 +1095,30 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         args: { clear: Boolean(flags.clear), level: flags.level, limit: flags.limit ? Number(flags.limit) : 50 },
       })
       break
-    case 'network':
+    case 'network': {
+      const bodyReqId = typeof flags.body === 'string' ? flags.body : undefined
       res = await callDaemon(live.endpoint, '/tool', {
         tabId,
         name: 'page_network',
-        args: {
-          clear: Boolean(flags.clear),
-          failedOnly: Boolean(flags.failed),
-          blockedOnly: Boolean(flags.blocked),
-          limit: flags.limit ? Number(flags.limit) : 50,
-        },
+        args: bodyReqId
+          ? {
+              body: bodyReqId,
+              ...(flags['max-chars'] !== undefined ? { maxBodyChars: Number(flags['max-chars']) } : {}),
+              ...(flags.raw ? { prettyJson: false } : {}),
+              ...(flags.reveal ? { revealHeaders: true } : {}),
+              ...(flags.binary ? { includeBinary: true } : {}),
+            }
+          : {
+              clear: Boolean(flags.clear),
+              failedOnly: Boolean(flags.failed),
+              blockedOnly: Boolean(flags.blocked),
+              ...(typeof flags.method === 'string' ? { method: flags.method } : {}),
+              ...(typeof flags['url-filter'] === 'string' ? { urlFilter: flags['url-filter'] } : {}),
+              limit: flags.limit ? Number(flags.limit) : 50,
+            },
       })
       break
+    }
     case 'eval':
       res = await callDaemon(live.endpoint, '/tool', { tabId, name: 'page_eval', args: { expression: args.join(' ') } })
       break
@@ -1187,6 +1205,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       cmd === 'viewport' ||
       cmd === 'downloads' ||
       cmd === 'dialogs' ||
+      (cmd === 'network' && Boolean(flags.body)) ||
       flags.ascii) &&
     typeof res.ascii === 'string'
   ) {

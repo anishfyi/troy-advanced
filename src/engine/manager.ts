@@ -63,6 +63,7 @@ import {
 import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
+import { formatNetworkListAscii } from './network.js'
 import { defaultDisabledCrashRecoveryStats } from './crash-recovery.js'
 import { formatDialogsAscii, parseDialogMode, parseDialogType } from './dialogs.js'
 import {
@@ -1255,10 +1256,30 @@ export class BrowserManager {
       }
 
       case 'page_network': {
+        const bodyReqId =
+          typeof args.body === 'string' && args.body.trim()
+            ? args.body.trim()
+            : typeof args.requestId === 'string' && args.requestId.trim()
+              ? args.requestId.trim()
+              : undefined
+        if (bodyReqId) {
+          if (!session.driver.getNetworkBody) {
+            return { ok: false, requestId: bodyReqId, error: 'Network body inspection is not supported by this engine.' }
+          }
+          const result = await session.driver.getNetworkBody(bodyReqId, {
+            ...(typeof args.maxBodyChars === 'number' ? { maxBodyChars: args.maxBodyChars } : {}),
+            ...(typeof args.prettyJson === 'boolean' ? { prettyJson: args.prettyJson } : {}),
+            ...(typeof args.revealHeaders === 'boolean' ? { revealHeaders: args.revealHeaders } : {}),
+            ...(typeof args.includeBinary === 'boolean' ? { includeBinary: args.includeBinary } : {}),
+          })
+          return result as unknown as Record<string, unknown>
+        }
         const entries = session.driver.getNetwork({
           clear: Boolean(args.clear),
           failedOnly: Boolean(args.failedOnly),
           blockedOnly: Boolean(args.blockedOnly),
+          method: typeof args.method === 'string' ? args.method : undefined,
+          urlFilter: typeof args.urlFilter === 'string' ? args.urlFilter : undefined,
           limit: typeof args.limit === 'number' ? args.limit : 50,
         })
         const trackerBlocking = session.driver.getBlockedTrackerStats?.()
@@ -1266,8 +1287,31 @@ export class BrowserManager {
           ok: true,
           count: entries.length,
           entries,
+          ascii: formatNetworkListAscii(entries),
           ...(trackerBlocking ? { trackerBlocking } : {}),
         }
+      }
+
+      case 'page_network_body': {
+        const bodyReqId =
+          typeof args.requestId === 'string' && args.requestId.trim()
+            ? args.requestId.trim()
+            : typeof args.body === 'string' && args.body.trim()
+              ? args.body.trim()
+              : ''
+        if (!bodyReqId) {
+          return { ok: false, error: 'Missing required parameter: requestId' }
+        }
+        if (!session.driver.getNetworkBody) {
+          return { ok: false, requestId: bodyReqId, error: 'Network body inspection is not supported by this engine.' }
+        }
+        const result = await session.driver.getNetworkBody(bodyReqId, {
+          ...(typeof args.maxBodyChars === 'number' ? { maxBodyChars: args.maxBodyChars } : {}),
+          ...(typeof args.prettyJson === 'boolean' ? { prettyJson: args.prettyJson } : {}),
+          ...(typeof args.revealHeaders === 'boolean' ? { revealHeaders: args.revealHeaders } : {}),
+          ...(typeof args.includeBinary === 'boolean' ? { includeBinary: args.includeBinary } : {}),
+        })
+        return result as unknown as Record<string, unknown>
       }
 
       case 'page_downloads': {

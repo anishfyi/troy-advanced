@@ -32,7 +32,10 @@ import type {
   EmulationOptions,
   EmulationProfile,
   EmulationUpdateMode,
+  NetworkBodyInspectionOptions,
+  NetworkBodyResult,
   NetworkEntry,
+  NetworkListOptions,
   OriginStorageSnapshot,
   PageSnapshot,
   SettleOptions,
@@ -62,6 +65,7 @@ import {
 import { DialogManager } from './dialogs.js'
 import { DownloadQuarantineManager } from './downloads.js'
 import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
+import { NetworkRecorder, buildNetworkBodyResult, normalizeHeadersMap } from './network.js'
 import {
   IFRAME_OWNER_INFO_FUNCTION,
   flattenFrameSnapshots,
@@ -592,7 +596,7 @@ interface ChromiumTabRecoveryHost {
   onTabClosed(tab: ChromiumTab): void
 }
 
-class ChromiumTab implements TabDriver {
+export class ChromiumTab implements TabDriver {
   readonly id: number
   readonly engine = 'chromium' as const
   private targetId: string
@@ -606,8 +610,18 @@ class ChromiumTab implements TabDriver {
   private frameContexts = new Map<string, number>()
   private oopifSessions = new Map<string, string>()
   private consoleLogs: ConsoleEntry[] = []
-  private networkLogs: NetworkEntry[] = []
-  private reqStart = new Map<string, { url: string; method: string; ts: number }>()
+  private networkRecorder = new NetworkRecorder()
+  private reqStart = new Map<
+    string,
+    {
+      url: string
+      method: string
+      ts: number
+      requestHeaders: Record<string, string>
+      postData?: string
+      hasPostData?: boolean
+    }
+  >()
   private blockedByFetch = new Map<string, string>()
   private networkIdle = new NetworkIdleTracker()
   private trackerBlocking?: TrackerBlockingOptions
@@ -730,9 +744,24 @@ class ChromiumTab implements TabDriver {
     })
     this.cdp.on('Network.requestWillBeSent', (params) => {
       const idStr = String(params.requestId ?? '')
-      const req = params.request as { url?: string; method?: string } | undefined
+      const req = params.request as
+        | {
+            url?: string
+            method?: string
+            headers?: Record<string, unknown>
+            postData?: string
+            hasPostData?: boolean
+          }
+        | undefined
       if (idStr && req?.url) {
-        this.reqStart.set(idStr, { url: req.url, method: req.method ?? 'GET', ts: Date.now() })
+        this.reqStart.set(idStr, {
+          url: req.url,
+          method: req.method ?? 'GET',
+          ts: Date.now(),
+          requestHeaders: normalizeHeadersMap(req.headers),
+          ...(typeof req.postData === 'string' ? { postData: req.postData } : {}),
+          ...(req.hasPostData ? { hasPostData: true } : {}),
+        })
         this.networkIdle.onRequestStart(idStr, req.url, params.type ? String(params.type) : undefined)
       }
     })
@@ -740,6 +769,9 @@ class ChromiumTab implements TabDriver {
       const idStr = String(params.requestId ?? '')
       if (idStr) {
         this.networkIdle.onRequestFinish(idStr)
+        if (typeof params.encodedDataLength === 'number') {
+          this.networkRecorder.updateEncodedDataLength(idStr, params.encodedDataLength)
+        }
       }
     })
     this.cdp.on('Network.requestServedFromCache', (params) => {
@@ -750,20 +782,36 @@ class ChromiumTab implements TabDriver {
     })
     this.cdp.on('Network.responseReceived', (params) => {
       const idStr = String(params.requestId ?? '')
-      const res = params.response as { url?: string; status?: number } | undefined
+      const res = params.response as
+        | {
+            url?: string
+            status?: number
+            statusText?: string
+            headers?: Record<string, unknown>
+            mimeType?: string
+            encodedDataLength?: number
+          }
+        | undefined
       const started = this.reqStart.get(idStr)
       this.reqStart.delete(idStr)
       const status = Number(res?.status ?? 0)
-      this.networkLogs.push({
+      this.networkRecorder.record({
+        cdpRequestId: idStr || undefined,
         url: res?.url ?? started?.url ?? '',
         method: started?.method ?? 'GET',
         status,
+        statusText: typeof res?.statusText === 'string' && res.statusText ? res.statusText : undefined,
         ok: status >= 200 && status < 400,
-        resourceType: String(params.type ?? ''),
+        resourceType: params.type ? String(params.type) : undefined,
+        mimeType: typeof res?.mimeType === 'string' && res.mimeType ? res.mimeType : undefined,
+        encodedDataLength: typeof res?.encodedDataLength === 'number' ? res.encodedDataLength : undefined,
         durationMs: started ? Date.now() - started.ts : undefined,
         ts: Date.now(),
+        requestHeaders: started?.requestHeaders,
+        responseHeaders: normalizeHeadersMap(res?.headers),
+        requestBody: started?.postData,
+        hasPostData: started?.hasPostData,
       })
-      if (this.networkLogs.length > 300) this.networkLogs.shift()
     })
     this.cdp.on('Network.loadingFailed', (params) => {
       const idStr = String(params.requestId ?? '')
@@ -789,7 +837,8 @@ class ChromiumTab implements TabDriver {
         }
       }
 
-      this.networkLogs.push({
+      this.networkRecorder.record({
+        cdpRequestId: idStr || undefined,
         url,
         method: started?.method ?? 'GET',
         ok: false,
@@ -798,8 +847,10 @@ class ChromiumTab implements TabDriver {
         ts: Date.now(),
         error: errorText,
         ...(blocked ? { blocked: true, blockedReason } : {}),
+        requestHeaders: started?.requestHeaders,
+        requestBody: started?.postData,
+        hasPostData: started?.hasPostData,
       })
-      if (this.networkLogs.length > 300) this.networkLogs.shift()
     })
     this.cdp.on('Browser.downloadWillBegin', (params) => {
       if (!this.downloads) return
@@ -2080,12 +2131,77 @@ class ChromiumTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
-  getNetwork(opts: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number } = {}): NetworkEntry[] {
-    let items = [...this.networkLogs]
-    if (opts.failedOnly) items = items.filter((i) => !i.ok)
-    if (opts.blockedOnly) items = items.filter((i) => Boolean(i.blocked))
-    if (opts.clear) this.networkLogs = []
-    return items.slice(-(opts.limit ?? 50))
+  getNetwork(opts: NetworkListOptions = {}): NetworkEntry[] {
+    return this.networkRecorder.list(opts)
+  }
+
+  async getNetworkBody(reqId: string, opts: NetworkBodyInspectionOptions = {}): Promise<NetworkBodyResult> {
+    const record = this.networkRecorder.get(reqId)
+    if (!record) {
+      return {
+        ok: false,
+        requestId: reqId,
+        error: `Network request "${reqId}" not found. Run "network" to list captured request IDs.`,
+      }
+    }
+
+    let requestBody = record.requestBody
+    let requestBodyUnavailableReason: string | undefined
+    if (requestBody === undefined && record.hasPostData && record.entry.cdpRequestId) {
+      try {
+        const postRes = await this.cdp.send('Network.getRequestPostData', {
+          requestId: record.entry.cdpRequestId,
+        })
+        if (typeof postRes.postData === 'string') {
+          requestBody = postRes.postData
+          record.requestBody = requestBody
+        }
+      } catch (err) {
+        requestBodyUnavailableReason = `CDP Network.getRequestPostData unavailable: ${String((err as Error)?.message ?? err)}`
+      }
+    }
+
+    let responseBody: string | undefined
+    let responseBase64Encoded = false
+    let responseBodyUnavailableReason: string | undefined
+
+    if (record.cachedResponseBody) {
+      responseBody = record.cachedResponseBody.body
+      responseBase64Encoded = record.cachedResponseBody.base64Encoded
+    } else if (record.entry.blocked) {
+      responseBodyUnavailableReason = `request blocked (${record.entry.blockedReason ?? 'policy'})`
+    } else if (record.entry.error) {
+      responseBodyUnavailableReason = `request failed (${record.entry.error})`
+    } else if (record.entry.status === 204 || record.entry.status === 304) {
+      responseBodyUnavailableReason = `HTTP ${record.entry.status} has no response body`
+    } else if (record.entry.cdpRequestId) {
+      try {
+        const bodyRes = await this.cdp.send('Network.getResponseBody', {
+          requestId: record.entry.cdpRequestId,
+        })
+        const rawBody = typeof bodyRes.body === 'string' ? bodyRes.body : ''
+        const isBase64 = Boolean(bodyRes.base64Encoded)
+        record.cachedResponseBody = { body: rawBody, base64Encoded: isBase64 }
+        responseBody = rawBody
+        responseBase64Encoded = isBase64
+      } catch (err) {
+        responseBodyUnavailableReason = `CDP Network.getResponseBody unavailable: ${String((err as Error)?.message ?? err)}`
+      }
+    } else {
+      responseBodyUnavailableReason = 'response body unavailable'
+    }
+
+    return buildNetworkBodyResult(
+      record,
+      {
+        requestBody,
+        requestBodyUnavailableReason,
+        responseBody,
+        responseBase64Encoded,
+        responseBodyUnavailableReason,
+      },
+      opts,
+    )
   }
 
   getDialogs(opts: { type?: DialogType; limit?: number; clear?: boolean } = {}): DialogEntry[] {

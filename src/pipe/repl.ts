@@ -412,6 +412,62 @@ export async function executePipeCommand(
       })
       return { output: format(res) }
     }
+    case 'network': {
+      const tokens = tokenizePipeArgs(argStr)
+      let body: string | undefined
+      let failedOnly = false
+      let blockedOnly = false
+      let clear = false
+      let method: string | undefined
+      let urlFilter: string | undefined
+      let prettyJson: boolean | undefined
+      let revealHeaders = false
+      let includeBinary = false
+      let maxBodyChars: number | undefined
+      let limit: number | undefined
+
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok === '--body' && tokens[i + 1]) body = tokens[++i]
+        else if (tok.startsWith('--body=')) body = tok.slice('--body='.length)
+        else if (tok === '--failed') failedOnly = true
+        else if (tok === '--blocked') blockedOnly = true
+        else if (tok === '--clear' || tok === 'clear') clear = true
+        else if (tok === '--raw') prettyJson = false
+        else if (tok === '--reveal') revealHeaders = true
+        else if (tok === '--binary') includeBinary = true
+        else if (tok === '--method' && tokens[i + 1]) method = tokens[++i]
+        else if (tok.startsWith('--method=')) method = tok.slice('--method='.length)
+        else if (tok === '--url-filter' && tokens[i + 1]) urlFilter = tokens[++i]
+        else if (tok.startsWith('--url-filter=')) urlFilter = tok.slice('--url-filter='.length)
+        else if (tok === '--max-chars' && tokens[i + 1]) maxBodyChars = Number(tokens[++i])
+        else if (tok.startsWith('--max-chars=')) maxBodyChars = Number(tok.slice('--max-chars='.length))
+        else if (tok === '--limit' && tokens[i + 1]) limit = Number(tokens[++i])
+        else if (tok.startsWith('--limit=')) limit = Number(tok.slice('--limit='.length))
+      }
+
+      const res = await manager.runTool(
+        undefined,
+        'page_network',
+        body
+          ? {
+              body,
+              ...(prettyJson !== undefined ? { prettyJson } : {}),
+              ...(revealHeaders ? { revealHeaders: true } : {}),
+              ...(includeBinary ? { includeBinary: true } : {}),
+              ...(maxBodyChars !== undefined && Number.isFinite(maxBodyChars) ? { maxBodyChars } : {}),
+            }
+          : {
+              failedOnly,
+              blockedOnly,
+              clear,
+              ...(method ? { method } : {}),
+              ...(urlFilter ? { urlFilter } : {}),
+              ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+            },
+      )
+      return { output: format(res) }
+    }
     default:
       return { output: opts.jsonMode ? JSON.stringify({ ok: false, error: `unknown command: ${verb}` }) : `ERR: unknown command "${verb}" (try "help")` }
   }

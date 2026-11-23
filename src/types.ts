@@ -129,16 +129,76 @@ export interface ConsoleEntry {
 }
 
 export interface NetworkEntry {
+  /** Stable request identifier within the tab (e.g. `req-1`, `req-2`) for body inspection. */
+  requestId?: string
+  /** Underlying CDP requestId when captured via Chromium CDP. */
+  cdpRequestId?: string
   url: string
   method: string
   status?: number
+  statusText?: string
   ok: boolean
   resourceType?: string
+  mimeType?: string
+  encodedDataLength?: number
   durationMs?: number
   ts: number
   error?: string
   blocked?: boolean
   blockedReason?: string
+  hasRequestBody?: boolean
+  hasResponseBody?: boolean
+}
+
+export interface NetworkListOptions {
+  clear?: boolean
+  failedOnly?: boolean
+  blockedOnly?: boolean
+  method?: string
+  urlFilter?: string
+  limit?: number
+}
+
+export interface NetworkBodyInspectionOptions {
+  /** Maximum characters to return per body (default: 32768, clamped 256..262144). */
+  maxBodyChars?: number
+  /** Pretty-print JSON bodies when valid JSON (default: true). */
+  prettyJson?: boolean
+  /** Reveal sensitive headers (Authorization, Cookie, X-API-Key, etc.) instead of masking (default: false). */
+  revealHeaders?: boolean
+  /** Include raw base64 payload for binary responses (default: false). */
+  includeBinary?: boolean
+}
+
+export interface NetworkBodyPayload {
+  /** Body text (UTF-8 decoded, optionally pretty-printed, or base64 if `base64Encoded` is true). */
+  body?: string
+  /** True when `body` is base64-encoded binary data. */
+  base64Encoded?: boolean
+  /** Original byte size before truncation. */
+  sizeBytes?: number
+  /** True when `body` was truncated to `maxBodyChars`. */
+  truncated?: boolean
+  /** True when the payload is detected as binary (image, audio, video, pdf, octet-stream, etc.). */
+  isBinary?: boolean
+  /** MIME type of the payload if known. */
+  mimeType?: string
+  /** True when valid JSON was pretty-printed. */
+  prettyPrinted?: boolean
+  /** Explanation when body is unavailable (e.g. evicted from CDP buffer, blocked, failed, or binary omitted). */
+  unavailableReason?: string
+}
+
+export interface NetworkBodyResult {
+  ok: boolean
+  requestId: string
+  entry?: NetworkEntry
+  requestHeaders?: Record<string, string>
+  responseHeaders?: Record<string, string>
+  requestBody?: NetworkBodyPayload
+  responseBody?: NetworkBodyPayload
+  ascii?: string
+  error?: string
 }
 
 export type TrackerBlockMode = 'fetch' | 'network' | 'both' | 'off'

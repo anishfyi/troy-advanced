@@ -20,7 +20,10 @@ import type {
   EmulationOptions,
   EmulationProfile,
   EmulationUpdateMode,
+  NetworkBodyInspectionOptions,
+  NetworkBodyResult,
   NetworkEntry,
+  NetworkListOptions,
   OriginStorageSnapshot,
   PageSnapshot,
   SettleOptions,
@@ -53,7 +56,8 @@ export interface TabDriver {
   evaluate(expression: string): Promise<unknown>
   screenshot(opts?: { fullPage?: boolean }): Promise<Buffer | null>
   getConsole(opts?: { clear?: boolean; level?: string; limit?: number }): ConsoleEntry[]
-  getNetwork(opts?: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number }): NetworkEntry[]
+  getNetwork(opts?: NetworkListOptions): NetworkEntry[]
+  getNetworkBody?(reqId: string, opts?: NetworkBodyInspectionOptions): Promise<NetworkBodyResult>
   getDialogs?(opts?: { type?: DialogType; limit?: number; clear?: boolean }): DialogEntry[]
   getBlockedTrackerStats?(): BlockedTrackerStats
   getStorage(opts?: { area?: StorageArea; keyPrefix?: string }): Promise<OriginStorageSnapshot>
