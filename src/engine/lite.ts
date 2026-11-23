@@ -44,15 +44,7 @@ import type {
 } from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
-import {
-  cookieMatchesUrl,
-  cookieStorageKey,
-  domainFilterMatches,
-  filterCookies,
-  isCookieExpired,
-  normalizeCookie,
-  parseSetCookieHeader,
-} from './cookies.js'
+import { CookieJar } from './cookie-jar.js'
 import { DialogManager } from './dialogs.js'
 import {
   NetworkRecorder,
@@ -646,7 +638,7 @@ class LiteTab implements TabDriver {
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
   private networkRecorder = new NetworkRecorder()
-  private cookies: Map<string, BrowserCookie>
+  private cookieJar: CookieJar
   private localStorageByOrigin: Map<string, Map<string, string>>
   private sessionStorageByOrigin = new Map<string, Map<string, string>>()
   private emulation: EmulationProfile
@@ -655,14 +647,14 @@ class LiteTab implements TabDriver {
 
   constructor(
     id: number,
-    cookies: Map<string, BrowserCookie>,
+    cookieJar: CookieJar,
     localStorageByOrigin: Map<string, Map<string, string>>,
     initialEmulation?: EmulationProfile,
     downloads?: DownloadQuarantineManager,
     dialogs?: DialogManager,
   ) {
     this.id = id
-    this.cookies = cookies
+    this.cookieJar = cookieJar
     this.localStorageByOrigin = localStorageByOrigin
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.downloads = downloads
@@ -695,41 +687,11 @@ class LiteTab implements TabDriver {
   }
 
   private cookieHeaderFor(targetUrl: string): string | undefined {
-    try {
-      const nowSec = Math.floor(Date.now() / 1000)
-      const pairs: string[] = []
-      for (const [k, cookie] of this.cookies) {
-        if (isCookieExpired(cookie, nowSec)) {
-          this.cookies.delete(k)
-          continue
-        }
-        if (cookieMatchesUrl(cookie, targetUrl, nowSec)) {
-          pairs.push(`${cookie.name}=${cookie.value}`)
-        }
-      }
-      return pairs.length > 0 ? pairs.join('; ') : undefined
-    } catch {
-      return undefined
-    }
+    return this.cookieJar.getCookieHeader(targetUrl)
   }
 
   private storeCookies(targetUrl: string, headers: Headers): void {
-    try {
-      const nowSec = Math.floor(Date.now() / 1000)
-      const setCookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : []
-      for (const raw of setCookies) {
-        const parsed = parseSetCookieHeader(raw, targetUrl, nowSec)
-        if (!parsed) continue
-        const key = cookieStorageKey(parsed)
-        if (isCookieExpired(parsed, nowSec)) {
-          this.cookies.delete(key)
-        } else {
-          this.cookies.set(key, parsed)
-        }
-      }
-    } catch {
-      // ignore invalid cookies
-    }
+    this.cookieJar.setFromHeaders(headers, targetUrl)
   }
 
   private async fetchPage(targetUrl: string, init?: RequestInit, pushHistory = true): Promise<{ url: string; title: string }> {
@@ -738,33 +700,95 @@ class LiteTab implements TabDriver {
     }
     this.loading = true
     const started = Date.now()
-    const headers = new Headers()
-    for (const [k, v] of Object.entries(this.emulation.extraHeaders)) {
-      headers.set(k, v)
-    }
-    if (init?.headers) {
-      const initHeaders = new Headers(init.headers)
-      initHeaders.forEach((v, k) => headers.set(k, v))
-    }
-    if (!headers.has('user-agent')) {
-      headers.set('user-agent', this.emulation.userAgent)
-    }
-    if (this.emulation.acceptLanguage && !headers.has('accept-language')) {
-      headers.set('accept-language', this.emulation.acceptLanguage)
-    }
-    if (!headers.has('accept')) {
-      headers.set('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
-    }
-    const cookie = this.cookieHeaderFor(targetUrl)
-    if (cookie) headers.set('cookie', cookie)
-
-    const requestHeadersMap = normalizeHeadersMap(headers)
-    const requestBodyStr = serializeRequestInitBody(init?.body)
+    const MAX_REDIRECTS = 10
+    let currentUrl = targetUrl
+    let currentInit: RequestInit = { ...init }
+    let requestHeadersMap: Record<string, string> = {}
+    let requestBodyStr = serializeRequestInitBody(currentInit.body)
 
     try {
-      const res = await fetch(targetUrl, { ...init, headers, redirect: 'follow' })
-      this.storeCookies(res.url || targetUrl, res.headers)
-      const finalUrl = res.url || targetUrl
+      let res: Response | null = null
+      for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+        if (isTrackerHost(currentUrl)) {
+          throw new Error(`Blocked tracker host: ${currentUrl}`)
+        }
+        const hopHeaders = new Headers()
+        for (const [k, v] of Object.entries(this.emulation.extraHeaders)) {
+          hopHeaders.set(k, v)
+        }
+        if (currentInit.headers) {
+          const initHeaders = new Headers(currentInit.headers)
+          initHeaders.forEach((v, k) => hopHeaders.set(k, v))
+        }
+        if (!hopHeaders.has('user-agent')) {
+          hopHeaders.set('user-agent', this.emulation.userAgent)
+        }
+        if (this.emulation.acceptLanguage && !hopHeaders.has('accept-language')) {
+          hopHeaders.set('accept-language', this.emulation.acceptLanguage)
+        }
+        if (!hopHeaders.has('accept')) {
+          hopHeaders.set('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
+        }
+        const cookie = this.cookieHeaderFor(currentUrl)
+        if (cookie) {
+          hopHeaders.set('cookie', cookie)
+        } else {
+          hopHeaders.delete('cookie')
+        }
+
+        requestHeadersMap = normalizeHeadersMap(hopHeaders)
+        requestBodyStr = serializeRequestInitBody(currentInit.body)
+
+        res = await fetch(currentUrl, { ...currentInit, headers: hopHeaders, redirect: 'manual' })
+        this.storeCookies(currentUrl, res.headers)
+
+        const isRedirect = res.status >= 300 && res.status < 400
+        const location = res.headers.get('location')
+        if (isRedirect && location) {
+          if (hop === MAX_REDIRECTS) {
+            throw new Error(`Too many redirects (>${MAX_REDIRECTS}) while fetching ${targetUrl}`)
+          }
+          const prevOrigin = new URL(currentUrl).origin
+          const nextUrl = new URL(location, currentUrl).toString()
+          const nextOrigin = new URL(nextUrl).origin
+
+          try {
+            await res.body?.cancel()
+          } catch {
+            // ignore body cancellation errors
+          }
+
+          const prevMethod = (currentInit.method ?? 'GET').toUpperCase()
+          const nextInit: RequestInit = { ...currentInit }
+          if (nextInit.headers) {
+            const cleaned = new Headers(nextInit.headers)
+            cleaned.delete('cookie')
+            if (prevOrigin !== nextOrigin) {
+              cleaned.delete('authorization')
+            }
+            nextInit.headers = cleaned
+          }
+          if (res.status === 303 || ((res.status === 301 || res.status === 302) && prevMethod === 'POST')) {
+            nextInit.method = 'GET'
+            delete nextInit.body
+            if (nextInit.headers) {
+              const cleaned = new Headers(nextInit.headers)
+              cleaned.delete('content-type')
+              cleaned.delete('content-length')
+              nextInit.headers = cleaned
+            }
+          }
+          currentUrl = nextUrl
+          currentInit = nextInit
+          continue
+        }
+        break
+      }
+
+      if (!res) {
+        throw new Error(`No response received while fetching ${targetUrl}`)
+      }
+      const finalUrl = currentUrl
       const contentType = res.headers.get('content-type') ?? ''
       const contentDisposition = res.headers.get('content-disposition')
       const responseHeadersMap = normalizeHeadersMap(res.headers)
@@ -1305,6 +1329,10 @@ class LiteTab implements TabDriver {
 export interface LiteEngineOptions {
   emulation?: EmulationOptions
   profileDir?: string
+  /** Custom path for persistent cookies.json (default: `<profileDir>/cookies.json`). Pass `null` to disable disk persistence. */
+  cookieJarPath?: string | null
+  /** Whether to persist session cookies (without Expires/Max-Age) to cookies.json. Default: false. */
+  persistSessionCookies?: boolean
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
 }
@@ -1313,7 +1341,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   readonly kind = 'lite' as const
   readonly cdpPort = 0
   private nextId = 1
-  private cookies = new Map<string, BrowserCookie>()
+  private cookieJar: CookieJar
   private localStorageByOrigin = new Map<string, Map<string, string>>()
   private defaultEmulation: EmulationProfile
   private downloads: DownloadQuarantineManager
@@ -1321,11 +1349,25 @@ export class LiteBrowserEngine implements BrowserEngine {
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
+    const cookieJarPath =
+      opts.cookieJarPath !== undefined
+        ? opts.cookieJarPath
+        : opts.profileDir
+          ? path.join(opts.profileDir, 'cookies.json')
+          : null
+    this.cookieJar = new CookieJar({
+      filePath: cookieJarPath,
+      persistSessionCookies: opts.persistSessionCookies,
+    })
     const defaultQuarantineDir = opts.profileDir
       ? path.join(opts.profileDir, 'quarantine')
       : path.join(os.tmpdir(), `troy-advanced-lite-quarantine-${process.pid}`)
     this.downloads = new DownloadQuarantineManager(opts.downloads, defaultQuarantineDir)
     this.dialogs = new DialogManager(opts.dialogs)
+  }
+
+  getCookieJar(): CookieJar {
+    return this.cookieJar
   }
 
   getDefaultEmulation(): EmulationProfile {
@@ -1396,7 +1438,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   async createTab(initialUrl?: string): Promise<TabDriver> {
     const tab = new LiteTab(
       this.nextId++,
-      this.cookies,
+      this.cookieJar,
       this.localStorageByOrigin,
       this.defaultEmulation,
       this.downloads,
@@ -1409,49 +1451,15 @@ export class LiteBrowserEngine implements BrowserEngine {
   }
 
   async exportCookies(opts: CookieExportOptions = {}): Promise<BrowserCookie[]> {
-    return filterCookies([...this.cookies.values()], opts)
+    return this.cookieJar.exportCookies(opts)
   }
 
   async importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult> {
-    let imported = 0
-    let skipped = 0
-    const errors: string[] = []
-    const nowSec = Math.floor(Date.now() / 1000)
-
-    for (const raw of cookies) {
-      const cookie = normalizeCookie(raw as unknown as Partial<BrowserCookie> & Record<string, unknown>)
-      if (!cookie) {
-        skipped++
-        errors.push(`Invalid cookie skipped: ${String((raw as { name?: unknown })?.name ?? '<unnamed>')}`)
-        continue
-      }
-      const key = cookieStorageKey(cookie)
-      if (isCookieExpired(cookie, nowSec)) {
-        this.cookies.delete(key)
-        skipped++
-        continue
-      }
-      this.cookies.set(key, cookie)
-      imported++
-    }
-
-    return { imported, skipped, errors }
+    return this.cookieJar.importCookies(cookies)
   }
 
   async clearCookies(opts: { domain?: string } = {}): Promise<number> {
-    if (!opts.domain) {
-      const count = this.cookies.size
-      this.cookies.clear()
-      return count
-    }
-    let removed = 0
-    for (const [key, cookie] of this.cookies) {
-      if (domainFilterMatches(cookie.domain, opts.domain)) {
-        this.cookies.delete(key)
-        removed++
-      }
-    }
-    return removed
+    return this.cookieJar.clear(opts)
   }
 
   getEngineStorage(opts: { origin?: string; area?: StorageArea; keyPrefix?: string } = {}): OriginStorageSnapshot[] {
@@ -1534,7 +1542,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   }
 
   async close(): Promise<void> {
-    this.cookies.clear()
+    this.cookieJar.close()
     this.localStorageByOrigin.clear()
   }
 }

@@ -228,8 +228,16 @@ describe('Lite engine + Agent Socket + CLI cookies export/import (M23)', () => {
   })
 
   it('transfers signed-in session between two Lite daemons via CLI encrypted file and stdin/stdout pipe', async () => {
-    const mgrA = await BrowserManager.create({ engine: 'lite', memoryEnabled: false })
-    const mgrB = await BrowserManager.create({ engine: 'lite', memoryEnabled: false })
+    const mgrA = await BrowserManager.create({
+      engine: 'lite',
+      profileDir: path.join(tmpDir, 'lite-a'),
+      memoryEnabled: false,
+    })
+    const mgrB = await BrowserManager.create({
+      engine: 'lite',
+      profileDir: path.join(tmpDir, 'lite-b'),
+      memoryEnabled: false,
+    })
     const sockA = await createAgentSocket(mgrA)
     const sockB = await createAgentSocket(mgrB)
 

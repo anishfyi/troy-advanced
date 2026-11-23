@@ -37,7 +37,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M30: Remote CDP proxy support (`--cdp-url ws://...` or `http://...`) for driving Chrome on another EC2 node or SSH tunnel
 
 ## Track 3: Zero-Chrome Lite Engine Depth (Milestones 31–42)
-- [ ] M31: Persistent file-backed CookieJar (`cookies.json`, `0o600`) with domain/path/expiry/Secure/HttpOnly handling in Lite engine
+- [x] M31: Persistent file-backed CookieJar (`cookies.json`, `0o600`) with domain/path/expiry/Secure/HttpOnly handling in Lite engine
 - [ ] M32: Proper HTML entity decoding table (named HTML5 entities + numeric decimal/hex)
 - [ ] M33: Nested `<label><input .../></label>` implicit label association in Lite HTML parser
 - [ ] M34: Support `<meta http-equiv="refresh">` and `<base href="...">` resolution in Lite engine
