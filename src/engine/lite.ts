@@ -73,6 +73,11 @@ import { decodeHtmlEntities } from './html-entities.js'
 import { parseKeyChord } from './keyboard.js'
 import { waitForPageSettle } from './settle.js'
 import {
+  detectStructuredKind,
+  parseStructuredDocument,
+  type StructuredKind,
+} from './structured-view.js'
+import {
   filterStorageSnapshots,
   normalizeOriginStorageSnapshot,
   normalizeStorageArea,
@@ -1415,6 +1420,11 @@ class LiteTab implements TabDriver {
   private doc: ParsedDoc = { title: 'New Tab', blocks: [], elements: [], text: '', forms: new Map() }
   private detailsOpenOverrides = new Map<string, boolean>()
   private dialogOpenOverrides = new Map<string, boolean>()
+  private structuredKind: StructuredKind | null = null
+  private structuredCollapsed = new Map<string, boolean>()
+  private structuredFocusPath: string | null = null
+  private structuredContainerPaths: string[] = []
+  private structuredRootPath = '$'
   private historyStack: string[] = []
   private historyIndex = -1
   private consoleLogs: ConsoleEntry[] = []
@@ -1617,8 +1627,9 @@ class LiteTab implements TabDriver {
         const hopContentType = res.headers.get('content-type') ?? ''
         const hopContentDisp = res.headers.get('content-disposition')
         const isDownload = Boolean(this.downloads && isDownloadResponse(hopContentDisp, hopContentType))
-        const isPlainOrJson = hopContentType.includes('application/json') || hopContentType.includes('text/plain')
-        if (!isDownload && !isPlainOrJson) {
+        const isPlain = hopContentType.toLowerCase().includes('text/plain')
+        const isStructuredByMime = detectStructuredKind(hopContentType, '', currentUrl) !== null
+        if (!isDownload && !isPlain && !isStructuredByMime) {
           preReadBody = await res.text()
           preParsedDoc = parseHtmlDocument(preReadBody, currentUrl)
           const mr = preParsedDoc.metaRefresh
@@ -1718,7 +1729,29 @@ class LiteTab implements TabDriver {
       this.rawHtml = body
       this.detailsOpenOverrides.clear()
       this.dialogOpenOverrides.clear()
-      if (contentType.includes('application/json') || contentType.includes('text/plain')) {
+      this.structuredKind = null
+      this.structuredCollapsed.clear()
+      this.structuredFocusPath = null
+      this.structuredContainerPaths = []
+      this.structuredRootPath = '$'
+
+      const structuredKind = detectStructuredKind(contentType, body, finalUrl)
+      if (structuredKind) {
+        this.structuredKind = structuredKind
+        const parsed = parseStructuredDocument(structuredKind, body, finalUrl, {
+          collapsedPaths: this.structuredCollapsed,
+          focusPath: this.structuredFocusPath,
+        })
+        this.structuredContainerPaths = parsed.containerPaths
+        this.structuredRootPath = parsed.rootPath
+        this.doc = {
+          title: parsed.title,
+          blocks: parsed.blocks,
+          elements: parsed.elements,
+          text: parsed.text,
+          forms: new Map(),
+        }
+      } else if (contentType.toLowerCase().includes('text/plain')) {
         const title = new URL(finalUrl).pathname || finalUrl
         this.doc = {
           title,
@@ -1947,10 +1980,60 @@ class LiteTab implements TabDriver {
     }
   }
 
+  private reparseStructuredView(): void {
+    if (!this.structuredKind) return
+    const parsed = parseStructuredDocument(this.structuredKind, this.rawHtml, this.url, {
+      collapsedPaths: this.structuredCollapsed,
+      focusPath: this.structuredFocusPath,
+    })
+    this.structuredContainerPaths = parsed.containerPaths
+    this.structuredRootPath = parsed.rootPath
+    this.doc = {
+      title: parsed.title,
+      blocks: parsed.blocks,
+      elements: parsed.elements,
+      text: parsed.text,
+      forms: new Map(),
+    }
+    this.title = this.doc.title || this.url
+  }
+
   async click(selector: string): Promise<{ ok: boolean; note?: string }> {
     const el = this.doc.elements.find((e) => e.selector === selector)
     if (!el) return { ok: false, note: `element ${selector} not found` }
     if (el.disabled) return { ok: false, note: `element ${selector} is disabled` }
+
+    if (this.structuredKind) {
+      if (selector.startsWith('json-toggle:') || selector.startsWith('xml-toggle:')) {
+        const targetPath = selector.slice(selector.indexOf(':') + 1)
+        const currentlyExpanded = Boolean(el.checked)
+        this.structuredCollapsed.set(targetPath, currentlyExpanded)
+        this.reparseStructuredView()
+        return { ok: true, note: currentlyExpanded ? `collapsed ${targetPath}` : `expanded ${targetPath}` }
+      }
+      if (selector.startsWith('json-focus:') || selector.startsWith('xml-focus:')) {
+        const targetPath = selector.slice(selector.indexOf(':') + 1)
+        this.structuredFocusPath = targetPath === this.structuredRootPath ? null : targetPath
+        this.scrollY = 0
+        this.reparseStructuredView()
+        return { ok: true, note: `focused ${targetPath}` }
+      }
+      if (selector === 'json-action:expand-all' || selector === 'xml-action:expand-all') {
+        for (const p of this.structuredContainerPaths) {
+          this.structuredCollapsed.set(p, false)
+        }
+        this.reparseStructuredView()
+        return { ok: true, note: 'expanded all nodes' }
+      }
+      if (selector === 'json-action:collapse-all' || selector === 'xml-action:collapse-all') {
+        const activeRoot = this.structuredFocusPath ?? this.structuredRootPath
+        for (const p of this.structuredContainerPaths) {
+          this.structuredCollapsed.set(p, p !== activeRoot)
+        }
+        this.reparseStructuredView()
+        return { ok: true, note: 'collapsed all nodes' }
+      }
+    }
 
     const detailsKey = this.doc.detailsBySummarySelector?.get(selector)
     if (detailsKey) {
