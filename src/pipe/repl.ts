@@ -5,6 +5,7 @@
 
 import readline from 'node:readline'
 import type { BrowserManager } from '../engine/manager.js'
+import { parseDialogMode, parseDialogType } from '../engine/dialogs.js'
 import { parseDownloadMode } from '../engine/downloads.js'
 import { parseHeaderList } from '../engine/emulation.js'
 
@@ -366,6 +367,48 @@ export async function executePipeCommand(
         clear,
         ...(mode ? { mode } : {}),
         ...(removeId ? { removeId } : {}),
+      })
+      return { output: format(res) }
+    }
+    case 'dialogs': {
+      const tokens = tokenizePipeArgs(argStr)
+      let clear = false
+      let clearQueue = false
+      let allTabs = true
+      let mode: string | undefined
+      let type: string | undefined
+      let queueAccept: boolean | undefined
+      let promptText: string | undefined
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok === '--clear' || tok === 'clear') clear = true
+        else if (tok === '--clear-queue') clearQueue = true
+        else if ((tok === '--mode' || tok === 'mode') && tokens[i + 1]) mode = tokens[++i]
+        else if (tok.startsWith('--mode=')) mode = tok.slice('--mode='.length)
+        else if ((tok === '--type' || tok === 'type') && tokens[i + 1]) type = tokens[++i]
+        else if (tok.startsWith('--type=')) type = tok.slice('--type='.length)
+        else if (tok === '--next' && tokens[i + 1]) {
+          const val = tokens[++i]!.toLowerCase()
+          if (val === 'accept') queueAccept = true
+          else if (val === 'dismiss') queueAccept = false
+        } else if (tok === '--prompt-text' && tokens[i + 1]) {
+          promptText = tokens[++i]
+        } else if (tok.startsWith('--prompt-text=')) {
+          promptText = tok.slice('--prompt-text='.length)
+        } else if (parseDialogMode(tok)) {
+          mode = tok
+        } else if (parseDialogType(tok)) {
+          type = tok
+        }
+      }
+      const res = await manager.runTool(undefined, 'page_dialogs', {
+        allTabs,
+        clear,
+        clearQueue,
+        ...(mode ? { mode } : {}),
+        ...(type ? { type } : {}),
+        ...(queueAccept !== undefined ? { queueAccept } : {}),
+        ...(promptText !== undefined ? { promptText } : {}),
       })
       return { output: format(res) }
     }

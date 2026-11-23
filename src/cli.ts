@@ -5,6 +5,7 @@ import path from 'node:path'
 import type {
   BrowserCookie,
   CrashRecoveryOptions,
+  DialogPolicyOptions,
   DownloadPolicyOptions,
   EmulationOptions,
   EngineKind,
@@ -13,6 +14,7 @@ import type {
   TrackerBlockMode,
 } from './types.js'
 import { BrowserManager } from './engine/manager.js'
+import { parseDialogMode, parseDialogType } from './engine/dialogs.js'
 import { parseDownloadMode } from './engine/downloads.js'
 import { parseHeaderList } from './engine/emulation.js'
 import {
@@ -76,6 +78,8 @@ Client Commands (talk to running daemon, or use --oneshot):
   console | network | eval <expr>         Inspect tab diagnostics or evaluate JS
   downloads [--blocked] [--clear] [--mode quarantine|deny|allow] [--remove <id>] [--json]
                                           Inspect intercepted/quarantined/blocked auto-downloads or update policy
+  dialogs [--type alert|confirm|prompt|beforeunload] [--mode dismiss|accept] [--next accept|dismiss] [--prompt-text <str>] [--clear] [--clear-queue] [--json]
+                                          Inspect captured JS dialogs, configure auto-dismiss/accept policy, or queue next response
   act <json-steps> [--allow-submit]       Run batched action list
   grant <origin>                          Extend origin autonomy boundary
   recall <query> | forget [origin]        Query or clear persistent page memory
@@ -243,6 +247,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
             : {}),
         }
       : undefined
+  const dialogModeFlag = parseDialogMode(flags['dialog-mode'])
+  const dialogPromptFlag =
+    typeof flags['dialog-prompt-text'] === 'string' ? flags['dialog-prompt-text'] : undefined
+  const dialogDismissBeforeUnloadFlag = Boolean(flags['dialog-dismiss-beforeunload'])
+  const dialogsOpts: DialogPolicyOptions | undefined =
+    dialogModeFlag || dialogPromptFlag !== undefined || dialogDismissBeforeUnloadFlag
+      ? {
+          ...(dialogModeFlag ? { mode: dialogModeFlag } : {}),
+          ...(dialogPromptFlag !== undefined ? { defaultPromptText: dialogPromptFlag } : {}),
+          ...(dialogDismissBeforeUnloadFlag ? { acceptBeforeUnload: false } : {}),
+        }
+      : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -309,6 +325,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       emulation: cliEmulation,
       crashRecovery,
       downloads: downloadsOpts,
+      dialogs: dialogsOpts,
     }
 
     if (sub === 'run') {
@@ -347,6 +364,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       emulation: cliEmulation,
       crashRecovery,
       downloads: downloadsOpts,
+      dialogs: dialogsOpts,
     })
     try {
       await runTerminalBrowser(manager, {
@@ -368,6 +386,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       emulation: cliEmulation,
       crashRecovery,
       downloads: downloadsOpts,
+      dialogs: dialogsOpts,
     })
     try {
       await runMcpStdioServer(manager)
@@ -386,6 +405,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       emulation: cliEmulation,
       crashRecovery,
       downloads: downloadsOpts,
+      dialogs: dialogsOpts,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1130,6 +1150,30 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     }
+    case 'dialogs': {
+      const modeArg = parseDialogMode(flags.mode) ?? parseDialogMode(args[0])
+      const typeArg = parseDialogType(flags.type) ?? parseDialogType(args[0])
+      const nextRaw = typeof flags.next === 'string' ? flags.next.trim().toLowerCase() : undefined
+      const queueAccept =
+        nextRaw === 'accept' ? true : nextRaw === 'dismiss' ? false : undefined
+      res = await callDaemon(live.endpoint, '/dialogs', {
+        ...(tabId !== undefined ? { tabId } : {}),
+        ...(typeArg ? { type: typeArg } : {}),
+        ...(modeArg ? { mode: modeArg } : {}),
+        ...(typeof flags['default-prompt-text'] === 'string'
+          ? { defaultPromptText: flags['default-prompt-text'] }
+          : {}),
+        ...(flags['dismiss-beforeunload'] ? { acceptBeforeUnload: false } : {}),
+        ...(flags['accept-beforeunload'] ? { acceptBeforeUnload: true } : {}),
+        ...(queueAccept !== undefined ? { queueAccept } : {}),
+        ...(typeof flags['prompt-text'] === 'string' ? { promptText: flags['prompt-text'] } : {}),
+        ...(parseDialogType(flags['queue-type']) ? { queueType: parseDialogType(flags['queue-type']) } : {}),
+        clearQueue: Boolean(flags['clear-queue']),
+        clear: Boolean(flags.clear),
+        ...(flags.limit !== undefined ? { limit: Number(flags.limit) } : {}),
+      })
+      break
+    }
     default:
       console.error(`Unknown command: ${cmd}\nRun "troy-advanced help" for usage.`)
       process.exit(1)
@@ -1137,7 +1181,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   if (
     !flags.json &&
-    (cmd === 'ascii' || cmd === 'visual' || cmd === 'emulate' || cmd === 'viewport' || cmd === 'downloads' || flags.ascii) &&
+    (cmd === 'ascii' ||
+      cmd === 'visual' ||
+      cmd === 'emulate' ||
+      cmd === 'viewport' ||
+      cmd === 'downloads' ||
+      cmd === 'dialogs' ||
+      flags.ascii) &&
     typeof res.ascii === 'string'
   ) {
     console.log(res.ascii)

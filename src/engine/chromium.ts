@@ -17,6 +17,12 @@ import type {
   CrashRecoveryOptions,
   CrashRecoveryStats,
   CrashRecoveryStatus,
+  DialogEntry,
+  DialogEvent,
+  DialogPolicyOptions,
+  DialogQueuedResponse,
+  DialogStats,
+  DialogType,
   DownloadEntry,
   DownloadEvent,
   DownloadPolicyOptions,
@@ -53,6 +59,7 @@ import {
   resolveCrashRecoveryOptions,
   shouldRestoreTabUrl,
 } from './crash-recovery.js'
+import { DialogManager } from './dialogs.js'
 import { DownloadQuarantineManager } from './downloads.js'
 import { cloneEmulationProfile, defaultEmulationProfile, resolveEmulationProfile } from './emulation.js'
 import {
@@ -608,6 +615,7 @@ class ChromiumTab implements TabDriver {
   private emulation: EmulationProfile
   private recoveryHost?: ChromiumTabRecoveryHost
   private downloads?: DownloadQuarantineManager
+  private dialogs?: DialogManager
 
   constructor(
     id: number,
@@ -618,6 +626,7 @@ class ChromiumTab implements TabDriver {
     initialEmulation?: EmulationProfile,
     recoveryHost?: ChromiumTabRecoveryHost,
     downloads?: DownloadQuarantineManager,
+    dialogs?: DialogManager,
   ) {
     this.id = id
     this.targetId = targetId
@@ -626,6 +635,7 @@ class ChromiumTab implements TabDriver {
     this.trackerBlocking = trackerBlocking
     this.recoveryHost = recoveryHost
     this.downloads = downloads
+    this.dialogs = dialogs
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.trackerBlocker = this.createTrackerBlocker(cdp)
     this.bindCdpListeners()
@@ -824,6 +834,42 @@ class ChromiumTab implements TabDriver {
       if (shouldCancel) {
         void this.cdp.send('Browser.cancelDownload', { guid }).catch(() => {})
       }
+    })
+    this.cdp.on('Page.javascriptDialogOpening', (params) => {
+      const type = typeof params.type === 'string' ? params.type : 'alert'
+      const message = typeof params.message === 'string' ? params.message : ''
+      const url = typeof params.url === 'string' ? params.url : this.url
+      const defaultPrompt = typeof params.defaultPrompt === 'string' ? params.defaultPrompt : undefined
+      const hasBrowserHandler = typeof params.hasBrowserHandler === 'boolean' ? params.hasBrowserHandler : undefined
+
+      if (this.dialogs) {
+        const decision = this.dialogs.handleOpening({
+          tabId: this.id,
+          type,
+          message,
+          url,
+          defaultPrompt,
+          hasBrowserHandler,
+        })
+        const cdpParams: Record<string, unknown> = { accept: decision.accept }
+        if (decision.entry.type === 'prompt' && decision.accept) {
+          cdpParams.promptText = decision.promptText ?? ''
+        }
+        void this.cdp.send('Page.handleJavaScriptDialog', cdpParams).catch(() => {})
+      } else {
+        // Safety fallback: never allow a modal dialog to hang headless execution
+        void this.cdp
+          .send('Page.handleJavaScriptDialog', { accept: type === 'beforeunload' })
+          .catch(() => {})
+      }
+    })
+    this.cdp.on('Page.javascriptDialogClosed', (params) => {
+      if (!this.dialogs) return
+      this.dialogs.recordClosed({
+        tabId: this.id,
+        result: typeof params.result === 'boolean' ? params.result : undefined,
+        userInput: typeof params.userInput === 'string' ? params.userInput : undefined,
+      })
     })
   }
 
@@ -2042,6 +2088,10 @@ class ChromiumTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
+  getDialogs(opts: { type?: DialogType; limit?: number; clear?: boolean } = {}): DialogEntry[] {
+    return this.dialogs ? this.dialogs.list({ ...opts, tabId: this.id }) : []
+  }
+
   getBlockedTrackerStats(): BlockedTrackerStats {
     return this.trackerBlocker.getStats()
   }
@@ -2213,6 +2263,7 @@ export interface ChromiumLaunchOptions {
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
   downloads?: DownloadPolicyOptions
+  dialogs?: DialogPolicyOptions
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
@@ -2227,6 +2278,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   private defaultEmulation: EmulationProfile
   private recoveryOpts: Required<CrashRecoveryOptions>
   private downloads: DownloadQuarantineManager
+  private dialogs: DialogManager
   private closing = false
   private status: CrashRecoveryStatus = 'healthy'
   private restartCount = 0
@@ -2252,6 +2304,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     defaultEmulation?: EmulationProfile
     crashRecovery?: CrashRecoveryOptions
     downloads?: DownloadPolicyOptions
+    dialogs?: DialogPolicyOptions
   }) {
     this._cdpPort = cfg.cdpPort
     this.preferredCdpPort = cfg.preferredCdpPort
@@ -2265,6 +2318,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       ? path.join(cfg.profileDir, 'quarantine')
       : path.join(os.tmpdir(), `troy-advanced-quarantine-${process.pid}`)
     this.downloads = new DownloadQuarantineManager(cfg.downloads, defaultQuarantineDir)
+    this.dialogs = new DialogManager(cfg.dialogs)
     if (this.proc) {
       this.attachProcessExitHandler(this.proc)
     }
@@ -2434,6 +2488,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         defaultEmulation: initialEmulation,
         crashRecovery: { ...opts.crashRecovery, enabled: false },
         downloads: opts.downloads,
+        dialogs: opts.dialogs,
       })
     }
 
@@ -2462,6 +2517,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       defaultEmulation: initialEmulation,
       crashRecovery: opts.crashRecovery,
       downloads: opts.downloads,
+      dialogs: opts.dialogs,
     })
   }
 
@@ -2670,6 +2726,38 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     return this.downloads.onEvent(fn)
   }
 
+  getDialogs(opts?: { tabId?: number; type?: DialogType; limit?: number; clear?: boolean }): DialogEntry[] {
+    return this.dialogs.list(opts)
+  }
+
+  getDialogStats(): DialogStats {
+    return this.dialogs.getStats()
+  }
+
+  setDialogPolicy(opts: DialogPolicyOptions): DialogStats {
+    return this.dialogs.setPolicy(opts)
+  }
+
+  queueDialogResponse(resp: DialogQueuedResponse): DialogStats {
+    return this.dialogs.queueResponse(resp)
+  }
+
+  getDialogQueue(): DialogQueuedResponse[] {
+    return this.dialogs.getQueue()
+  }
+
+  clearDialogQueue(): number {
+    return this.dialogs.clearQueue()
+  }
+
+  clearDialogs(opts?: { tabId?: number }): number {
+    return this.dialogs.clear(opts)
+  }
+
+  onDialogEvent(fn: (ev: DialogEvent) => void): () => void {
+    return this.dialogs.onEvent(fn)
+  }
+
   async createTab(initialUrl?: string): Promise<TabDriver> {
     const tab = await this.withRecovery(async () => {
       const target = await this.openNewTarget(this._cdpPort)
@@ -2688,6 +2776,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
           },
         },
         this.downloads,
+        this.dialogs,
       )
       await created.init()
       this.liveTabs.add(created)

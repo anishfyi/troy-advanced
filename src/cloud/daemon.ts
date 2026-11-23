@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type {
   CrashRecoveryOptions,
+  DialogPolicyOptions,
   DownloadPolicyOptions,
   EmulationOptions,
   EngineKind,
@@ -34,6 +35,7 @@ export interface DaemonOptions {
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
   downloads?: DownloadPolicyOptions
+  dialogs?: DialogPolicyOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -46,6 +48,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     emulation: opts.emulation,
     crashRecovery: opts.crashRecovery,
     downloads: opts.downloads,
+    dialogs: opts.dialogs,
   })
 
   if (opts.initialUrl) {
@@ -144,6 +147,13 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.crashRecovery?.maxRestarts !== undefined) args.push('--max-restarts', String(opts.crashRecovery.maxRestarts))
   if (opts.downloads?.mode) args.push('--download-mode', opts.downloads.mode)
   if (opts.downloads?.maxBytes !== undefined) args.push('--download-max-bytes', String(opts.downloads.maxBytes))
+  if (opts.dialogs?.mode) args.push('--dialog-mode', opts.dialogs.mode)
+  if (opts.dialogs?.defaultPromptText !== undefined) {
+    args.push('--dialog-prompt-text', opts.dialogs.defaultPromptText)
+  }
+  if (opts.dialogs?.acceptBeforeUnload === false) {
+    args.push('--dialog-dismiss-beforeunload')
+  }
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport
     if (typeof vp === 'string') {

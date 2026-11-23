@@ -6,6 +6,12 @@ import type {
   CookieImportResult,
   CrashRecoveryEvent,
   CrashRecoveryStats,
+  DialogEntry,
+  DialogEvent,
+  DialogPolicyOptions,
+  DialogQueuedResponse,
+  DialogStats,
+  DialogType,
   DownloadEntry,
   DownloadEvent,
   DownloadPolicyOptions,
@@ -48,6 +54,7 @@ export interface TabDriver {
   screenshot(opts?: { fullPage?: boolean }): Promise<Buffer | null>
   getConsole(opts?: { clear?: boolean; level?: string; limit?: number }): ConsoleEntry[]
   getNetwork(opts?: { clear?: boolean; failedOnly?: boolean; blockedOnly?: boolean; limit?: number }): NetworkEntry[]
+  getDialogs?(opts?: { type?: DialogType; limit?: number; clear?: boolean }): DialogEntry[]
   getBlockedTrackerStats?(): BlockedTrackerStats
   getStorage(opts?: { area?: StorageArea; keyPrefix?: string }): Promise<OriginStorageSnapshot>
   setStorage(
@@ -78,6 +85,14 @@ export interface BrowserEngine {
   clearDownloads?(opts?: { deleteFiles?: boolean }): { cleared: number; removedFiles: number }
   removeDownload?(id: string): { ok: boolean; removedFile: boolean; error?: string }
   onDownloadEvent?(fn: (ev: DownloadEvent) => void): () => void
+  getDialogs?(opts?: { tabId?: number; type?: DialogType; limit?: number; clear?: boolean }): DialogEntry[]
+  getDialogStats?(): DialogStats
+  setDialogPolicy?(opts: DialogPolicyOptions): DialogStats
+  queueDialogResponse?(resp: DialogQueuedResponse): DialogStats
+  getDialogQueue?(): DialogQueuedResponse[]
+  clearDialogQueue?(): number
+  clearDialogs?(opts?: { tabId?: number }): number
+  onDialogEvent?(fn: (ev: DialogEvent) => void): () => void
   exportCookies(opts?: CookieExportOptions): Promise<BrowserCookie[]>
   importCookies(cookies: BrowserCookie[]): Promise<CookieImportResult>
   clearCookies?(opts?: { domain?: string }): Promise<number>

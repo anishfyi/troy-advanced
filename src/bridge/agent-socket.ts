@@ -6,6 +6,7 @@ import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { parseAsciiDensity } from '../ascii/layout.js'
 import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnapshot } from '../types.js'
+import { formatDialogsAscii, parseDialogMode, parseDialogType } from '../engine/dialogs.js'
 import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
@@ -50,6 +51,7 @@ export async function createAgentSocket(
             tabs: manager.listTabs().length,
             crashRecovery: manager.getCrashRecoveryStats(),
             downloads: manager.getDownloadStats(),
+            dialogs: manager.getDialogStats(),
           },
         }
       case '/tabs':
@@ -355,6 +357,60 @@ export async function createAgentSocket(
             entries,
             stats,
             ascii: formatDownloadsAscii(entries, stats),
+          },
+        }
+      }
+      case '/dialogs': {
+        if (body.clearQueue) {
+          manager.clearDialogQueue()
+        }
+        const mode = parseDialogMode(body.mode)
+        const hasPolicyUpdate =
+          Boolean(mode) ||
+          typeof body.acceptBeforeUnload === 'boolean' ||
+          typeof body.defaultPromptText === 'string'
+        if (hasPolicyUpdate) {
+          manager.setDialogPolicy({
+            ...(mode ? { mode } : {}),
+            ...(typeof body.acceptBeforeUnload === 'boolean' ? { acceptBeforeUnload: body.acceptBeforeUnload } : {}),
+            ...(typeof body.defaultPromptText === 'string' ? { defaultPromptText: body.defaultPromptText } : {}),
+          })
+        }
+        if (body.next && typeof body.next === 'object') {
+          const nextObj = body.next as Record<string, unknown>
+          if (typeof nextObj.accept === 'boolean') {
+            manager.queueDialogResponse({
+              accept: nextObj.accept,
+              ...(typeof nextObj.promptText === 'string' ? { promptText: nextObj.promptText } : {}),
+              ...(parseDialogType(nextObj.type) ? { type: parseDialogType(nextObj.type) } : {}),
+            })
+          }
+        } else if (typeof body.queueAccept === 'boolean') {
+          manager.queueDialogResponse({
+            accept: body.queueAccept,
+            ...(typeof body.promptText === 'string' ? { promptText: body.promptText } : {}),
+            ...(parseDialogType(body.queueType) ? { type: parseDialogType(body.queueType) } : {}),
+          })
+        }
+        const tabId = typeof body.tabId === 'number' ? body.tabId : undefined
+        const type = parseDialogType(body.type)
+        const entries = manager.getDialogs({
+          tabId,
+          type,
+          limit: typeof body.limit === 'number' ? body.limit : 100,
+          clear: Boolean(body.clear),
+        })
+        const stats = manager.getDialogStats()
+        const queue = manager.getDialogQueue()
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            count: entries.length,
+            entries,
+            stats,
+            queue,
+            ascii: formatDialogsAscii(entries, stats, queue),
           },
         }
       }

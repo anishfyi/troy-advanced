@@ -207,6 +207,52 @@ const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: 'troy_dialogs',
+    description:
+      'Inspect captured JavaScript dialogs (alert/confirm/prompt/beforeunload), update auto-handle policy (dismiss|accept), or queue a one-shot response for the next dialog so headless runs never hang.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        allTabs: { type: 'boolean', description: 'Return dialogs from all tabs instead of just the target tab' },
+        type: {
+          type: 'string',
+          enum: ['alert', 'confirm', 'prompt', 'beforeunload'],
+          description: 'Filter captured dialogs by dialog type',
+        },
+        mode: {
+          type: 'string',
+          enum: ['dismiss', 'accept'],
+          description: 'Update default dialog auto-handling mode',
+        },
+        acceptBeforeUnload: {
+          type: 'boolean',
+          description: 'Whether to auto-accept beforeunload dialogs (default true)',
+        },
+        defaultPromptText: {
+          type: 'string',
+          description: 'Default text supplied when accepting prompt() dialogs',
+        },
+        queueAccept: {
+          type: 'boolean',
+          description: 'Queue a one-shot accept (true) or dismiss (false) response for the next dialog',
+        },
+        promptText: {
+          type: 'string',
+          description: 'Prompt input text paired with queueAccept=true',
+        },
+        queueType: {
+          type: 'string',
+          enum: ['alert', 'confirm', 'prompt', 'beforeunload'],
+          description: 'Optional dialog type filter for the queued one-shot response',
+        },
+        clearQueue: { type: 'boolean', description: 'Clear all queued one-shot dialog responses' },
+        clear: { type: 'boolean', description: 'Clear captured dialog history after returning' },
+        limit: { type: 'number', description: 'Maximum entries to return (default 100)' },
+      },
+    },
+  },
 ]
 
 export async function handleMcpRequest(
@@ -368,6 +414,21 @@ export async function handleMcpRequest(
           maxBytes: args.maxBytes,
           clear: args.clear,
           removeId: args.removeId,
+          limit: args.limit,
+        })
+        break
+      case 'troy_dialogs':
+        result = await manager.runTool(tabId, 'page_dialogs', {
+          allTabs: args.allTabs,
+          type: args.type,
+          mode: args.mode,
+          acceptBeforeUnload: args.acceptBeforeUnload,
+          defaultPromptText: args.defaultPromptText,
+          queueAccept: args.queueAccept,
+          promptText: args.promptText,
+          queueType: args.queueType,
+          clearQueue: args.clearQueue,
+          clear: args.clear,
           limit: args.limit,
         })
         break

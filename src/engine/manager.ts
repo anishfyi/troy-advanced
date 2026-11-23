@@ -12,6 +12,11 @@ import type {
   CookieImportResult,
   CrashRecoveryOptions,
   CrashRecoveryStats,
+  DialogEntry,
+  DialogPolicyOptions,
+  DialogQueuedResponse,
+  DialogStats,
+  DialogType,
   DownloadEntry,
   DownloadPolicyOptions,
   DownloadStats,
@@ -59,6 +64,7 @@ import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
 import { ChromiumBrowserEngine, findChromeBinary } from './chromium.js'
 import { defaultDisabledCrashRecoveryStats } from './crash-recovery.js'
+import { formatDialogsAscii, parseDialogMode, parseDialogType } from './dialogs.js'
 import {
   DEFAULT_DOWNLOAD_MAX_BYTES,
   formatDownloadsAscii,
@@ -116,6 +122,7 @@ export interface BrowserManagerOptions {
   emulation?: EmulationOptions
   crashRecovery?: CrashRecoveryOptions
   downloads?: DownloadPolicyOptions
+  dialogs?: DialogPolicyOptions
 }
 
 export class BrowserManager {
@@ -128,6 +135,7 @@ export class BrowserManager {
   private eventListeners = new Set<(event: Record<string, unknown>) => void>()
   private unsubscribeCrash?: () => void
   private unsubscribeDownloads?: () => void
+  private unsubscribeDialogs?: () => void
 
   private constructor(engine: BrowserEngine, profileDir: string, memory: PageMemory | null) {
     this.engine = engine
@@ -148,6 +156,11 @@ export class BrowserManager {
         this.emit({ type: ev.kind, download: ev.entry })
       })
     }
+    if (engine.onDialogEvent) {
+      this.unsubscribeDialogs = engine.onDialogEvent((ev) => {
+        this.emit({ type: ev.kind, dialog: ev.entry })
+      })
+    }
   }
 
   static async create(opts: BrowserManagerOptions = {}): Promise<BrowserManager> {
@@ -162,7 +175,12 @@ export class BrowserManager {
     let engine: BrowserEngine
     const requested = opts.engine ?? 'auto'
     if (requested === 'lite') {
-      engine = new LiteBrowserEngine({ emulation: opts.emulation, profileDir, downloads: downloadsOpts })
+      engine = new LiteBrowserEngine({
+        emulation: opts.emulation,
+        profileDir,
+        downloads: downloadsOpts,
+        dialogs: opts.dialogs,
+      })
     } else if (requested === 'chromium') {
       engine = await ChromiumBrowserEngine.launch({
         chromeBin: opts.chromeBin,
@@ -173,6 +191,7 @@ export class BrowserManager {
         emulation: opts.emulation,
         crashRecovery: opts.crashRecovery,
         downloads: downloadsOpts,
+        dialogs: opts.dialogs,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -187,12 +206,23 @@ export class BrowserManager {
             emulation: opts.emulation,
             crashRecovery: opts.crashRecovery,
             downloads: downloadsOpts,
+            dialogs: opts.dialogs,
           })
         } catch {
-          engine = new LiteBrowserEngine({ emulation: opts.emulation, profileDir, downloads: downloadsOpts })
+          engine = new LiteBrowserEngine({
+            emulation: opts.emulation,
+            profileDir,
+            downloads: downloadsOpts,
+            dialogs: opts.dialogs,
+          })
         }
       } else {
-        engine = new LiteBrowserEngine({ emulation: opts.emulation, profileDir, downloads: downloadsOpts })
+        engine = new LiteBrowserEngine({
+          emulation: opts.emulation,
+          profileDir,
+          downloads: downloadsOpts,
+          dialogs: opts.dialogs,
+        })
       }
     }
 
@@ -560,6 +590,57 @@ export class BrowserManager {
 
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const session = this.resolveSession(tabId)
+    if (name === 'page_dialogs') {
+      if (args.clearQueue) {
+        this.clearDialogQueue()
+      }
+      const mode = parseDialogMode(args.mode)
+      const hasPolicyUpdate =
+        Boolean(mode) ||
+        typeof args.acceptBeforeUnload === 'boolean' ||
+        typeof args.defaultPromptText === 'string'
+      if (hasPolicyUpdate) {
+        this.setDialogPolicy({
+          ...(mode ? { mode } : {}),
+          ...(typeof args.acceptBeforeUnload === 'boolean' ? { acceptBeforeUnload: args.acceptBeforeUnload } : {}),
+          ...(typeof args.defaultPromptText === 'string' ? { defaultPromptText: args.defaultPromptText } : {}),
+        })
+      }
+      if (args.next && typeof args.next === 'object') {
+        const nextObj = args.next as Record<string, unknown>
+        if (typeof nextObj.accept === 'boolean') {
+          this.queueDialogResponse({
+            accept: nextObj.accept,
+            ...(typeof nextObj.promptText === 'string' ? { promptText: nextObj.promptText } : {}),
+            ...(parseDialogType(nextObj.type) ? { type: parseDialogType(nextObj.type) } : {}),
+          })
+        }
+      } else if (typeof args.queueAccept === 'boolean') {
+        this.queueDialogResponse({
+          accept: args.queueAccept,
+          ...(typeof args.promptText === 'string' ? { promptText: args.promptText } : {}),
+          ...(parseDialogType(args.queueType) ? { type: parseDialogType(args.queueType) } : {}),
+        })
+      }
+      const dialogType = parseDialogType(args.type)
+      const filterTabId = args.allTabs === true ? undefined : session?.driver.id
+      const entries = this.getDialogs({
+        tabId: filterTabId,
+        type: dialogType,
+        limit: typeof args.limit === 'number' ? args.limit : 100,
+        clear: Boolean(args.clear),
+      })
+      const stats = this.getDialogStats()
+      const queue = this.getDialogQueue()
+      return {
+        ok: true,
+        count: entries.length,
+        entries,
+        stats,
+        queue,
+        ascii: formatDialogsAscii(entries, stats, queue),
+      }
+    }
     if (!session) return { ok: false, error: 'no such tab', code: 'no-tab' }
     this.refreshOrigins()
     const ctx = () => ({ tabId: session.driver.id, url: session.driver.getUrl(), epoch: session.driver.getEpoch() })
@@ -1751,11 +1832,65 @@ export class BrowserManager {
       : { ok: false, removedFile: false, error: 'downloads not supported by engine' }
   }
 
+  getDialogs(opts?: { tabId?: number; type?: DialogType; limit?: number; clear?: boolean }): DialogEntry[] {
+    return this.engine.getDialogs ? this.engine.getDialogs(opts) : []
+  }
+
+  getDialogStats(): DialogStats {
+    if (this.engine.getDialogStats) {
+      return this.engine.getDialogStats()
+    }
+    return {
+      mode: 'dismiss',
+      acceptBeforeUnload: true,
+      queuedCount: 0,
+      total: 0,
+      alerts: 0,
+      confirms: 0,
+      prompts: 0,
+      beforeUnloads: 0,
+      accepted: 0,
+      dismissed: 0,
+    }
+  }
+
+  setDialogPolicy(opts: DialogPolicyOptions): DialogStats {
+    if (this.engine.setDialogPolicy) {
+      const stats = this.engine.setDialogPolicy(opts)
+      this.emit({ type: 'dialog_policy_updated', stats })
+      return stats
+    }
+    return this.getDialogStats()
+  }
+
+  queueDialogResponse(resp: DialogQueuedResponse): DialogStats {
+    if (this.engine.queueDialogResponse) {
+      const stats = this.engine.queueDialogResponse(resp)
+      this.emit({ type: 'dialog_response_queued', response: resp, stats })
+      return stats
+    }
+    return this.getDialogStats()
+  }
+
+  getDialogQueue(): DialogQueuedResponse[] {
+    return this.engine.getDialogQueue ? this.engine.getDialogQueue() : []
+  }
+
+  clearDialogQueue(): number {
+    return this.engine.clearDialogQueue ? this.engine.clearDialogQueue() : 0
+  }
+
+  clearDialogs(opts?: { tabId?: number }): number {
+    return this.engine.clearDialogs ? this.engine.clearDialogs(opts) : 0
+  }
+
   async close(): Promise<void> {
     this.unsubscribeCrash?.()
     this.unsubscribeCrash = undefined
     this.unsubscribeDownloads?.()
     this.unsubscribeDownloads = undefined
+    this.unsubscribeDialogs?.()
+    this.unsubscribeDialogs = undefined
     for (const s of this.tabs.values()) {
       await s.driver.close().catch(() => {})
     }

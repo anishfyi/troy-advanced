@@ -10,6 +10,12 @@ import type {
   ContentBlock,
   CookieExportOptions,
   CookieImportResult,
+  DialogEntry,
+  DialogEvent,
+  DialogPolicyOptions,
+  DialogQueuedResponse,
+  DialogStats,
+  DialogType,
   DownloadEntry,
   DownloadEvent,
   DownloadPolicyOptions,
@@ -44,6 +50,7 @@ import {
   normalizeCookie,
   parseSetCookieHeader,
 } from './cookies.js'
+import { DialogManager } from './dialogs.js'
 import {
   DownloadQuarantineManager,
   isDownloadResponse,
@@ -635,6 +642,7 @@ class LiteTab implements TabDriver {
   private sessionStorageByOrigin = new Map<string, Map<string, string>>()
   private emulation: EmulationProfile
   private downloads?: DownloadQuarantineManager
+  private dialogs?: DialogManager
 
   constructor(
     id: number,
@@ -642,12 +650,14 @@ class LiteTab implements TabDriver {
     localStorageByOrigin: Map<string, Map<string, string>>,
     initialEmulation?: EmulationProfile,
     downloads?: DownloadQuarantineManager,
+    dialogs?: DialogManager,
   ) {
     this.id = id
     this.cookies = cookies
     this.localStorageByOrigin = localStorageByOrigin
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.downloads = downloads
+    this.dialogs = dialogs
   }
 
   getEmulation(): EmulationProfile {
@@ -1127,6 +1137,10 @@ class LiteTab implements TabDriver {
     return items.slice(-(opts.limit ?? 50))
   }
 
+  getDialogs(opts: { type?: DialogType; limit?: number; clear?: boolean } = {}): DialogEntry[] {
+    return this.dialogs ? this.dialogs.list({ ...opts, tabId: this.id }) : []
+  }
+
   async getStorage(opts: { area?: StorageArea; keyPrefix?: string } = {}): Promise<OriginStorageSnapshot> {
     const origin = normalizeStorageOrigin(this.url)
     if (!origin) return { origin: '', localStorage: {}, sessionStorage: {} }
@@ -1229,6 +1243,7 @@ export interface LiteEngineOptions {
   emulation?: EmulationOptions
   profileDir?: string
   downloads?: DownloadPolicyOptions
+  dialogs?: DialogPolicyOptions
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -1239,6 +1254,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   private localStorageByOrigin = new Map<string, Map<string, string>>()
   private defaultEmulation: EmulationProfile
   private downloads: DownloadQuarantineManager
+  private dialogs: DialogManager
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
@@ -1246,6 +1262,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       ? path.join(opts.profileDir, 'quarantine')
       : path.join(os.tmpdir(), `troy-advanced-lite-quarantine-${process.pid}`)
     this.downloads = new DownloadQuarantineManager(opts.downloads, defaultQuarantineDir)
+    this.dialogs = new DialogManager(opts.dialogs)
   }
 
   getDefaultEmulation(): EmulationProfile {
@@ -1281,6 +1298,38 @@ export class LiteBrowserEngine implements BrowserEngine {
     return this.downloads.onEvent(fn)
   }
 
+  getDialogs(opts?: { tabId?: number; type?: DialogType; limit?: number; clear?: boolean }): DialogEntry[] {
+    return this.dialogs.list(opts)
+  }
+
+  getDialogStats(): DialogStats {
+    return this.dialogs.getStats()
+  }
+
+  setDialogPolicy(opts: DialogPolicyOptions): DialogStats {
+    return this.dialogs.setPolicy(opts)
+  }
+
+  queueDialogResponse(resp: DialogQueuedResponse): DialogStats {
+    return this.dialogs.queueResponse(resp)
+  }
+
+  getDialogQueue(): DialogQueuedResponse[] {
+    return this.dialogs.getQueue()
+  }
+
+  clearDialogQueue(): number {
+    return this.dialogs.clearQueue()
+  }
+
+  clearDialogs(opts?: { tabId?: number }): number {
+    return this.dialogs.clear(opts)
+  }
+
+  onDialogEvent(fn: (ev: DialogEvent) => void): () => void {
+    return this.dialogs.onEvent(fn)
+  }
+
   async createTab(initialUrl?: string): Promise<TabDriver> {
     const tab = new LiteTab(
       this.nextId++,
@@ -1288,6 +1337,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       this.localStorageByOrigin,
       this.defaultEmulation,
       this.downloads,
+      this.dialogs,
     )
     if (initialUrl) {
       await tab.navigate(initialUrl)

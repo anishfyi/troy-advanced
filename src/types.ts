@@ -587,3 +587,67 @@ export interface DownloadEvent {
   kind: DownloadEventKind
   entry: DownloadEntry
 }
+
+export type DialogType = 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+
+export type DialogPolicyMode = 'dismiss' | 'accept'
+
+export type DialogAction = 'accepted' | 'dismissed'
+
+export interface DialogQueuedResponse {
+  accept: boolean
+  promptText?: string
+  type?: DialogType
+}
+
+export interface DialogPolicyOptions {
+  /**
+   * Default handling for JavaScript dialogs (`alert`, `confirm`, `prompt`, `beforeunload`):
+   * - 'dismiss' (default): auto-dismiss dialogs so headless runs never hang (note: `beforeunload` defaults to accept unless `acceptBeforeUnload: false`).
+   * - 'accept': auto-accept dialogs, supplying `defaultPromptText` (or the page's default prompt) for `prompt()`.
+   */
+  mode?: DialogPolicyMode
+  /** Default text entered when accepting a `prompt()` dialog without a queued override. */
+  defaultPromptText?: string
+  /** Whether to accept `beforeunload` dialogs so headless navigation is never stalled (default: true). */
+  acceptBeforeUnload?: boolean
+  /** Maximum number of captured dialogs retained in memory (default: 200). */
+  maxHistory?: number
+}
+
+export interface DialogEntry {
+  id: string
+  tabId?: number
+  type: DialogType
+  message: string
+  url: string
+  defaultPrompt?: string
+  action: DialogAction
+  accepted: boolean
+  promptText?: string
+  handledBy: 'policy' | 'queue'
+  hasBrowserHandler?: boolean
+  ts: number
+  closedAt?: number
+}
+
+export interface DialogStats {
+  mode: DialogPolicyMode
+  acceptBeforeUnload: boolean
+  defaultPromptText?: string
+  queuedCount: number
+  total: number
+  alerts: number
+  confirms: number
+  prompts: number
+  beforeUnloads: number
+  accepted: number
+  dismissed: number
+}
+
+export type DialogEventKind = 'dialog_handled' | 'dialog_closed'
+
+export interface DialogEvent {
+  kind: DialogEventKind
+  entry: DialogEntry
+}
