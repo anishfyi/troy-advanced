@@ -36,7 +36,7 @@ import {
 import { readLiveEndpoint } from './bridge/endpoint.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
 import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
-import { runMcpStdioServer } from './mcp/server.js'
+import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import { runPipeRepl } from './pipe/repl.js'
 import { runTerminalBrowser } from './tui/terminal-browser.js'
 import { parseInspectorTab } from './tui/inspector.js'
@@ -53,8 +53,8 @@ Daemon & Modes:
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Interactive ASCII terminal browser (auto-detects piped/non-TTY fallback)
-  mcp          [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
-                                                         Model Context Protocol stdio server
+  mcp          [--framing auto|ndjson|content-length] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
+                                                         Model Context Protocol stdio server (auto-detects NDJSON & Content-Length framing)
   pipe         [--json] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Streaming stdin/stdout AI REPL
   doctor       [--json]                                  EC2 / Linux / Chrome environment check
@@ -156,6 +156,7 @@ const VALUE_FLAGS = new Set([
   '--max-chars',
   '--method',
   '--url-filter',
+  '--framing',
 ])
 
 const REPEATABLE_FLAGS = new Set(['--header', '--remove-header'])
@@ -414,6 +415,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   }
 
   if (cmd === 'mcp') {
+    const rawFraming =
+      typeof flags.framing === 'string'
+        ? flags.framing
+        : flags['content-length']
+          ? 'content-length'
+          : flags.ndjson
+            ? 'ndjson'
+            : process.env.TROY_MCP_FRAMING
+    const framing = parseMcpFramingMode(rawFraming)
     const manager = await BrowserManager.create({
       engine,
       profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
@@ -426,7 +436,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       dialogs: dialogsOpts,
     })
     try {
-      await runMcpStdioServer(manager)
+      await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
     } finally {
       await manager.close()
     }

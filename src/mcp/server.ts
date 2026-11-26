@@ -2,8 +2,41 @@
 // Enables Claude Code, Dexter, Codex, Cursor, and any MCP client to drive
 // Troy Advanced in pure ASCII or structured JSON directly on EC2 or local terminals.
 
-import readline from 'node:readline'
 import type { BrowserManager } from '../engine/manager.js'
+import {
+  McpStdioFrameParser,
+  encodeMcpMessage,
+  parseMcpFramingMode,
+  type McpFramingMode,
+  type ParsedMcpFrame,
+  type ResolvedMcpFraming,
+} from './transport.js'
+
+export {
+  McpStdioFrameParser,
+  encodeMcpMessage,
+  parseMcpFramingMode,
+  type McpFramingMode,
+  type McpFrameError,
+  type McpFrameOk,
+  type McpFrameParserOptions,
+  type ParsedMcpFrame,
+  type ResolvedMcpFraming,
+} from './transport.js'
+
+export interface McpStdioServerOptions {
+  /**
+   * Wire framing mode for stdio JSON-RPC messages:
+   * - `auto` (default): auto-detect per-stream between Content-Length and NDJSON, matching responses to the incoming framing
+   * - `ndjson`: newline-delimited JSON-RPC (one JSON object per line)
+   * - `content-length`: LSP/MCP `Content-Length: <utf8-bytes>\r\n\r\n<json>` framed transport
+   */
+  framing?: McpFramingMode
+  /** Maximum allowed Content-Length payload in bytes (default: 16 MiB). */
+  maxFrameBytes?: number
+  /** Maximum allowed header block size in bytes (default: 16 KiB). */
+  maxHeaderBytes?: number
+}
 
 export interface McpResourceDefinition {
   uri: string
@@ -910,29 +943,79 @@ export async function handleMcpRequest(
   }
 }
 
+async function dispatchMcpFrame(
+  manager: BrowserManager,
+  frame: ParsedMcpFrame,
+  output: NodeJS.WritableStream,
+  responseFraming: ResolvedMcpFraming,
+): Promise<void> {
+  if (!frame.ok) {
+    output.write(
+      encodeMcpMessage(
+        {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32700, message: frame.error },
+        },
+        responseFraming,
+      ),
+    )
+    return
+  }
+
+  try {
+    const req = JSON.parse(frame.raw) as {
+      jsonrpc?: string
+      id?: string | number | null
+      method: string
+      params?: Record<string, unknown>
+    }
+    const res = await handleMcpRequest(manager, req)
+    if (res) {
+      output.write(encodeMcpMessage(res, responseFraming))
+    }
+  } catch (err) {
+    output.write(
+      encodeMcpMessage(
+        {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32700, message: String((err as Error)?.message ?? err) },
+        },
+        responseFraming,
+      ),
+    )
+  }
+}
+
 export async function runMcpStdioServer(
   manager: BrowserManager,
   input: NodeJS.ReadableStream = process.stdin,
   output: NodeJS.WritableStream = process.stdout,
+  options: McpStdioServerOptions = {},
 ): Promise<void> {
-  const rl = readline.createInterface({ input, crlfDelay: Infinity })
-  for await (const rawLine of rl) {
-    const line = rawLine.trim()
-    if (!line) continue
-    try {
-      const req = JSON.parse(line) as { jsonrpc?: string; id?: string | number | null; method: string; params?: Record<string, unknown> }
-      const res = await handleMcpRequest(manager, req)
-      if (res) {
-        output.write(`${JSON.stringify(res)}\n`)
-      }
-    } catch (err) {
-      output.write(
-        `${JSON.stringify({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32700, message: String((err as Error)?.message ?? err) },
-        })}\n`,
-      )
+  const mode = parseMcpFramingMode(options.framing)
+  const parser = new McpStdioFrameParser(mode, {
+    maxFrameBytes: options.maxFrameBytes,
+    maxHeaderBytes: options.maxHeaderBytes,
+  })
+
+  const handleFrames = async (frames: ParsedMcpFrame[]) => {
+    for (const frame of frames) {
+      const responseFraming: ResolvedMcpFraming = mode === 'auto' ? frame.framing : mode
+      await dispatchMcpFrame(manager, frame, output, responseFraming)
     }
   }
+
+  for await (const chunk of input as AsyncIterable<Buffer | Uint8Array | string>) {
+    const normalized =
+      typeof chunk === 'string'
+        ? chunk
+        : Buffer.isBuffer(chunk)
+          ? chunk
+          : Buffer.from(chunk)
+    await handleFrames(parser.push(normalized))
+  }
+
+  await handleFrames(parser.flush())
 }
