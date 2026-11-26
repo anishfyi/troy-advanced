@@ -66,7 +66,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M55: Headless PTY / simulated stream unit tests covering every TUI interaction
 
 ## Track 5: Deep AI Agent & Protocol Integration (Milestones 56–70)
-- [ ] M56: Full MCP resources (`troy://tabs`, `troy://active/ascii`, `troy://memory/stats`) and MCP prompts (`browse_and_extract`, `fill_form_safely`)
+- [x] M56: Full MCP resources (`troy://tabs`, `troy://active/ascii`, `troy://memory/stats`) and MCP prompts (`browse_and_extract`, `fill_form_safely`)
 - [ ] M57: MCP `Content-Length` framed stdio transport option alongside NDJSON line mode for maximum MCP client compatibility
 - [ ] M58: Claude Code / Dexter / Codex ready-to-use `SKILL.md` and `.claude-plugin/plugin.json` inside `skills/troy-advanced/`
 - [ ] M59: OpenAI / Anthropic / Gemini JSON tool-schema generator (`troy-advanced schema --format openai|anthropic|gemini|mcp`)
