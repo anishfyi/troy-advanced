@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "troy-advanced": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@anishfyi/troy-advanced",
+        "mcp",
+        "--framing",
+        "auto",
+        "--engine",
+        "auto"
+      ]
+    }
+  }
+}

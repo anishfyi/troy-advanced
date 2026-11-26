@@ -1,0 +1,26 @@
+{
+  "name": "troy-advanced",
+  "version": "0.1.0",
+  "description": "Terminal-native, EC2-ready, ASCII-rendered AI browser with headless Chromium CDP, zero-Chrome Lite engine, Set-of-Marks ASCII screenshots, Troy Agent Socket, and native MCP server.",
+  "author": {
+    "name": "Anish Kumar",
+    "email": "anishfyi@gmail.com"
+  },
+  "homepage": "https://github.com/anishfyi/troy-advanced",
+  "repository": "https://github.com/anishfyi/troy-advanced",
+  "license": "MIT",
+  "keywords": [
+    "browser",
+    "ai-agent",
+    "ascii",
+    "terminal",
+    "ec2",
+    "headless",
+    "cdp",
+    "mcp",
+    "troy",
+    "automation"
+  ],
+  "skills": "./",
+  "mcpServers": "./.mcp.json"
+}
