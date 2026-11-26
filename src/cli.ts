@@ -1,6 +1,7 @@
 // CLI entrypoint for `troy-advanced`.
 
 import { fileURLToPath } from 'node:url'
+import fs from 'node:fs'
 import path from 'node:path'
 import type {
   BrowserCookie,
@@ -37,6 +38,11 @@ import { readLiveEndpoint } from './bridge/endpoint.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
 import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
+import {
+  TOOL_SCHEMA_FORMATS,
+  formatToolSchemasJson,
+  parseToolSchemaFormat,
+} from './mcp/schema.js'
 import { runPipeRepl } from './pipe/repl.js'
 import { runTerminalBrowser } from './tui/terminal-browser.js'
 import { parseInspectorTab } from './tui/inspector.js'
@@ -55,6 +61,8 @@ Daemon & Modes:
                                                          Interactive ASCII terminal browser (auto-detects piped/non-TTY fallback)
   mcp          [--framing auto|ndjson|content-length] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Model Context Protocol stdio server (auto-detects NDJSON & Content-Length framing)
+  schema       [--format openai|anthropic|gemini|mcp] [--tools a,b] [--prefix <str>] [--strict] [--compact] [--out <file>]
+                                                         Generate provider-ready JSON tool schemas for OpenAI, Anthropic, Gemini, or MCP
   pipe         [--json] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Streaming stdin/stdout AI REPL
   doctor       [--json]                                  EC2 / Linux / Chrome environment check
@@ -157,6 +165,8 @@ const VALUE_FLAGS = new Set([
   '--method',
   '--url-filter',
   '--framing',
+  '--format',
+  '--tools',
 ])
 
 const REPEATABLE_FLAGS = new Set(['--header', '--remove-header'])
@@ -304,6 +314,68 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (cmd === 'doctor') {
     const report = runDoctor()
     console.log(flags.json ? JSON.stringify(report, null, 2) : formatDoctorAscii(report))
+    return
+  }
+
+  if (cmd === 'schema') {
+    const rawFormat =
+      typeof flags.format === 'string'
+        ? flags.format
+        : typeof positional[1] === 'string'
+          ? positional[1]
+          : 'mcp'
+    const format = parseToolSchemaFormat(rawFormat)
+    if (!format) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            error: `Invalid schema format: "${rawFormat}". Expected one of: ${TOOL_SCHEMA_FORMATS.join(', ')}`,
+          },
+          null,
+          2,
+        ),
+      )
+      process.exit(1)
+    }
+
+    const toolsFilter =
+      typeof flags.tools === 'string'
+        ? flags.tools
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined
+    const prefix = typeof flags.prefix === 'string' ? flags.prefix : undefined
+    const strict = Boolean(flags.strict)
+    const compact = Boolean(flags.compact)
+
+    try {
+      const json = formatToolSchemasJson({
+        format,
+        tools: toolsFilter,
+        prefix,
+        strict,
+        compact,
+      })
+      if (typeof flags.out === 'string' && flags.out.trim()) {
+        const outPath = path.resolve(flags.out.trim())
+        fs.mkdirSync(path.dirname(outPath), { recursive: true })
+        fs.writeFileSync(outPath, `${json}\n`, 'utf8')
+        console.log(JSON.stringify({ ok: true, format, out: outPath }, null, 2))
+      } else {
+        console.log(json)
+      }
+    } catch (err) {
+      console.error(
+        JSON.stringify(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          null,
+          2,
+        ),
+      )
+      process.exit(1)
+    }
     return
   }
 

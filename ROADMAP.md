@@ -69,7 +69,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M56: Full MCP resources (`troy://tabs`, `troy://active/ascii`, `troy://memory/stats`) and MCP prompts (`browse_and_extract`, `fill_form_safely`)
 - [x] M57: MCP `Content-Length` framed stdio transport option alongside NDJSON line mode for maximum MCP client compatibility
 - [x] M58: Claude Code / Dexter / Codex ready-to-use `SKILL.md` and `.claude-plugin/plugin.json` inside `skills/troy-advanced/`
-- [ ] M59: OpenAI / Anthropic / Gemini JSON tool-schema generator (`troy-advanced schema --format openai|anthropic|gemini|mcp`)
+- [x] M59: OpenAI / Anthropic / Gemini JSON tool-schema generator (`troy-advanced schema --format openai|anthropic|gemini|mcp`)
 - [ ] M60: Agent action audit log (`audit.jsonl`) recording every tool call, refusal, timing, and URL transition
 - [ ] M61: Token-budget estimator & auto-trimmer (`--max-tokens N`) that fits ASCII page output cleanly into any LLM context window
 - [ ] M62: Multi-agent tab isolation: named agent sessions (`x-troy-session`) with per-session owned-tab tracking and origin scopes
