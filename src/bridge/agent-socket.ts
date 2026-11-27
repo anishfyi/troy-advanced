@@ -4,7 +4,7 @@
 
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { parseAsciiDensity } from '../ascii/layout.js'
+import { parseAsciiDensity, parseMaxTokens } from '../ascii/layout.js'
 import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnapshot } from '../types.js'
 import { formatDialogsAscii, parseDialogMode, parseDialogType } from '../engine/dialogs.js'
 import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
@@ -89,6 +89,7 @@ export async function createAgentSocket(
         const layoutOpt =
           body.layout === 'spatial' || body.layout === 'auto' || body.layout === 'flow' ? body.layout : undefined
         const densityOpt = parseAsciiDensity(body.density)
+        const maxTokensOpt = parseMaxTokens(body.maxTokens ?? body.max_tokens)
         const res = await manager.renderAscii(tabId, {
           width: typeof body.width === 'number' ? body.width : undefined,
           height: typeof body.height === 'number' ? body.height : undefined,
@@ -99,6 +100,7 @@ export async function createAgentSocket(
           scrollOffset: typeof body.scrollOffset === 'number' ? body.scrollOffset : 0,
           layout: layoutOpt,
           density: densityOpt,
+          maxTokens: maxTokensOpt,
           crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           since: Boolean(body.since),
@@ -114,6 +116,8 @@ export async function createAgentSocket(
                 url: res.snapshot?.url,
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
+                ...(res.estimatedTokens !== undefined ? { estimatedTokens: res.estimatedTokens } : {}),
+                ...(res.tokenBudget ? { tokenBudget: res.tokenBudget } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),

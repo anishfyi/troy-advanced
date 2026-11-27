@@ -113,6 +113,7 @@ export async function executePipeCommand(
     case 'render': {
       let width: number | undefined
       let density: string | undefined
+      let maxTokens: string | undefined
       let crop: string | undefined
       let ref: string | undefined
       let since = false
@@ -127,6 +128,10 @@ export async function executePipeCommand(
           density = rest[++i]
         } else if (tok.startsWith('--density=')) {
           density = tok.slice('--density='.length)
+        } else if (tok === '--max-tokens' && rest[i + 1]) {
+          maxTokens = rest[++i]
+        } else if (tok.startsWith('--max-tokens=')) {
+          maxTokens = tok.slice('--max-tokens='.length)
         } else if (tok === '--crop' && rest[i + 1]) {
           crop = rest[++i]
         } else if (tok.startsWith('--crop=')) {
@@ -141,7 +146,16 @@ export async function executePipeCommand(
           width = Number(tok)
         }
       }
-      const res = await manager.runTool(undefined, 'page_read_ascii', { width, density, crop, ref, since, showMediaSummary, asciiOnly: true })
+      const res = await manager.runTool(undefined, 'page_read_ascii', {
+        width,
+        density,
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+        crop,
+        ref,
+        since,
+        showMediaSummary,
+        asciiOnly: true,
+      })
       return { output: format(res) }
     }
     case 'markdown':

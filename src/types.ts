@@ -242,6 +242,40 @@ export type AsciiLayoutMode = 'flow' | 'spatial' | 'auto'
 
 export type AsciiDensity = 'compact' | 'normal' | 'wide'
 
+export interface TokenEstimate {
+  tokens: number
+  chars: number
+  lines: number
+  words: number
+  bytes: number
+}
+
+export type TokenBudgetStrategy = 'none' | 'compact' | 'trim' | 'compact+trim' | 'hard-truncate'
+
+export interface TokenBudgetReport {
+  maxTokens: number
+  originalTokens: number
+  finalTokens: number
+  trimmed: boolean
+  strategy: TokenBudgetStrategy
+  droppedLines: number
+  preservedRefs: number
+  totalRefs: number
+  originalChars: number
+  finalChars: number
+}
+
+export interface TokenBudgetOptions {
+  /** Prioritize preserving lines with interactive [eN] refs (default: true). */
+  preserveRefs?: boolean
+  /** Prioritize preserving title/URL/heading lines (default: true). */
+  preserveHeadings?: boolean
+  /** Keep truncation marker strict 7-bit ASCII (default: true). */
+  asciiOnly?: boolean
+  /** Optional line width hint for formatting the truncation notice. */
+  width?: number
+}
+
 export interface AsciiRenderOptions {
   width?: number
   height?: number
@@ -262,6 +296,8 @@ export interface AsciiRenderOptions {
   activeTabId?: number
   statusMessage?: string
   focusedRef?: string
+  /** Optional LLM token budget; progressively compacts and trims ASCII output to fit <= maxTokens. */
+  maxTokens?: number
 }
 
 export interface MarkdownRenderOptions {

@@ -46,6 +46,7 @@ import type {
   StorageImportOptions,
   StorageImportResult,
   TabSummary,
+  TokenBudgetReport,
   TrackerBlockingOptions,
 } from '../types.js'
 import {
@@ -60,14 +61,16 @@ import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
 import {
+  estimateTokens,
   extractMediaSummary,
   parseAsciiDensity,
+  parseMaxTokens,
   renderCanvasPreviewAscii,
   renderCompactRefsAscii,
   renderDeltaAscii,
   renderMediaSummaryAscii,
-  renderPageAscii,
   renderPageAsciiWithMetrics,
+  trimAsciiToTokenBudget,
 } from '../ascii/layout.js'
 import { renderPageMarkdown } from '../ascii/markdown.js'
 import { parseCropRect, renderPngToAscii } from '../ascii/pixels.js'
@@ -729,6 +732,8 @@ export class BrowserManager {
       viewportRows: number
     }
     focusedLineIndex?: number
+    estimatedTokens?: number
+    tokenBudget?: TokenBudgetReport
     error?: string
   }> {
     const session = this.resolveSession(tabId)
@@ -740,25 +745,51 @@ export class BrowserManager {
     const prev = session.lastSnapshot
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
+    const maxTokens = parseMaxTokens(opts.maxTokens)
     if (opts.since && prev) {
       const delta = computePageDelta(prev, snap)
-      const ascii = renderDeltaAscii(delta, {
+      let ascii = renderDeltaAscii(delta, {
         width: opts.width,
         asciiOnly: opts.asciiOnly,
         color: opts.color,
         showChrome: opts.showChrome,
         density: opts.density,
       })
-      return { ok: true, mode: 'delta', ascii, snapshot: snap, delta, ...(settleRes ? { settle: settleRes } : {}) }
+      let tokenBudget: TokenBudgetReport | undefined
+      if (maxTokens) {
+        const trimmed = trimAsciiToTokenBudget(ascii, maxTokens, {
+          preserveRefs: true,
+          preserveHeadings: true,
+          asciiOnly: opts.asciiOnly !== false,
+          width: opts.width,
+        })
+        ascii = trimmed.text
+        tokenBudget = trimmed.report
+      }
+      const estimatedTokens = tokenBudget ? tokenBudget.finalTokens : estimateTokens(ascii).tokens
+      return {
+        ok: true,
+        mode: 'delta',
+        ascii,
+        snapshot: snap,
+        delta,
+        estimatedTokens,
+        ...(tokenBudget ? { tokenBudget } : {}),
+        ...(settleRes ? { settle: settleRes } : {}),
+      }
     }
     const { crop: _rawCrop, ref: _rawRef, since: _since, settle: _settle, ...renderOpts } = opts
     const rendered = renderPageAsciiWithMetrics(snap, {
       ...renderOpts,
+      maxTokens,
       crop: cropRes.crop,
       cropLabel: cropRes.cropRef ?? opts.cropLabel,
       tabs: this.listTabs(),
       activeTabId: this.activeTabId ?? snap.tabId,
     })
+    const estimatedTokens = rendered.tokenBudget
+      ? rendered.tokenBudget.finalTokens
+      : estimateTokens(rendered.ascii).tokens
     return {
       ok: true,
       mode: 'full',
@@ -770,6 +801,8 @@ export class BrowserManager {
         totalLines: rendered.totalLines,
         viewportRows: rendered.viewportRows,
       },
+      estimatedTokens,
+      ...(rendered.tokenBudget ? { tokenBudget: rendered.tokenBudget } : {}),
       ...(rendered.focusedLineIndex !== undefined ? { focusedLineIndex: rendered.focusedLineIndex } : {}),
       ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
@@ -1002,20 +1035,36 @@ export class BrowserManager {
         const snap = await this.takeIndexedSnapshot(session)
         session.lastSnapshot = snap
 
+        const maxTokens = parseMaxTokens(args.maxTokens ?? args.max_tokens)
+
         if (args.since && prev) {
           const delta = computePageDelta(prev, snap)
-          const ascii = renderDeltaAscii(delta, {
+          let ascii = renderDeltaAscii(delta, {
             width: typeof args.width === 'number' ? args.width : undefined,
             asciiOnly: args.asciiOnly !== false,
             color: Boolean(args.color),
             showChrome: typeof args.showChrome === 'boolean' ? args.showChrome : undefined,
             density: parseAsciiDensity(args.density),
           })
+          let tokenBudget: TokenBudgetReport | undefined
+          if (maxTokens) {
+            const trimmed = trimAsciiToTokenBudget(ascii, maxTokens, {
+              preserveRefs: true,
+              preserveHeadings: true,
+              asciiOnly: args.asciiOnly !== false,
+              width: typeof args.width === 'number' ? args.width : undefined,
+            })
+            ascii = trimmed.text
+            tokenBudget = trimmed.report
+          }
+          const estimatedTokens = tokenBudget ? tokenBudget.finalTokens : estimateTokens(ascii).tokens
           return capPayload({
             ok: true,
             mode: 'delta',
             ...delta,
             ascii,
+            estimatedTokens,
+            ...(tokenBudget ? { tokenBudget } : {}),
             ...(settleRes ? { settle: settleRes } : {}),
             ...(name === 'page_read_ascii' ? { content: ascii } : {}),
           })
@@ -1024,7 +1073,7 @@ export class BrowserManager {
         const layoutOpt =
           args.layout === 'spatial' || args.layout === 'auto' || args.layout === 'flow' ? args.layout : undefined
         const densityOpt = parseAsciiDensity(args.density)
-        const ascii = renderPageAscii(snap, {
+        const renderedAscii = renderPageAsciiWithMetrics(snap, {
           width: typeof args.width === 'number' ? args.width : undefined,
           height: typeof args.height === 'number' ? args.height : undefined,
           asciiOnly: args.asciiOnly !== false,
@@ -1033,11 +1082,15 @@ export class BrowserManager {
           showMediaSummary: Boolean(args.showMediaSummary),
           layout: layoutOpt,
           density: densityOpt,
+          maxTokens,
           crop: cropRes.crop,
           cropLabel: cropRes.cropRef,
           tabs: this.listTabs(),
           activeTabId: this.activeTabId ?? snap.tabId,
         })
+        const ascii = renderedAscii.ascii
+        const tokenBudget = renderedAscii.tokenBudget
+        const estimatedTokens = tokenBudget ? tokenBudget.finalTokens : estimateTokens(ascii).tokens
 
         let pixelAscii: string | undefined
         if (name === 'page_read_visual') {
@@ -1073,6 +1126,8 @@ export class BrowserManager {
           elementCount: snap.elements.length,
           elements: snap.elements.map(({ selector: _s, ...pub }) => pub),
           ascii,
+          estimatedTokens,
+          ...(tokenBudget ? { tokenBudget } : {}),
           compactRefs: renderCompactRefsAscii(snap),
           ...(media.length > 0 ? { media, mediaSummaryAscii } : {}),
           ...(pixelAscii ? { pixelAscii } : {}),

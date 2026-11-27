@@ -11,9 +11,11 @@ import type {
   InlineLink,
   PageSnapshot,
   Rect,
+  TokenBudgetReport,
 } from '../types.js'
 import { formatMediaMeta, renderMediaSummaryAscii, resolveBlockCanvasPreview } from './media.js'
 import { sanitizeAscii, stripAnsi } from './sanitize.js'
+import { countUniqueRefs, estimateTokens, parseMaxTokens, trimAsciiToTokenBudget } from './token-budget.js'
 
 export { sanitizeAscii, stripAnsi, isStrictAscii } from './sanitize.js'
 
@@ -1528,6 +1530,7 @@ export interface AsciiRenderMetrics {
   scrollOffset: number
   maxScrollOffset: number
   focusedLineIndex?: number
+  tokenBudget?: TokenBudgetReport
 }
 
 export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderOptions = {}): string {
@@ -1535,6 +1538,106 @@ export function renderPageAscii(rawSnapshot: PageSnapshot, options: AsciiRenderO
 }
 
 export function renderPageAsciiWithMetrics(
+  rawSnapshot: PageSnapshot,
+  options: AsciiRenderOptions = {},
+): AsciiRenderMetrics {
+  const maxTokens = parseMaxTokens(options.maxTokens)
+  const initial = renderPageAsciiCore(rawSnapshot, options)
+  if (!maxTokens) return initial
+
+  const origEstimate = estimateTokens(initial.ascii)
+  const totalRefs = countUniqueRefs(initial.ascii)
+  if (origEstimate.tokens <= maxTokens) {
+    return {
+      ...initial,
+      tokenBudget: {
+        maxTokens,
+        originalTokens: origEstimate.tokens,
+        finalTokens: origEstimate.tokens,
+        trimmed: false,
+        strategy: 'none',
+        droppedLines: 0,
+        preservedRefs: totalRefs,
+        totalRefs,
+        originalChars: initial.ascii.length,
+        finalChars: initial.ascii.length,
+      },
+    }
+  }
+
+  // Step 1: Progressive compaction (drop chrome/scrollbar + compact density) if not already minimal
+  const alreadyCompact = options.density === 'compact' && options.showChrome === false
+  let candidate = initial
+  let compacted = false
+  if (!alreadyCompact) {
+    const compactWidth = Math.min(options.width ?? 80, 80)
+    const compactRender = renderPageAsciiCore(rawSnapshot, {
+      ...options,
+      maxTokens: undefined,
+      density: 'compact',
+      showChrome: false,
+      showScrollbar: false,
+      width: compactWidth,
+    })
+    const compactEst = estimateTokens(compactRender.ascii)
+    if (compactEst.tokens <= maxTokens) {
+      const initialLines = initial.ascii.split('\n').length
+      const compactLines = compactRender.ascii.split('\n').length
+      return {
+        ...compactRender,
+        tokenBudget: {
+          maxTokens,
+          originalTokens: origEstimate.tokens,
+          finalTokens: compactEst.tokens,
+          trimmed: true,
+          strategy: 'compact',
+          droppedLines: Math.max(0, initialLines - compactLines),
+          preservedRefs: countUniqueRefs(compactRender.ascii),
+          totalRefs,
+          originalChars: initial.ascii.length,
+          finalChars: compactRender.ascii.length,
+        },
+      }
+    }
+    if (compactEst.tokens < origEstimate.tokens) {
+      candidate = compactRender
+      compacted = true
+    }
+  }
+
+  // Step 2: Priority-preserving line/token trimming
+  const trimmed = trimAsciiToTokenBudget(candidate.ascii, maxTokens, {
+    preserveRefs: true,
+    preserveHeadings: true,
+    asciiOnly: options.asciiOnly ?? true,
+    width: Math.min(options.width ?? 80, 80),
+  })
+  const finalStrategy =
+    trimmed.report.strategy === 'hard-truncate'
+      ? 'hard-truncate'
+      : compacted
+        ? 'compact+trim'
+        : trimmed.report.strategy
+
+  return {
+    ...candidate,
+    ascii: trimmed.text,
+    tokenBudget: {
+      maxTokens,
+      originalTokens: origEstimate.tokens,
+      finalTokens: trimmed.report.finalTokens,
+      trimmed: true,
+      strategy: finalStrategy,
+      droppedLines: Math.max(0, initial.ascii.split('\n').length - trimmed.text.split('\n').length),
+      preservedRefs: trimmed.report.preservedRefs,
+      totalRefs,
+      originalChars: initial.ascii.length,
+      finalChars: trimmed.text.length,
+    },
+  }
+}
+
+function renderPageAsciiCore(
   rawSnapshot: PageSnapshot,
   options: AsciiRenderOptions = {},
 ): AsciiRenderMetrics {
@@ -1794,6 +1897,15 @@ export function renderCompactRefsAscii(snapshot: PageSnapshot, limit = 60): stri
 }
 
 export { renderDeltaAscii, type DeltaAsciiOptions } from './delta.js'
+export {
+  countUniqueRefs,
+  estimateTokens,
+  MAX_TOKEN_BUDGET,
+  MIN_TOKEN_BUDGET,
+  parseMaxTokens,
+  trimAsciiToTokenBudget,
+  type TokenBudgetTrimResult,
+} from './token-budget.js'
 export {
   decodeCanvasDataUrl,
   extractMediaSummary,

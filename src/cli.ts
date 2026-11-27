@@ -53,6 +53,7 @@ import {
 } from './mcp/schema.js'
 import { runPipeRepl } from './pipe/repl.js'
 import { runTerminalBrowser } from './tui/terminal-browser.js'
+import { parseMaxTokens } from './ascii/token-budget.js'
 import { parseInspectorTab } from './tui/inspector.js'
 import { parseViewMode } from './tui/pixel-preview.js'
 import { parseNonTtyPolicy } from './tui/tty-fallback.js'
@@ -80,13 +81,13 @@ Client Commands (talk to running daemon, or use --oneshot):
   status                                  Daemon health + memory stats
   tabs                                    List open tabs
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
-  ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--crop x,y,w,h] [--ref eN]
-                                          Render tab as strict 7-bit ASCII viewport (or diff with --since)
+  ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--max-tokens N] [--crop x,y,w,h] [--ref eN]
+                                          Render tab as strict 7-bit ASCII viewport (auto-trimmed to --max-tokens N, or diff with --since)
   markdown [--frontmatter] [--no-refs] [--no-urls] [--media] [--ascii] [--crop x,y,w,h] [--ref eN]
                                           Export tab as CommonMark/GFM Markdown preserving inline [eN] refs
   visual [--mode ascii|edge|braille|halfblock] [--annotate] [--crop x,y,w,h] [--ref eN]
                                           Render Chromium PNG screenshot (or cropped region) as ASCII
-  read [--since] [--ascii] [--visual] [--crop x,y,w,h] [--ref eN] [--json]
+  read [--since] [--ascii] [--visual] [--max-tokens N] [--crop x,y,w,h] [--ref eN] [--json]
                                           Read page structure or ASCII/JSON delta
   find <query>                            Find interactive elements as eN refs
   click <ref> [--allow-submit]            Click element ref
@@ -143,6 +144,7 @@ const VALUE_FLAGS = new Set([
   '--height',
   '--layout',
   '--density',
+  '--max-tokens',
   '--mode',
   '--crop',
   '--ref',
@@ -1075,11 +1077,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         return
       }
       const toolName = cmd === 'visual' ? 'page_screenshot_ascii' : 'page_read_ascii'
+      const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
       const res = await manager.runTool(opened.id, toolName, {
         width: flags.width ? Number(flags.width) : cmd === 'visual' ? 80 : undefined,
         height: flags.height ? Number(flags.height) : undefined,
         layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         density: typeof flags.density === 'string' ? flags.density : undefined,
+        ...(maxTokensOpt !== undefined ? { maxTokens: maxTokensOpt } : {}),
         mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
         crop: typeof flags.crop === 'string' ? flags.crop : undefined,
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
@@ -1125,12 +1129,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'open':
       res = await callDaemon(live.endpoint, '/open', { url: args.join(' '), activate: true })
       if (res.ok && flags.ascii) {
+        const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
         res = await callDaemon(live.endpoint, '/ascii', {
           tabId: res.id,
           width: flags.width ? Number(flags.width) : undefined,
           height: flags.height ? Number(flags.height) : undefined,
           layout: typeof flags.layout === 'string' ? flags.layout : undefined,
           density: typeof flags.density === 'string' ? flags.density : undefined,
+          ...(maxTokensOpt !== undefined ? { maxTokens: maxTokensOpt } : {}),
         })
       }
       break
@@ -1143,13 +1149,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'grant':
       res = await callDaemon(live.endpoint, '/grant-origin', { origin: args[0], tabId })
       break
-    case 'ascii':
+    case 'ascii': {
+      const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
       res = await callDaemon(live.endpoint, '/ascii', {
         tabId,
         width: flags.width ? Number(flags.width) : undefined,
         height: flags.height ? Number(flags.height) : undefined,
         layout: typeof flags.layout === 'string' ? flags.layout : undefined,
         density: typeof flags.density === 'string' ? flags.density : undefined,
+        ...(maxTokensOpt !== undefined ? { maxTokens: maxTokensOpt } : {}),
         crop: typeof flags.crop === 'string' ? flags.crop : undefined,
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         showMediaSummary: Boolean(flags.media),
@@ -1158,6 +1166,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         asciiOnly: true,
       })
       break
+    }
     case 'markdown':
     case 'md':
       res = await callDaemon(live.endpoint, '/markdown', {
@@ -1186,7 +1195,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         },
       })
       break
-    case 'read':
+    case 'read': {
+      const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
       res = await callDaemon(live.endpoint, '/tool', {
         tabId,
         name: flags.visual ? 'page_read_visual' : flags.ascii ? 'page_read_ascii' : 'page_read',
@@ -1196,6 +1206,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           height: flags.height ? Number(flags.height) : undefined,
           layout: typeof flags.layout === 'string' ? flags.layout : undefined,
           density: typeof flags.density === 'string' ? flags.density : undefined,
+          ...(maxTokensOpt !== undefined ? { maxTokens: maxTokensOpt } : {}),
           crop: typeof flags.crop === 'string' ? flags.crop : undefined,
           ref: typeof flags.ref === 'string' ? flags.ref : undefined,
           showMediaSummary: Boolean(flags.media),
@@ -1203,6 +1214,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         },
       })
       break
+    }
     case 'find':
       res = await callDaemon(live.endpoint, '/tool', { tabId, name: 'page_find', args: { query: args.join(' ') } })
       break
