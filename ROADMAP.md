@@ -75,7 +75,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M62: Multi-agent tab isolation: named agent sessions (`x-troy-session`) with per-session owned-tab tracking and origin scopes
 - [x] M63: Structured data extractor (`page_extract` tool) returning tables, forms, links, headings, and JSON-LD/OpenGraph metadata
 - [x] M64: Replayable macro/script runner (`troy-advanced run <flow.json>`) with assertions and ASCII failure dumps
-- [ ] M65: Streaming SSE `/stream` live ASCII frame broadcasts whenever the active tab navigates or mutates
+- [x] M65: Streaming SSE `/stream` live ASCII frame broadcasts whenever the active tab navigates or mutates
 - [ ] M66: WebSocket bridge endpoint (`/ws`) on Agent Socket for ultra-low-latency bidirectional AI control
 - [ ] M67: Deterministic `page_recall` auto-binding that verifies recalled selectors on the live DOM and issues immediate `eN` refs
 - [ ] M68: Smart `page_find` fuzzy + synonym + ARIA role scoring (`button`, `input`, `link` filters)

@@ -12,6 +12,7 @@ import { formatAuditAscii, parseAuditEventKind } from '../agent/audit.js'
 import { formatSessionsAscii, parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
+import { parseSseStreamOptions, SseStreamHub } from './sse-stream.js'
 
 const MAX_BODY = 128 * 1024
 const MAX_IMPORT_BODY = 2 * 1024 * 1024
@@ -28,18 +29,7 @@ export async function createAgentSocket(
 ): Promise<AgentSocketServer> {
   const host = opts.host ?? '127.0.0.1'
   const token = opts.token ?? randomBytes(24).toString('hex')
-  const sseClients = new Set<http.ServerResponse>()
-
-  const unsubscribe = manager.onEvent((ev) => {
-    const chunk = `data: ${JSON.stringify(ev)}\n\n`
-    for (const res of sseClients) {
-      try {
-        res.write(chunk)
-      } catch {
-        sseClients.delete(res)
-      }
-    }
-  })
+  const streamHub = new SseStreamHub(manager)
 
   async function handleRoute(
     pathname: string,
@@ -71,6 +61,7 @@ export async function createAgentSocket(
             downloads: manager.getDownloadStats(),
             dialogs: manager.getDialogStats(),
             audit: manager.getAuditStats(),
+            stream: streamHub.getStats(),
           },
         }
       }
@@ -618,14 +609,11 @@ export async function createAgentSocket(
     }
 
     if (req.method === 'GET' && url.pathname === '/stream') {
-      res.writeHead(200, {
-        'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-      })
-      res.write(`data: ${JSON.stringify({ type: 'connected', engine: manager.engine.kind })}\n\n`)
-      sseClients.add(res)
-      req.on('close', () => sseClients.delete(res))
+      const parsed = parseSseStreamOptions(url.searchParams, headerSessionId)
+      if (!parsed.ok) {
+        return respond(400, { ok: false, error: parsed.error })
+      }
+      streamHub.attach(req, res, parsed.options)
       return
     }
 
@@ -671,15 +659,8 @@ export async function createAgentSocket(
     port,
     token,
     async close() {
-      unsubscribe()
-      for (const client of sseClients) {
-        try {
-          client.end()
-        } catch {
-          // ignore
-        }
-      }
-      sseClients.clear()
+      streamHub.close()
+      server.closeAllConnections?.()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
   }

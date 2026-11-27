@@ -94,6 +94,8 @@ Client Commands (talk to running daemon, or use --oneshot):
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
   ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--max-tokens N] [--crop x,y,w,h] [--ref eN]
                                           Render tab as strict 7-bit ASCII viewport (auto-trimmed to --max-tokens N, or diff with --since)
+  stream [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--max-tokens N] [--poll-ms N] [--throttle-ms N] [--max-frames N] [--mode ascii|delta|events] [--json]
+                                          Subscribe to SSE /stream for live ASCII frame broadcasts on navigation & mutation
   markdown [--frontmatter] [--no-refs] [--no-urls] [--media] [--ascii] [--crop x,y,w,h] [--ref eN]
                                           Export tab as CommonMark/GFM Markdown preserving inline [eN] refs
   visual [--mode ascii|edge|braille|halfblock] [--annotate] [--crop x,y,w,h] [--ref eN]
@@ -202,6 +204,10 @@ const VALUE_FLAGS = new Set([
   '--var',
   '--base-url',
   '--dump-dir',
+  '--throttle-ms',
+  '--poll-ms',
+  '--heartbeat-ms',
+  '--max-frames',
 ])
 
 const REPEATABLE_FLAGS = new Set(['--header', '--remove-header', '--var'])
@@ -1265,6 +1271,103 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   let res: Record<string, unknown>
 
   switch (cmd) {
+    case 'stream': {
+      const params = new URLSearchParams()
+      if (tabId !== undefined) params.set('tabId', String(tabId))
+      if (flags.width !== undefined) params.set('width', String(flags.width))
+      if (flags.height !== undefined) params.set('height', String(flags.height))
+      if (typeof flags.density === 'string') params.set('density', flags.density)
+      if (typeof flags.layout === 'string') params.set('layout', flags.layout)
+      if (flags['max-tokens'] !== undefined) params.set('maxTokens', String(flags['max-tokens']))
+      if (flags.since) params.set('since', 'true')
+      if (typeof flags.mode === 'string') params.set('mode', flags.mode)
+      if (flags['throttle-ms'] !== undefined) params.set('throttleMs', String(flags['throttle-ms']))
+      if (flags['poll-ms'] !== undefined) params.set('pollMs', String(flags['poll-ms']))
+      if (flags['heartbeat-ms'] !== undefined) params.set('heartbeatMs', String(flags['heartbeat-ms']))
+      if (flags['no-initial']) params.set('initial', 'false')
+      if (flags['no-dedupe']) params.set('dedupe', 'false')
+      const maxFrames = flags['max-frames'] !== undefined ? Number(flags['max-frames']) : undefined
+
+      const qs = params.toString()
+      const streamUrl = `http://127.0.0.1:${daemonEndpoint.agentPort}/stream${qs ? `?${qs}` : ''}`
+      const controller = new AbortController()
+      const onSig = () => controller.abort()
+      process.once('SIGINT', onSig)
+      process.once('SIGTERM', onSig)
+
+      try {
+        const resp = await fetch(streamUrl, {
+          method: 'GET',
+          headers: {
+            'x-troy-agent': daemonEndpoint.agentToken,
+            ...(sessionId ? { [SESSION_HEADER]: sessionId } : {}),
+            accept: 'text/event-stream',
+          },
+          signal: controller.signal,
+        })
+        if (!resp.ok || !resp.body) {
+          const text = await resp.text().catch(() => '')
+          console.error(text || JSON.stringify({ ok: false, error: `HTTP ${resp.status}` }))
+          process.exit(1)
+        }
+
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let framesSeen = 0
+
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          let boundary = buffer.indexOf('\n\n')
+          while (boundary !== -1) {
+            const rawEvent = buffer.slice(0, boundary)
+            buffer = buffer.slice(boundary + 2)
+            boundary = buffer.indexOf('\n\n')
+
+            const dataLines = rawEvent
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trim())
+            if (!dataLines.length) continue
+            const rawJson = dataLines.join('\n')
+            let parsed: Record<string, unknown>
+            try {
+              parsed = JSON.parse(rawJson) as Record<string, unknown>
+            } catch {
+              continue
+            }
+
+            if (flags.json) {
+              console.log(JSON.stringify(parsed))
+            } else if (parsed.type === 'ascii_frame' && typeof parsed.ascii === 'string') {
+              console.log(
+                `--- [frame #${parsed.seq ?? '?'} | ${parsed.reason ?? 'update'} | tab ${parsed.tabId ?? '?'} | ${parsed.mode ?? 'full'}] ---`,
+              )
+              console.log(parsed.ascii)
+            }
+
+            if (parsed.type === 'ascii_frame') {
+              framesSeen++
+              if (maxFrames !== undefined && Number.isFinite(maxFrames) && framesSeen >= maxFrames) {
+                controller.abort()
+                break
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if ((err as Error)?.name !== 'AbortError') {
+          console.error(JSON.stringify({ ok: false, error: String((err as Error)?.message ?? err) }))
+          process.exit(1)
+        }
+      } finally {
+        process.off('SIGINT', onSig)
+        process.off('SIGTERM', onSig)
+      }
+      return
+    }
     case 'status': {
       const health = await callDaemon(daemonEndpoint, '/health')
       const memory = await callDaemon(daemonEndpoint, '/memory')

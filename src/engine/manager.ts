@@ -777,6 +777,16 @@ export class BrowserManager {
     return { ok: true }
   }
 
+  getActiveTabId(sessionId?: string): number | null {
+    if (sessionId) {
+      const sid = this.sessions.getActiveTabId(sessionId)
+      return sid !== null && this.tabs.has(sid) ? sid : null
+    }
+    if (this.activeTabId !== null && this.tabs.has(this.activeTabId)) return this.activeTabId
+    const first = this.tabs.keys().next()
+    return first.done ? null : first.value
+  }
+
   private resolveSession(tabId?: number): TabSession | null {
     if (tabId !== undefined) return this.tabs.get(tabId) ?? null
     if (this.activeTabId !== null) return this.tabs.get(this.activeTabId) ?? null
@@ -1629,6 +1639,17 @@ export class BrowserManager {
           toUrl,
           ok: result.ok,
         })
+        if (result.ok) {
+          this.emit({
+            type: 'page_mutated',
+            reason: 'click',
+            tabId: session.driver.id,
+            url: toUrl,
+            title: session.driver.getTitle(),
+            navigated: fromUrl !== toUrl,
+            ...(sessionId ? { sessionId } : {}),
+          })
+        }
         return {
           ...result,
           url: toUrl,
@@ -1697,6 +1718,16 @@ export class BrowserManager {
           toUrl: session.driver.getUrl(),
           ok: result.ok,
         })
+        if (result.ok) {
+          this.emit({
+            type: 'page_mutated',
+            reason: 'fill',
+            tabId: session.driver.id,
+            url: session.driver.getUrl(),
+            title: session.driver.getTitle(),
+            ...(sessionId ? { sessionId } : {}),
+          })
+        }
         return {
           ...result,
           ref: args.ref,
@@ -1753,6 +1784,16 @@ export class BrowserManager {
             result = await session.driver.select(activeSelector, String(args.value ?? ''))
           }
         }
+        if (result.ok) {
+          this.emit({
+            type: 'page_mutated',
+            reason: 'select',
+            tabId: session.driver.id,
+            url: session.driver.getUrl(),
+            title: session.driver.getTitle(),
+            ...(sessionId ? { sessionId } : {}),
+          })
+        }
         return {
           ...result,
           ref: args.ref,
@@ -1797,6 +1838,17 @@ export class BrowserManager {
             recoveryStrategy = domRec.strategy
             result = await session.driver.press(String(args.key ?? 'Enter'), selector)
           }
+        }
+        if (result.ok) {
+          this.emit({
+            type: 'page_mutated',
+            reason: 'press',
+            tabId: session.driver.id,
+            url: session.driver.getUrl(),
+            title: session.driver.getTitle(),
+            key: args.key,
+            ...(sessionId ? { sessionId } : {}),
+          })
         }
         return {
           ...result,
@@ -1854,6 +1906,15 @@ export class BrowserManager {
         const dir = (args.direction as 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom') || 'down'
         const amount = typeof args.amount === 'number' ? args.amount : 450
         const pos = await session.driver.scroll(dir, amount)
+        this.emit({
+          type: 'page_mutated',
+          reason: 'scroll',
+          tabId: session.driver.id,
+          url: session.driver.getUrl(),
+          title: session.driver.getTitle(),
+          ...pos,
+          ...(sessionId ? { sessionId } : {}),
+        })
         return { ok: true, direction: dir, ...pos }
       }
 
@@ -1915,6 +1976,14 @@ export class BrowserManager {
         })
         if (session.driver.getUrl() !== prevUrl) {
           session.elements.invalidate()
+          this.emit({
+            type: 'navigated',
+            reason: 'wait',
+            tabId: session.driver.id,
+            url: session.driver.getUrl(),
+            title: session.driver.getTitle(),
+            ...(sessionId ? { sessionId } : {}),
+          })
         }
         return { ...result }
       }
@@ -1923,6 +1992,14 @@ export class BrowserManager {
         const dir = (args.direction as 'back' | 'forward' | 'reload') || 'reload'
         const res = await session.driver.history(dir)
         session.elements.invalidate()
+        this.emit({
+          type: 'navigated',
+          direction: dir,
+          tabId: session.driver.id,
+          url: res.url,
+          title: res.title,
+          ...(sessionId ? { sessionId } : {}),
+        })
         return { ok: true, direction: dir, ...res }
       }
 
@@ -2085,6 +2162,14 @@ export class BrowserManager {
           return { ok: false, ...decision, error: decision.reason }
         }
         const value = await session.driver.evaluate(String(args.expression ?? ''))
+        this.emit({
+          type: 'page_mutated',
+          reason: 'eval',
+          tabId: session.driver.id,
+          url: session.driver.getUrl(),
+          title: session.driver.getTitle(),
+          ...(sessionId ? { sessionId } : {}),
+        })
         return capPayload({ ok: true, value })
       }
 
