@@ -8,6 +8,10 @@ import type {
   ActStep,
   AgentActivityEntry,
   AsciiRenderOptions,
+  AuditEntry,
+  AuditLogOptions,
+  AuditQueryOptions,
+  AuditStats,
   BrowserCookie,
   ConsoleEntry,
   CookieExportOptions,
@@ -51,6 +55,7 @@ import {
   type RefRecoveryStrategy,
 } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
+import { AuditLogger, extractRefusalInfo } from '../agent/audit.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
@@ -143,12 +148,14 @@ export interface BrowserManagerOptions {
   robotsRetryHooks?: RobotsRetryHooks
   cache?: ResponseCacheOptions
   cacheHooks?: ResponseCacheHooks
+  audit?: AuditLogOptions
 }
 
 export class BrowserManager {
   readonly engine: BrowserEngine
   readonly profileDir: string
   readonly memory: PageMemory | null
+  readonly audit: AuditLogger
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
@@ -159,10 +166,11 @@ export class BrowserManager {
   private unsubscribeDownloads?: () => void
   private unsubscribeDialogs?: () => void
 
-  private constructor(engine: BrowserEngine, profileDir: string, memory: PageMemory | null) {
+  private constructor(engine: BrowserEngine, profileDir: string, memory: PageMemory | null, audit: AuditLogger) {
     this.engine = engine
     this.profileDir = profileDir
     this.memory = memory
+    this.audit = audit
     if (engine.onCrashRecovery) {
       this.unsubscribeCrash = engine.onCrashRecovery((ev) => {
         if (ev.kind === 'chromium_recovered') {
@@ -270,7 +278,25 @@ export class BrowserManager {
     }
 
     const memory = opts.memoryEnabled === false ? null : new PageMemory(path.join(profileDir, 'memory.json'))
-    return new BrowserManager(engine, profileDir, memory)
+    const audit = new AuditLogger({
+      filePath: opts.audit?.filePath || path.join(profileDir, 'audit.jsonl'),
+      enabled: opts.audit?.enabled !== false,
+      maxMemoryEntries: opts.audit?.maxMemoryEntries,
+      redactArgs: opts.audit?.redactArgs,
+    })
+    return new BrowserManager(engine, profileDir, memory, audit)
+  }
+
+  getAuditLog(opts?: AuditQueryOptions): AuditEntry[] {
+    return this.audit.query(opts)
+  }
+
+  getAuditStats(): AuditStats {
+    return this.audit.stats()
+  }
+
+  clearAuditLog(opts?: { truncateFile?: boolean }): { clearedMemory: number; truncatedFile: boolean } {
+    return this.audit.clear(opts)
   }
 
   onEvent(fn: (event: Record<string, unknown>) => void): () => void {
@@ -381,25 +407,50 @@ export class BrowserManager {
     const startedAt = Date.now()
     const origin = normalizeOrigin(originOrUrl)
     if (!origin) {
+      const durationMs = Date.now() - startedAt
       this.recordActivity({
         ts: startedAt,
         tool: 'origin_grant',
         summary: originOrUrl || '(empty)',
         ok: false,
-        durationMs: Date.now() - startedAt,
+        durationMs,
+        error: 'grant needs an http(s) origin',
+      })
+      this.audit.record({
+        tsMs: startedAt,
+        kind: 'refusal',
+        tool: 'origin_grant',
+        ok: false,
+        refused: true,
+        refusal: { status: 'blocked', code: 'origin', reason: 'grant needs an http(s) origin' },
+        durationMs,
+        args: { origin: originOrUrl },
+        summary: originOrUrl || '(empty)',
         error: 'grant needs an http(s) origin',
       })
       return { ok: false, error: 'grant needs an http(s) origin' }
     }
     this.allowedOrigins.add(origin)
     this.emit({ type: 'origin_granted', origin })
+    const durationMs = Date.now() - startedAt
     this.recordActivity({
       ts: startedAt,
       tool: 'origin_grant',
       summary: origin,
       ok: true,
-      durationMs: Date.now() - startedAt,
+      durationMs,
       url: origin,
+    })
+    this.audit.record({
+      tsMs: startedAt,
+      kind: 'origin_grant',
+      tool: 'origin_grant',
+      ok: true,
+      refused: false,
+      durationMs,
+      args: { origin },
+      summary: origin,
+      toUrl: origin,
     })
     return { ok: true, origin }
   }
@@ -411,12 +462,25 @@ export class BrowserManager {
       const resolved = resolveInput(inputUrl)
       if (resolved.kind === 'refused') {
         const error = `${inputUrl} refused (${resolved.reason})`
+        const durationMs = Date.now() - startedAt
         this.recordActivity({
           ts: startedAt,
           tool: 'tab_open',
           summary: inputUrl,
           ok: false,
-          durationMs: Date.now() - startedAt,
+          durationMs,
+          error,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_open',
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'scheme', reason: resolved.reason },
+          durationMs,
+          args: { url: inputUrl },
+          summary: inputUrl,
           error,
         })
         return { ok: false, error }
@@ -437,19 +501,34 @@ export class BrowserManager {
     if (this.activeTabId === null || opts.activate) {
       this.activeTabId = driver.id
     }
-    const finalOrigin = exactOrigin(driver.getUrl())
+    const finalUrl = driver.getUrl()
+    const finalOrigin = exactOrigin(finalUrl)
     if (finalOrigin) this.allowedOrigins.add(finalOrigin)
-    this.emit({ type: 'tab_opened', tabId: driver.id, url: driver.getUrl() })
+    this.emit({ type: 'tab_opened', tabId: driver.id, url: finalUrl })
+    const durationMs = Date.now() - startedAt
     this.recordActivity({
       ts: startedAt,
       tabId: driver.id,
       tool: 'tab_open',
-      summary: driver.getUrl(),
+      summary: finalUrl,
       ok: true,
-      durationMs: Date.now() - startedAt,
-      url: driver.getUrl(),
+      durationMs,
+      url: finalUrl,
     })
-    return { ok: true, id: driver.id, url: driver.getUrl(), title: driver.getTitle() }
+    this.audit.record({
+      tsMs: startedAt,
+      kind: 'tab_action',
+      tool: 'tab_open',
+      tabId: driver.id,
+      ok: true,
+      refused: false,
+      durationMs,
+      ...(inputUrl ? { args: { url: inputUrl } } : {}),
+      summary: finalUrl,
+      toUrl: finalUrl,
+      urlChanged: Boolean(finalUrl && finalUrl !== 'about:blank'),
+    })
+    return { ok: true, id: driver.id, url: finalUrl, title: driver.getTitle() }
   }
 
   activateTab(tabId: number): { ok: boolean; error?: string } {
@@ -460,10 +539,25 @@ export class BrowserManager {
   }
 
   async closeTab(tabId: number, requireOwned = false): Promise<{ ok: boolean; error?: string }> {
+    const startedAt = Date.now()
     const session = this.tabs.get(tabId)
     if (!session) return { ok: false, error: `no tab ${tabId}` }
+    const fromUrl = session.driver.getUrl()
     if (requireOwned && !session.ownedByBridge) {
-      return { ok: false, error: 'this bridge session did not open that tab; refusing to close it' }
+      const error = 'this bridge session did not open that tab; refusing to close it'
+      this.audit.record({
+        tsMs: startedAt,
+        kind: 'refusal',
+        tool: 'tab_close',
+        tabId,
+        ok: false,
+        refused: true,
+        refusal: { status: 'blocked', code: 'owned_tab', reason: error },
+        durationMs: Date.now() - startedAt,
+        fromUrl,
+        error,
+      })
+      return { ok: false, error }
     }
     await session.driver.close()
     this.tabs.delete(tabId)
@@ -472,6 +566,16 @@ export class BrowserManager {
       this.activeTabId = next.done ? null : next.value
     }
     this.emit({ type: 'tab_closed', tabId })
+    this.audit.record({
+      tsMs: startedAt,
+      kind: 'tab_action',
+      tool: 'tab_close',
+      tabId,
+      ok: true,
+      refused: false,
+      durationMs: Date.now() - startedAt,
+      fromUrl,
+    })
     return { ok: true }
   }
 
@@ -756,30 +860,71 @@ export class BrowserManager {
 
   async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const startedAt = Date.now()
-    const resolvedTabId = this.resolveSession(tabId)?.driver.id ?? tabId
+    const sessionBefore = this.resolveSession(tabId)
+    const resolvedTabId = sessionBefore?.driver.id ?? tabId
+    const fromUrl = sessionBefore?.driver.getUrl()
+    const summary = this.summarizeToolArgs(name, args)
     try {
       const res = await this.runToolImpl(tabId, name, args)
       const sessionAfter = this.resolveSession(tabId)
+      const durationMs = Date.now() - startedAt
+      const toUrl = typeof res.url === 'string' ? res.url : sessionAfter?.driver.getUrl()
+      const finalTabId = sessionAfter?.driver.id ?? resolvedTabId
+      const ok = Boolean(res.ok)
+      const error = !ok && typeof res.error === 'string' ? res.error : undefined
+      const refusal = extractRefusalInfo(res)
+      const urlChanged = Boolean(fromUrl && toUrl && fromUrl !== toUrl)
+
       this.recordActivity({
         ts: startedAt,
-        tabId: sessionAfter?.driver.id ?? resolvedTabId,
+        tabId: finalTabId,
         tool: name,
-        summary: this.summarizeToolArgs(name, args),
-        ok: Boolean(res.ok),
-        durationMs: Date.now() - startedAt,
-        url: typeof res.url === 'string' ? res.url : sessionAfter?.driver.getUrl(),
-        error: !res.ok && typeof res.error === 'string' ? res.error : undefined,
+        summary,
+        ok,
+        durationMs,
+        url: toUrl,
+        error,
+      })
+      this.audit.record({
+        tsMs: startedAt,
+        kind: 'tool_call',
+        tool: name,
+        tabId: finalTabId,
+        ok,
+        refused: Boolean(refusal),
+        refusal,
+        durationMs,
+        args,
+        summary,
+        fromUrl,
+        toUrl,
+        urlChanged,
+        error,
       })
       return res
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      const durationMs = Date.now() - startedAt
       this.recordActivity({
         ts: startedAt,
         tabId: resolvedTabId,
         tool: name,
-        summary: this.summarizeToolArgs(name, args),
+        summary,
         ok: false,
-        durationMs: Date.now() - startedAt,
+        durationMs,
+        error: message,
+      })
+      this.audit.record({
+        tsMs: startedAt,
+        kind: 'tool_call',
+        tool: name,
+        tabId: resolvedTabId,
+        ok: false,
+        refused: false,
+        durationMs,
+        args,
+        summary,
+        fromUrl,
         error: message,
       })
       throw err

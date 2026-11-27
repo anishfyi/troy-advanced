@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import path from 'node:path'
 import type {
+  AuditLogOptions,
   BrowserCookie,
   CrashRecoveryOptions,
   DialogPolicyOptions,
@@ -15,6 +16,13 @@ import type {
   TrackerBlockMode,
 } from './types.js'
 import { BrowserManager } from './engine/manager.js'
+import {
+  computeAuditStats,
+  filterAuditEntries,
+  formatAuditAscii,
+  parseAuditEventKind,
+  readAuditJsonl,
+} from './agent/audit.js'
 import { parseDialogMode, parseDialogType } from './engine/dialogs.js'
 import { parseDownloadMode } from './engine/downloads.js'
 import { parseHeaderList } from './engine/emulation.js'
@@ -96,6 +104,8 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect intercepted/quarantined/blocked auto-downloads or update policy
   dialogs [--type alert|confirm|prompt|beforeunload] [--mode dismiss|accept] [--next accept|dismiss] [--prompt-text <str>] [--clear] [--clear-queue] [--json]
                                           Inspect captured JS dialogs, configure auto-dismiss/accept policy, or queue next response
+  audit [--limit N] [--tool <name>] [--kind <k>] [--refused] [--transitions] [--failed] [--tab <id>] [--disk] [--file <path>] [--clear] [--truncate] [--json]
+                                          Inspect persistent agent action audit log (audit.jsonl) with refusals, timing, and URL transitions
   act <json-steps> [--allow-submit]       Run batched action list
   grant <origin>                          Extend origin autonomy boundary
   recall <query> | forget [origin]        Query or clear persistent page memory
@@ -167,6 +177,10 @@ const VALUE_FLAGS = new Set([
   '--framing',
   '--format',
   '--tools',
+  '--audit-file',
+  '--file',
+  '--kind',
+  '--tool',
 ])
 
 const REPEATABLE_FLAGS = new Set(['--header', '--remove-header'])
@@ -283,6 +297,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           ...(dialogDismissBeforeUnloadFlag ? { acceptBeforeUnload: false } : {}),
         }
       : undefined
+  const auditOpts: AuditLogOptions | undefined =
+    flags['no-audit'] || typeof flags['audit-file'] === 'string'
+      ? {
+          ...(flags['no-audit'] ? { enabled: false } : {}),
+          ...(typeof flags['audit-file'] === 'string' && flags['audit-file'].trim()
+            ? { filePath: path.resolve(flags['audit-file'].trim()) }
+            : {}),
+        }
+      : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -314,6 +337,31 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (cmd === 'doctor') {
     const report = runDoctor()
     console.log(flags.json ? JSON.stringify(report, null, 2) : formatDoctorAscii(report))
+    return
+  }
+
+  if (cmd === 'audit' && typeof flags.file === 'string' && flags.file.trim()) {
+    const filePath = path.resolve(flags.file.trim())
+    const allEntries = readAuditJsonl(filePath)
+    const filtered = filterAuditEntries(allEntries, {
+      limit: flags.limit !== undefined ? Number(flags.limit) : 100,
+      kind: parseAuditEventKind(flags.kind),
+      tool: typeof flags.tool === 'string' && flags.tool.trim() ? flags.tool.trim() : undefined,
+      tabId: flags.tab !== undefined ? Number(flags.tab) : undefined,
+      refusedOnly: Boolean(flags.refused),
+      urlChangedOnly: Boolean(flags.transitions),
+      failedOnly: Boolean(flags.failed),
+    })
+    const stats = computeAuditStats(allEntries, { enabled: true, filePath })
+    if (flags.json) {
+      console.log(JSON.stringify({ ok: true, count: filtered.length, entries: filtered, stats }, null, 2))
+    } else {
+      console.log(
+        formatAuditAscii(filtered, stats, {
+          width: flags.width !== undefined ? Number(flags.width) : undefined,
+        }),
+      )
+    }
     return
   }
 
@@ -423,6 +471,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       crashRecovery,
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
+      audit: auditOpts,
     }
 
     if (sub === 'run') {
@@ -463,6 +512,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       crashRecovery,
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
+      audit: auditOpts,
     })
     try {
       const inspectorTabFlag =
@@ -506,6 +556,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       crashRecovery,
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
+      audit: auditOpts,
     })
     try {
       await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
@@ -526,6 +577,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       crashRecovery,
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
+      audit: auditOpts,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1319,6 +1371,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     }
+    case 'audit': {
+      res = await callDaemon(live.endpoint, '/audit', {
+        ...(tabId !== undefined ? { tabId } : {}),
+        ...(typeof flags.kind === 'string' ? { kind: flags.kind } : {}),
+        ...(typeof flags.tool === 'string' ? { tool: flags.tool } : {}),
+        refusedOnly: Boolean(flags.refused),
+        urlChangedOnly: Boolean(flags.transitions),
+        failedOnly: Boolean(flags.failed),
+        fromDisk: Boolean(flags.disk),
+        clear: Boolean(flags.clear),
+        truncateFile: Boolean(flags.truncate),
+        ...(flags.limit !== undefined ? { limit: Number(flags.limit) } : {}),
+        ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
+      })
+      break
+    }
     default:
       console.error(`Unknown command: ${cmd}\nRun "troy-advanced help" for usage.`)
       process.exit(1)
@@ -1332,6 +1400,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       cmd === 'viewport' ||
       cmd === 'downloads' ||
       cmd === 'dialogs' ||
+      cmd === 'audit' ||
       (cmd === 'network' && Boolean(flags.body)) ||
       flags.ascii) &&
     typeof res.ascii === 'string'

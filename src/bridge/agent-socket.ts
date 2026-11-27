@@ -8,6 +8,7 @@ import { parseAsciiDensity } from '../ascii/layout.js'
 import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnapshot } from '../types.js'
 import { formatDialogsAscii, parseDialogMode, parseDialogType } from '../engine/dialogs.js'
 import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
+import { formatAuditAscii, parseAuditEventKind } from '../agent/audit.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 
@@ -54,6 +55,7 @@ export async function createAgentSocket(
             crashRecovery: manager.getCrashRecoveryStats(),
             downloads: manager.getDownloadStats(),
             dialogs: manager.getDialogStats(),
+            audit: manager.getAuditStats(),
           },
         }
       }
@@ -414,6 +416,43 @@ export async function createAgentSocket(
             stats,
             queue,
             ascii: formatDialogsAscii(entries, stats, queue),
+          },
+        }
+      }
+      case '/audit': {
+        if (body.clear) {
+          const cleared = manager.clearAuditLog({ truncateFile: Boolean(body.truncateFile) })
+          return {
+            status: 200,
+            payload: {
+              ok: true,
+              ...cleared,
+              stats: manager.getAuditStats(),
+            },
+          }
+        }
+        const entries = manager.getAuditLog({
+          limit: typeof body.limit === 'number' ? body.limit : 100,
+          kind: parseAuditEventKind(body.kind),
+          tool: typeof body.tool === 'string' && body.tool.trim() ? body.tool.trim() : undefined,
+          tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          refusedOnly: Boolean(body.refusedOnly),
+          urlChangedOnly: Boolean(body.urlChangedOnly),
+          failedOnly: Boolean(body.failedOnly),
+          sinceMs: typeof body.sinceMs === 'number' ? body.sinceMs : undefined,
+          fromDisk: Boolean(body.fromDisk),
+        })
+        const stats = manager.getAuditStats()
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            count: entries.length,
+            entries,
+            stats,
+            ascii: formatAuditAscii(entries, stats, {
+              width: typeof body.width === 'number' ? body.width : undefined,
+            }),
           },
         }
       }

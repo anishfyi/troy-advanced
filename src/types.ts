@@ -730,3 +730,68 @@ export interface DialogEvent {
   kind: DialogEventKind
   entry: DialogEntry
 }
+
+export type AuditEventKind = 'tool_call' | 'refusal' | 'url_transition' | 'tab_action' | 'origin_grant'
+
+export interface AuditRefusalInfo {
+  status?: 'blocked' | 'boundary' | 'refused'
+  code?: string
+  reason: string
+  origin?: string
+}
+
+export interface AuditEntry {
+  seq: number
+  ts: string
+  tsMs: number
+  kind: AuditEventKind
+  tool: string
+  tabId?: number
+  ok: boolean
+  refused: boolean
+  refusal?: AuditRefusalInfo
+  durationMs: number
+  args?: Record<string, unknown>
+  summary?: string
+  fromUrl?: string
+  toUrl?: string
+  urlChanged?: boolean
+  error?: string
+}
+
+export interface AuditLogOptions {
+  /** Enable persistent audit.jsonl recording (default: true). */
+  enabled?: boolean
+  /** Custom path to audit.jsonl (default: <profileDir>/audit.jsonl). */
+  filePath?: string
+  /** Max entries kept in the in-memory ring buffer (default: 1000). */
+  maxMemoryEntries?: number
+  /** Redact potentially sensitive argument keys/values before logging (default: true). */
+  redactArgs?: boolean
+}
+
+export interface AuditQueryOptions {
+  limit?: number
+  kind?: AuditEventKind
+  tool?: string
+  tabId?: number
+  refusedOnly?: boolean
+  urlChangedOnly?: boolean
+  failedOnly?: boolean
+  sinceMs?: number
+  fromDisk?: boolean
+}
+
+export interface AuditStats {
+  enabled: boolean
+  filePath: string
+  totalEntries: number
+  toolCalls: number
+  refusals: number
+  errors: number
+  urlTransitions: number
+  avgDurationMs: number
+  maxDurationMs: number
+  byTool: Record<string, number>
+  byRefusalCode: Record<string, number>
+}

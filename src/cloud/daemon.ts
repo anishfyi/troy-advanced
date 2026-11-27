@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import type {
+  AuditLogOptions,
   CrashRecoveryOptions,
   DialogPolicyOptions,
   DownloadPolicyOptions,
@@ -37,6 +38,7 @@ export interface DaemonOptions {
   crashRecovery?: CrashRecoveryOptions
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
+  audit?: AuditLogOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -51,6 +53,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     crashRecovery: opts.crashRecovery,
     downloads: opts.downloads,
     dialogs: opts.dialogs,
+    audit: opts.audit,
   })
 
   if (opts.initialUrl) {
@@ -173,6 +176,12 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   }
   if (opts.dialogs?.acceptBeforeUnload === false) {
     args.push('--dialog-dismiss-beforeunload')
+  }
+  if (opts.audit?.enabled === false) {
+    args.push('--no-audit')
+  }
+  if (opts.audit?.filePath) {
+    args.push('--audit-file', opts.audit.filePath)
   }
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport
