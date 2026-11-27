@@ -13,6 +13,7 @@ import { formatSessionsAscii, parseSessionId, SESSION_HEADER } from '../agent/se
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 import { parseSseStreamOptions, SseStreamHub } from './sse-stream.js'
+import { WsBridgeHub } from './ws-bridge.js'
 
 const MAX_BODY = 128 * 1024
 const MAX_IMPORT_BODY = 2 * 1024 * 1024
@@ -20,6 +21,7 @@ const MAX_IMPORT_BODY = 2 * 1024 * 1024
 export interface AgentSocketServer {
   port: number
   token: string
+  wsUrl: string
   close: () => Promise<void>
 }
 
@@ -30,6 +32,7 @@ export async function createAgentSocket(
   const host = opts.host ?? '127.0.0.1'
   const token = opts.token ?? randomBytes(24).toString('hex')
   const streamHub = new SseStreamHub(manager)
+  let wsHub: WsBridgeHub | null = null
 
   async function handleRoute(
     pathname: string,
@@ -62,6 +65,15 @@ export async function createAgentSocket(
             dialogs: manager.getDialogStats(),
             audit: manager.getAuditStats(),
             stream: streamHub.getStats(),
+            ws: wsHub?.getStats() ?? {
+              clients: 0,
+              subscribedClients: 0,
+              requestsHandled: 0,
+              messagesSent: 0,
+              framesSent: 0,
+              framesSkippedDuplicate: 0,
+              eventsSent: 0,
+            },
           },
         }
       }
@@ -647,6 +659,11 @@ export async function createAgentSocket(
     })
   })
 
+  wsHub = new WsBridgeHub(manager, handleRoute, { token })
+  server.on('upgrade', (req, socket, head) => {
+    wsHub?.handleUpgrade(req, socket, head)
+  })
+
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(opts.port ?? 0, host, () => resolve())
@@ -654,11 +671,14 @@ export async function createAgentSocket(
 
   const addr = server.address()
   const port = typeof addr === 'object' && addr ? addr.port : 0
+  const wsUrl = `ws://${host}:${port}/ws`
 
   return {
     port,
     token,
+    wsUrl,
     async close() {
+      wsHub?.close()
       streamHub.close()
       server.closeAllConnections?.()
       await new Promise<void>((resolve) => server.close(() => resolve()))

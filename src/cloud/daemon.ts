@@ -90,6 +90,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       engine: manager.engine.kind,
       agentPort: socket.port,
       agentToken: socket.token,
+      agentWsEndpoint: socket.wsUrl,
       profileDir: manager.profileDir,
     }
   }
@@ -117,6 +118,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       pid: process.pid,
       engine: manager.engine.kind,
       agentPort: socket.port,
+      agentWsEndpoint: socket.wsUrl,
       cdpPort: manager.engine.cdpPort,
       ...(manager.engine.remoteCdpUrl ? { remoteCdpUrl: manager.engine.remoteCdpUrl } : {}),
       endpointFile,

@@ -438,6 +438,7 @@ export interface EndpointDescriptor {
   engine: 'chromium' | 'lite'
   agentPort: number
   agentToken: string
+  agentWsEndpoint?: string
   profileDir: string
 }
 
