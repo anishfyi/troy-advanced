@@ -58,6 +58,11 @@ import {
 } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { AuditLogger, extractRefusalInfo } from '../agent/audit.js'
+import {
+  extractStructuredData,
+  formatExtractAscii,
+  parseExtractSections,
+} from '../agent/extract.js'
 import { SessionRegistry } from '../agent/sessions.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
@@ -1500,6 +1505,50 @@ export class BrowserManager {
         }
         const snap = await session.driver.snapshot()
         return capPayload({ ok: true, url: snap.url, title: snap.title, content: snap.text })
+      }
+
+      case 'page_extract': {
+        const settleOpts = this.extractSettleOptions(args)
+        const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
+
+        // Ensure fresh indexed snapshot so forms & links are enriched with active [eN] refs
+        const snap = await this.takeIndexedSnapshot(session)
+        session.lastSnapshot = snap
+
+        const html = session.driver.getHtml ? await session.driver.getHtml() : ''
+        const sections = parseExtractSections(args.sections ?? args.include)
+        const maxItems =
+          typeof args.maxItems === 'number' && Number.isFinite(args.maxItems)
+            ? Math.max(1, Math.min(1000, Math.floor(args.maxItems)))
+            : undefined
+
+        const extracted = extractStructuredData({
+          html,
+          snapshot: snap,
+          url: snap.url,
+          title: snap.title,
+          options: {
+            sections,
+            maxItems,
+            includeObjects: args.includeObjects !== false,
+            asciiOnly: Boolean(args.asciiOnly),
+            externalLinksOnly: Boolean(args.externalLinksOnly ?? args.external),
+            internalLinksOnly: Boolean(args.internalLinksOnly ?? args.internal),
+          },
+        })
+
+        const includeAscii = Boolean(args.ascii)
+        const ascii = includeAscii
+          ? formatExtractAscii(extracted, {
+              width: typeof args.width === 'number' ? args.width : undefined,
+            })
+          : undefined
+
+        return capPayload({
+          ...extracted,
+          ...(ascii ? { ascii } : {}),
+          ...(settleRes ? { settle: settleRes } : {}),
+        })
       }
 
       case 'page_navigate': {

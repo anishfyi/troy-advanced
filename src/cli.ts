@@ -91,6 +91,8 @@ Client Commands (talk to running daemon, or use --oneshot):
   read [--since] [--ascii] [--visual] [--max-tokens N] [--crop x,y,w,h] [--ref eN] [--json]
                                           Read page structure or ASCII/JSON delta
   find <query>                            Find interactive elements as eN refs
+  extract [url] [--sections tables,forms,links,headings,metadata] [--max-items N] [--external|--internal] [--ascii]
+                                          Extract structured tables, forms (with eN refs), links, headings, and JSON-LD/OpenGraph metadata
   click <ref> [--allow-submit]            Click element ref
   fill <ref> <text> [--clear]             Fill input ref
   select <ref> <value>                    Select dropdown option
@@ -1057,8 +1059,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
   }
 
-  // One-shot ASCII / Markdown / Visual fetch without needing a running daemon
-  if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md') && positional[1] && !readLiveEndpoint(endpointFlag)) {
+  // One-shot ASCII / Markdown / Visual / Extract fetch without needing a running daemon
+  if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md' || cmd === 'extract') && positional[1] && !readLiveEndpoint(endpointFlag)) {
     const manager = await BrowserManager.create({
       engine,
       remoteCdpPort: remoteCdpPortFlag,
@@ -1071,6 +1073,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       if (!opened.ok) {
         console.error(JSON.stringify(opened, null, 2))
         process.exit(1)
+      }
+      if (cmd === 'extract') {
+        const res = await manager.runTool(opened.id, 'page_extract', {
+          sections: typeof flags.sections === 'string' ? flags.sections : undefined,
+          maxItems: flags['max-items'] ? Number(flags['max-items']) : undefined,
+          includeObjects: !flags['no-objects'],
+          asciiOnly: Boolean(flags['ascii-only']),
+          externalLinksOnly: Boolean(flags.external),
+          internalLinksOnly: Boolean(flags.internal),
+          ascii: Boolean(flags.ascii),
+          width: flags.width ? Number(flags.width) : undefined,
+          settle: Boolean(flags.settle),
+        })
+        if (flags.ascii && !flags.json && typeof res.ascii === 'string') console.log(res.ascii)
+        else console.log(JSON.stringify(res, null, 2))
+        return
       }
       if (cmd === 'markdown' || cmd === 'md') {
         const res = await manager.runTool(opened.id, 'page_read_markdown', {
@@ -1260,6 +1278,20 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     case 'text':
       res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_text', args: args[0] ? { ref: args[0] } : {} })
+      break
+    case 'extract':
+      res = await callDaemon(daemonEndpoint, '/extract', {
+        tabId,
+        sections: typeof flags.sections === 'string' ? flags.sections : undefined,
+        maxItems: flags['max-items'] ? Number(flags['max-items']) : undefined,
+        includeObjects: !flags['no-objects'],
+        asciiOnly: Boolean(flags['ascii-only']),
+        externalLinksOnly: Boolean(flags.external),
+        internalLinksOnly: Boolean(flags.internal),
+        ascii: Boolean(flags.ascii),
+        width: flags.width ? Number(flags.width) : undefined,
+        settle: Boolean(flags.settle),
+      })
       break
     case 'click':
       res = await callDaemon(daemonEndpoint, '/tool', {

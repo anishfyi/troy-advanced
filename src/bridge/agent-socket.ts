@@ -244,6 +244,29 @@ export async function createAgentSocket(
               },
         }
       }
+      case '/extract': {
+        const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const result = await manager.runTool(
+          tabId,
+          'page_extract',
+          {
+            sections: body.sections ?? body.include,
+            maxItems: typeof body.maxItems === 'number' ? body.maxItems : undefined,
+            includeObjects: body.includeObjects !== false,
+            asciiOnly: Boolean(body.asciiOnly),
+            externalLinksOnly: Boolean(body.externalLinksOnly ?? body.external),
+            internalLinksOnly: Boolean(body.internalLinksOnly ?? body.internal),
+            ascii: Boolean(body.ascii),
+            width: typeof body.width === 'number' ? body.width : undefined,
+            settle: body.settle,
+          },
+          { sessionId },
+        )
+        return {
+          status: 200,
+          payload: sessionId ? { ...result, sessionId } : result,
+        }
+      }
       case '/tool': {
         const name = String(body.name ?? '')
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined

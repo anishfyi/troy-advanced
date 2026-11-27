@@ -92,7 +92,7 @@ export async function executePipeCommand(
     case 'help':
       return {
         output: [
-          'COMMANDS: open <url> | ascii [width] | markdown [--frontmatter] | visual [width] | read | find <q>',
+          'COMMANDS: open <url> | ascii [width] | markdown [--frontmatter] | visual [width] | read | find <q> | extract [--sections ...]',
           '          click <ref> [--submit] | fill <ref> <text> | select <ref> <val> | press <key> | scroll <dir>',
           '          wait [ms] [--text <str>] [--selector <css>] [--url <pat>] [--state visible|hidden|attached] [--timeout <ms>]',
           '          tabs | tab <id> | back | forward | reload | grant <origin> | recall <q> | quit',
@@ -229,6 +229,38 @@ export async function executePipeCommand(
     }
     case 'find': {
       const res = await manager.runTool(undefined, 'page_find', { query: argStr })
+      return { output: format(res) }
+    }
+    case 'extract': {
+      const tokens = tokenizePipeArgs(argStr)
+      let sections: string | undefined
+      let maxItems: number | undefined
+      let ascii = false
+      let asciiOnly = false
+      let externalLinksOnly = false
+      let internalLinksOnly = false
+      let includeObjects = true
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok === '--sections' && tokens[i + 1] !== undefined) sections = tokens[++i]
+        else if (tok.startsWith('--sections=')) sections = tok.slice('--sections='.length)
+        else if (tok === '--max-items' && tokens[i + 1] !== undefined) maxItems = Number(tokens[++i])
+        else if (tok.startsWith('--max-items=')) maxItems = Number(tok.slice('--max-items='.length))
+        else if (tok === '--ascii') ascii = true
+        else if (tok === '--ascii-only') asciiOnly = true
+        else if (tok === '--external') externalLinksOnly = true
+        else if (tok === '--internal') internalLinksOnly = true
+        else if (tok === '--no-objects') includeObjects = false
+      }
+      const res = await manager.runTool(undefined, 'page_extract', {
+        ...(sections ? { sections } : {}),
+        ...(maxItems !== undefined && Number.isFinite(maxItems) ? { maxItems } : {}),
+        includeObjects,
+        ascii,
+        asciiOnly,
+        externalLinksOnly,
+        internalLinksOnly,
+      })
       return { output: format(res) }
     }
     case 'click': {

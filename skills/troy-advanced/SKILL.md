@@ -75,6 +75,7 @@ troy-advanced daemon stop
   - `troy-advanced ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--crop x,y,w,h] [--ref eN]`
   - `troy-advanced markdown [--frontmatter] [--no-refs] [--no-urls] [--media] [--ascii] [--crop x,y,w,h] [--ref eN]`
   - `troy-advanced visual [--mode ascii|edge|braille|halfblock] [--annotate] [--crop x,y,w,h] [--ref eN]`
+  - `troy-advanced extract [url] [--sections tables,forms,links,headings,metadata] [--max-items N] [--external|--internal] [--ascii]`
 - **Navigation & Interaction**
   - `troy-advanced open <url|query>`, `tabs`, `read`, `find <query>`, `click <ref> [--allow-submit]`, `fill <ref> <text> [--clear]`, `select <ref> <value>`, `press <key> [--ref eN]`, `scroll [up|down|top|bottom] [amount]`, `back`, `forward`, `reload`, `act <json-steps> [--allow-submit]`
   - `troy-advanced wait [ms] [--text <str>] [--selector <css>] [--url <pattern>] [--state visible|hidden|attached] [--timeout <ms>]`
@@ -112,6 +113,7 @@ Bundled configuration files in this skill directory:
 | `troy_read_markdown` | Export tab as CommonMark/GFM Markdown with inline `[eN]` refs |
 | `troy_screenshot_ascii` | Capture Chromium PNG screenshot as `ascii`, `edge` (Sobel wireframe), `braille`, or `halfblock` with optional `[eN]` overlays |
 | `troy_find` | Find interactive elements matching a query and return `eN` refs |
+| `troy_extract` | Extract structured tables, forms (with `[eN]` refs), links (with `[eN]` refs), headings, and JSON-LD/OpenGraph/Twitter metadata |
 | `troy_click` | Click an element ref (`allowSubmit: true` required for submit/commit actions) |
 | `troy_fill` | Fill an input ref (`clear: true` to replace existing text) |
 | `troy_wait` | Wait for `text`, CSS `selector` (`visible`/`hidden`/`attached`), `url`, SPA `settle`, or `ms` |

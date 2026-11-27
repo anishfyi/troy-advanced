@@ -2111,6 +2111,15 @@ export class ChromiumTab implements TabDriver {
     }
   }
 
+  async getHtml(): Promise<string> {
+    try {
+      const html = await this.evaluate('document.documentElement ? document.documentElement.outerHTML : ""')
+      return typeof html === 'string' ? html : ''
+    } catch {
+      return ''
+    }
+  }
+
   async evaluate(expression: string): Promise<unknown> {
     return this.runWithRecovery(() => this.evalJson(expression))
   }

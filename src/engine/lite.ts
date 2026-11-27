@@ -2689,6 +2689,10 @@ class LiteTab implements TabDriver {
     }
   }
 
+  async getHtml(): Promise<string> {
+    return this.rawHtml
+  }
+
   async evaluate(_expression: string): Promise<unknown> {
     throw new Error('page_eval requires the chromium engine (launch with --engine chromium)')
   }

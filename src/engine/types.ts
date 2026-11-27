@@ -47,6 +47,7 @@ export interface TabDriver {
   navigate(url: string): Promise<{ url: string; title: string }>
   history(direction: 'back' | 'forward' | 'reload'): Promise<{ url: string; title: string }>
   snapshot(): Promise<PageSnapshot>
+  getHtml?(): Promise<string>
   click(selector: string): Promise<{ ok: boolean; note?: string }>
   fill(selector: string, text: string, clear?: boolean): Promise<{ ok: boolean; value?: string }>
   select(selector: string, value: string): Promise<{ ok: boolean; value?: string }>

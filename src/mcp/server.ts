@@ -227,6 +227,29 @@ export const MCP_TOOLS = [
     },
   },
   {
+    name: 'troy_extract',
+    description:
+      'Extract structured data (tables, forms with [eN] refs, links with [eN] refs, headings, and JSON-LD / OpenGraph / Twitter / meta metadata) from the active or target browser tab.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        sections: {
+          type: 'array',
+          items: { type: 'string', enum: ['tables', 'forms', 'links', 'headings', 'metadata'] },
+          description: 'Subset of sections to extract (default: all five sections)',
+        },
+        maxItems: { type: 'number', description: 'Maximum items per section (default: 200, clamped 1..1000)' },
+        includeObjects: { type: 'boolean', description: 'Include header-keyed row objects for tables (default: true)' },
+        asciiOnly: { type: 'boolean', description: 'Sanitize extracted text to strict 7-bit ASCII (default: false)' },
+        externalLinksOnly: { type: 'boolean', description: 'Return only external links (different origin than page)' },
+        internalLinksOnly: { type: 'boolean', description: 'Return only internal links (same origin as page)' },
+        ascii: { type: 'boolean', description: 'Also include a formatted strict 7-bit ASCII summary' },
+        settle: { type: 'boolean', description: 'Wait for network idle and DOM mutations to settle before extracting' },
+      },
+    },
+  },
+  {
     name: 'troy_click',
     description: 'Click an element by ref (e.g. e3). Pass allowSubmit: true for commit/submit actions.',
     inputSchema: {
@@ -800,6 +823,18 @@ export async function handleMcpRequest(
         break
       case 'troy_find':
         result = await manager.runTool(tabId, 'page_find', { query: args.query })
+        break
+      case 'troy_extract':
+        result = await manager.runTool(tabId, 'page_extract', {
+          sections: args.sections,
+          maxItems: args.maxItems,
+          includeObjects: args.includeObjects,
+          asciiOnly: args.asciiOnly,
+          externalLinksOnly: args.externalLinksOnly,
+          internalLinksOnly: args.internalLinksOnly,
+          ascii: args.ascii,
+          settle: args.settle,
+        })
         break
       case 'troy_click':
         result = await manager.runTool(tabId, 'page_click', { ref: args.ref, allowSubmit: args.allowSubmit })
