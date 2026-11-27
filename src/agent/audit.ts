@@ -32,6 +32,7 @@ export interface AuditRecordInput {
   kind: AuditEventKind
   tool: string
   tabId?: number
+  sessionId?: string
   ok: boolean
   refused: boolean
   refusal?: AuditRefusalInfo
@@ -192,6 +193,9 @@ export function filterAuditEntries(entries: AuditEntry[], opts: AuditQueryOption
   }
   if (opts.tabId !== undefined) {
     filtered = filtered.filter((e) => e.tabId === opts.tabId)
+  }
+  if (opts.sessionId) {
+    filtered = filtered.filter((e) => e.sessionId === opts.sessionId)
   }
   if (opts.refusedOnly) {
     filtered = filtered.filter((e) => e.refused || e.kind === 'refusal')
@@ -378,6 +382,7 @@ export class AuditLogger {
       kind: input.kind,
       tool: input.tool,
       ...(input.tabId !== undefined ? { tabId: input.tabId } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ok: input.ok,
       refused: input.refused,
       ...(input.refusal ? { refusal: input.refusal } : {}),

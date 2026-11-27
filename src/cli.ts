@@ -23,6 +23,7 @@ import {
   parseAuditEventKind,
   readAuditJsonl,
 } from './agent/audit.js'
+import { parseSessionId, SESSION_HEADER } from './agent/sessions.js'
 import { parseDialogMode, parseDialogType } from './engine/dialogs.js'
 import { parseDownloadMode } from './engine/downloads.js'
 import { parseHeaderList } from './engine/emulation.js'
@@ -105,8 +106,10 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect intercepted/quarantined/blocked auto-downloads or update policy
   dialogs [--type alert|confirm|prompt|beforeunload] [--mode dismiss|accept] [--next accept|dismiss] [--prompt-text <str>] [--clear] [--clear-queue] [--json]
                                           Inspect captured JS dialogs, configure auto-dismiss/accept policy, or queue next response
-  audit [--limit N] [--tool <name>] [--kind <k>] [--refused] [--transitions] [--failed] [--tab <id>] [--disk] [--file <path>] [--clear] [--truncate] [--json]
+  audit [--limit N] [--tool <name>] [--kind <k>] [--refused] [--transitions] [--failed] [--tab <id>] [--session <id>] [--disk] [--file <path>] [--clear] [--truncate] [--json]
                                           Inspect persistent agent action audit log (audit.jsonl) with refusals, timing, and URL transitions
+  sessions [id | close <id> [--keep-tabs]] [--json]
+                                          List, inspect, or close isolated multi-agent sessions (x-troy-session)
   act <json-steps> [--allow-submit]       Run batched action list
   grant <origin>                          Extend origin autonomy boundary
   recall <query> | forget [origin]        Query or clear persistent page memory
@@ -127,11 +130,12 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
   '--tab',
+  '--session',
   '--endpoint',
   '--engine',
   '--port',
@@ -238,13 +242,20 @@ function parseArgv(argv: string[]) {
 }
 
 async function callDaemon(
-  endpoint: { agentPort: number; agentToken: string },
+  endpoint: { agentPort: number; agentToken: string; sessionId?: string },
   route: string,
   body: Record<string, unknown> = {},
 ): Promise<Record<string, unknown>> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-troy-agent': endpoint.agentToken,
+  }
+  if (endpoint.sessionId) {
+    headers[SESSION_HEADER] = endpoint.sessionId
+  }
   const res = await fetch(`http://127.0.0.1:${endpoint.agentPort}${route}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-troy-agent': endpoint.agentToken },
+    headers,
     body: JSON.stringify(body),
   })
   return (await res.json()) as Record<string, unknown>
@@ -1112,25 +1123,54 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     process.exit(1)
   }
 
+  const rawSession = typeof flags.session === 'string' ? flags.session : process.env.TROY_SESSION
+  const parsedSession = parseSessionId(rawSession)
+  if (!parsedSession.ok) {
+    console.error(JSON.stringify({ ok: false, error: parsedSession.error }, null, 2))
+    process.exit(1)
+  }
+  const sessionId = parsedSession.sessionId
+  const daemonEndpoint = sessionId ? { ...live.endpoint, sessionId } : live.endpoint
+
   const tabId = flags.tab !== undefined ? Number(flags.tab) : undefined
   const args = positional.slice(1)
   let res: Record<string, unknown>
 
   switch (cmd) {
     case 'status': {
-      const health = await callDaemon(live.endpoint, '/health')
-      const memory = await callDaemon(live.endpoint, '/memory')
+      const health = await callDaemon(daemonEndpoint, '/health')
+      const memory = await callDaemon(daemonEndpoint, '/memory')
       res = { ok: true, endpoint: live.endpoint.file, pid: live.endpoint.pid, health, memory }
       break
     }
+    case 'sessions': {
+      if (args[0] === 'close') {
+        const targetId = args[1] || sessionId
+        res = await callDaemon(daemonEndpoint, '/sessions', {
+          sessionId: targetId,
+          close: true,
+          closeTabs: !flags['keep-tabs'],
+        })
+      } else if (args[0]) {
+        res = await callDaemon(daemonEndpoint, '/sessions', {
+          sessionId: args[0],
+          ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
+        })
+      } else {
+        res = await callDaemon(daemonEndpoint, '/sessions', {
+          ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
+        })
+      }
+      break
+    }
     case 'tabs':
-      res = await callDaemon(live.endpoint, '/tabs')
+      res = await callDaemon(daemonEndpoint, '/tabs')
       break
     case 'open':
-      res = await callDaemon(live.endpoint, '/open', { url: args.join(' '), activate: true })
+      res = await callDaemon(daemonEndpoint, '/open', { url: args.join(' '), activate: true })
       if (res.ok && flags.ascii) {
         const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-        res = await callDaemon(live.endpoint, '/ascii', {
+        res = await callDaemon(daemonEndpoint, '/ascii', {
           tabId: res.id,
           width: flags.width ? Number(flags.width) : undefined,
           height: flags.height ? Number(flags.height) : undefined,
@@ -1141,17 +1181,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       }
       break
     case 'focus':
-      res = await callDaemon(live.endpoint, '/activate', { tabId: Number(args[0]) })
+      res = await callDaemon(daemonEndpoint, '/activate', { tabId: Number(args[0]) })
       break
     case 'close':
-      res = await callDaemon(live.endpoint, '/close', { tabId: Number(args[0]) })
+      res = await callDaemon(daemonEndpoint, '/close', { tabId: Number(args[0]) })
       break
     case 'grant':
-      res = await callDaemon(live.endpoint, '/grant-origin', { origin: args[0], tabId })
+      res = await callDaemon(daemonEndpoint, '/grant-origin', { origin: args[0], tabId })
       break
     case 'ascii': {
       const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-      res = await callDaemon(live.endpoint, '/ascii', {
+      res = await callDaemon(daemonEndpoint, '/ascii', {
         tabId,
         width: flags.width ? Number(flags.width) : undefined,
         height: flags.height ? Number(flags.height) : undefined,
@@ -1169,7 +1209,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
     case 'markdown':
     case 'md':
-      res = await callDaemon(live.endpoint, '/markdown', {
+      res = await callDaemon(daemonEndpoint, '/markdown', {
         tabId,
         includeFrontmatter: Boolean(flags.frontmatter),
         includeMediaSummary: Boolean(flags.media),
@@ -1182,7 +1222,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     case 'visual':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_screenshot_ascii',
         args: {
@@ -1197,7 +1237,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     case 'read': {
       const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: flags.visual ? 'page_read_visual' : flags.ascii ? 'page_read_ascii' : 'page_read',
         args: {
@@ -1216,48 +1256,48 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'find':
-      res = await callDaemon(live.endpoint, '/tool', { tabId, name: 'page_find', args: { query: args.join(' ') } })
+      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_find', args: { query: args.join(' ') } })
       break
     case 'text':
-      res = await callDaemon(live.endpoint, '/tool', { tabId, name: 'page_text', args: args[0] ? { ref: args[0] } : {} })
+      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_text', args: args[0] ? { ref: args[0] } : {} })
       break
     case 'click':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_click',
         args: { ref: args[0], allowSubmit: Boolean(flags['allow-submit'] || flags.submit) },
       })
       break
     case 'fill':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_fill',
         args: { ref: args[0], text: args.slice(1).join(' '), clear: flags.clear !== undefined ? Boolean(flags.clear) : true },
       })
       break
     case 'select':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_select',
         args: { ref: args[0], value: args.slice(1).join(' ') },
       })
       break
     case 'press':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_press',
         args: { key: args[0] ?? 'Enter', ref: typeof flags.ref === 'string' ? flags.ref : undefined },
       })
       break
     case 'scroll':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_scroll',
         args: { direction: args[0] || 'down', amount: args[1] ? Number(args[1]) : 450 },
       })
       break
     case 'wait':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_wait',
         args: {
@@ -1277,10 +1317,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'back':
     case 'forward':
     case 'reload':
-      res = await callDaemon(live.endpoint, '/tool', { tabId, name: 'page_history', args: { direction: cmd } })
+      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_history', args: { direction: cmd } })
       break
     case 'console':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_console',
         args: { clear: Boolean(flags.clear), level: flags.level, limit: flags.limit ? Number(flags.limit) : 50 },
@@ -1288,7 +1328,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     case 'network': {
       const bodyReqId = typeof flags.body === 'string' ? flags.body : undefined
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_network',
         args: bodyReqId
@@ -1311,27 +1351,27 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'eval':
-      res = await callDaemon(live.endpoint, '/tool', { tabId, name: 'page_eval', args: { expression: args.join(' ') } })
+      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_eval', args: { expression: args.join(' ') } })
       break
     case 'act':
-      res = await callDaemon(live.endpoint, '/tool', {
+      res = await callDaemon(daemonEndpoint, '/tool', {
         tabId,
         name: 'page_act',
         args: { steps: JSON.parse(args.join(' ')), allowSubmit: Boolean(flags['allow-submit']) },
       })
       break
     case 'recall':
-      res = await callDaemon(live.endpoint, '/recall', { query: args.join(' '), origin: flags.origin, limit: flags.limit ? Number(flags.limit) : 10 })
+      res = await callDaemon(daemonEndpoint, '/recall', { query: args.join(' '), origin: flags.origin, limit: flags.limit ? Number(flags.limit) : 10 })
       break
     case 'forget':
-      res = await callDaemon(live.endpoint, '/forget', { origin: args[0] })
+      res = await callDaemon(daemonEndpoint, '/forget', { origin: args[0] })
       break
     case 'emulate':
     case 'viewport': {
       const viewportArg = typeof flags.viewport === 'string' ? flags.viewport : args[0]
       const extraHeaders = rawHeaderArgs.length > 0 ? parseHeaderList(rawHeaderArgs) : undefined
       const removeHeaders = multiFlags['remove-header']
-      res = await callDaemon(live.endpoint, '/emulation', {
+      res = await callDaemon(daemonEndpoint, '/emulation', {
         tabId,
         allTabs: Boolean(flags['all-tabs']),
         ...(viewportArg !== undefined ? { viewport: viewportArg } : {}),
@@ -1348,7 +1388,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
     case 'downloads': {
       const modeArg = parseDownloadMode(flags.mode) ?? parseDownloadMode(args[0])
-      res = await callDaemon(live.endpoint, '/downloads', {
+      res = await callDaemon(daemonEndpoint, '/downloads', {
         blockedOnly: Boolean(flags.blocked),
         clear: Boolean(flags.clear),
         ...(typeof flags.status === 'string' ? { status: flags.status } : {}),
@@ -1365,7 +1405,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const nextRaw = typeof flags.next === 'string' ? flags.next.trim().toLowerCase() : undefined
       const queueAccept =
         nextRaw === 'accept' ? true : nextRaw === 'dismiss' ? false : undefined
-      res = await callDaemon(live.endpoint, '/dialogs', {
+      res = await callDaemon(daemonEndpoint, '/dialogs', {
         ...(tabId !== undefined ? { tabId } : {}),
         ...(typeArg ? { type: typeArg } : {}),
         ...(modeArg ? { mode: modeArg } : {}),
@@ -1384,8 +1424,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'audit': {
-      res = await callDaemon(live.endpoint, '/audit', {
+      res = await callDaemon(daemonEndpoint, '/audit', {
         ...(tabId !== undefined ? { tabId } : {}),
+        ...(sessionId ? { sessionId } : {}),
         ...(typeof flags.kind === 'string' ? { kind: flags.kind } : {}),
         ...(typeof flags.tool === 'string' ? { tool: flags.tool } : {}),
         refusedOnly: Boolean(flags.refused),
@@ -1413,6 +1454,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       cmd === 'downloads' ||
       cmd === 'dialogs' ||
       cmd === 'audit' ||
+      cmd === 'sessions' ||
       (cmd === 'network' && Boolean(flags.body)) ||
       flags.ascii) &&
     typeof res.ascii === 'string'

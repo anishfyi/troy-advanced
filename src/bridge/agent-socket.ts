@@ -9,6 +9,7 @@ import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnap
 import { formatDialogsAscii, parseDialogMode, parseDialogType } from '../engine/dialogs.js'
 import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
 import { formatAuditAscii, parseAuditEventKind } from '../agent/audit.js'
+import { formatSessionsAscii, parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 
@@ -40,7 +41,20 @@ export async function createAgentSocket(
     }
   })
 
-  async function handleRoute(pathname: string, body: Record<string, unknown>): Promise<{ status: number; payload: Record<string, unknown> }> {
+  async function handleRoute(
+    pathname: string,
+    body: Record<string, unknown>,
+    headerSessionId?: string,
+  ): Promise<{ status: number; payload: Record<string, unknown> }> {
+    let sessionId = headerSessionId
+    if (!sessionId && body.sessionId !== undefined && pathname !== '/sessions' && pathname !== '/audit') {
+      const parsedBodySession = parseSessionId(body.sessionId)
+      if (!parsedBodySession.ok) {
+        return { status: 400, payload: { ok: false, error: parsedBodySession.error } }
+      }
+      sessionId = parsedBodySession.sessionId
+    }
+
     switch (pathname) {
       case '/health': {
         const remoteCdp = manager.engine.getRemoteCdpInfo ? manager.engine.getRemoteCdpInfo() : null
@@ -52,6 +66,7 @@ export async function createAgentSocket(
             cdpPort: manager.engine.cdpPort,
             ...(remoteCdp ? { remoteCdp } : {}),
             tabs: manager.listTabs().length,
+            sessions: manager.listSessions().length,
             crashRecovery: manager.getCrashRecoveryStats(),
             downloads: manager.getDownloadStats(),
             dialogs: manager.getDialogStats(),
@@ -59,30 +74,82 @@ export async function createAgentSocket(
           },
         }
       }
+      case '/sessions': {
+        const targetRaw = body.sessionId !== undefined ? body.sessionId : headerSessionId
+        if (body.close) {
+          const parsed = parseSessionId(targetRaw)
+          if (!parsed.ok) return { status: 400, payload: { ok: false, error: parsed.error } }
+          if (!parsed.sessionId) {
+            return { status: 400, payload: { ok: false, error: 'close requires a sessionId (or x-troy-session header)' } }
+          }
+          const closed = await manager.closeSession(parsed.sessionId, {
+            closeTabs: body.closeTabs !== false,
+          })
+          return { status: 200, payload: closed }
+        }
+        if (body.sessionId !== undefined) {
+          const parsed = parseSessionId(body.sessionId)
+          if (!parsed.ok) return { status: 400, payload: { ok: false, error: parsed.error } }
+          if (parsed.sessionId) {
+            const found = manager.getSession(parsed.sessionId)
+            if (!found) return { status: 200, payload: { ok: false, error: `no session "${parsed.sessionId}"` } }
+            return {
+              status: 200,
+              payload: {
+                ok: true,
+                session: found,
+                ascii: formatSessionsAscii([found], {
+                  width: typeof body.width === 'number' ? body.width : undefined,
+                }),
+              },
+            }
+          }
+        }
+        const sessions = manager.listSessions()
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            count: sessions.length,
+            sessions,
+            ascii: formatSessionsAscii(sessions, {
+              width: typeof body.width === 'number' ? body.width : undefined,
+            }),
+          },
+        }
+      }
       case '/tabs':
-        return { status: 200, payload: { ok: true, tabs: manager.listTabs() } }
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            ...(sessionId ? { sessionId } : {}),
+            tabs: manager.listTabs({ sessionId }),
+          },
+        }
       case '/open': {
         const res = await manager.openTab(typeof body.url === 'string' ? body.url : undefined, {
           activate: Boolean(body.activate),
           ownedByBridge: true,
+          sessionId,
         })
         return { status: 200, payload: res }
       }
       case '/activate': {
         const id = Number(body.tabId)
         if (!Number.isFinite(id)) return { status: 200, payload: { ok: false, error: 'no tabId' } }
-        return { status: 200, payload: manager.activateTab(id) }
+        return { status: 200, payload: manager.activateTab(id, { sessionId }) }
       }
       case '/close': {
         const id = Number(body.tabId)
         if (!Number.isFinite(id)) return { status: 200, payload: { ok: false, error: 'no tabId' } }
-        const res = await manager.closeTab(id, body.force ? false : true)
+        const res = await manager.closeTab(id, body.force ? false : true, { sessionId })
         return { status: 200, payload: res }
       }
       case '/grant-origin': {
         const origin = String(body.origin ?? '')
         if (!origin) return { status: 200, payload: { ok: false, error: 'grant needs an http(s) origin' } }
-        return { status: 200, payload: manager.grantOrigin(origin) }
+        return { status: 200, payload: manager.grantOrigin(origin, { sessionId }) }
       }
       case '/ascii': {
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
@@ -105,6 +172,7 @@ export async function createAgentSocket(
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           since: Boolean(body.since),
           settle: body.settle as boolean | Record<string, unknown> | undefined,
+          sessionId,
         })
         return {
           status: 200,
@@ -116,6 +184,7 @@ export async function createAgentSocket(
                 url: res.snapshot?.url,
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
+                ...(sessionId ? { sessionId } : {}),
                 ...(res.estimatedTokens !== undefined ? { estimatedTokens: res.estimatedTokens } : {}),
                 ...(res.tokenBudget ? { tokenBudget: res.tokenBudget } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
@@ -123,7 +192,12 @@ export async function createAgentSocket(
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),
                 ...(res.delta ? { delta: res.delta } : {}),
               }
-            : { ok: false, error: res.error },
+            : {
+                ok: false,
+                ...(res.status ? { status: res.status } : {}),
+                ...(res.code ? { code: res.code } : {}),
+                error: res.error,
+              },
         }
       }
       case '/markdown': {
@@ -146,6 +220,7 @@ export async function createAgentSocket(
           crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           settle: body.settle as boolean | Record<string, unknown> | undefined,
+          sessionId,
         })
         return {
           status: 200,
@@ -156,18 +231,24 @@ export async function createAgentSocket(
                 url: res.snapshot?.url,
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
+                ...(sessionId ? { sessionId } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),
               }
-            : { ok: false, error: res.error },
+            : {
+                ok: false,
+                ...(res.status ? { status: res.status } : {}),
+                ...(res.code ? { code: res.code } : {}),
+                error: res.error,
+              },
         }
       }
       case '/tool': {
         const name = String(body.name ?? '')
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
         const args = (typeof body.args === 'object' && body.args !== null ? body.args : {}) as Record<string, unknown>
-        const result = await manager.runTool(tabId, name, args)
+        const result = await manager.runTool(tabId, name, args, { sessionId })
         return { status: 200, payload: result }
       }
       case '/recall': {
@@ -435,11 +516,18 @@ export async function createAgentSocket(
             },
           }
         }
+        const auditSessionId =
+          typeof body.sessionId === 'string' && body.sessionId.trim()
+            ? body.sessionId.trim()
+            : body.sessionOnly && headerSessionId
+              ? headerSessionId
+              : undefined
         const entries = manager.getAuditLog({
           limit: typeof body.limit === 'number' ? body.limit : 100,
           kind: parseAuditEventKind(body.kind),
           tool: typeof body.tool === 'string' && body.tool.trim() ? body.tool.trim() : undefined,
           tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          sessionId: auditSessionId,
           refusedOnly: Boolean(body.refusedOnly),
           urlChangedOnly: Boolean(body.urlChangedOnly),
           failedOnly: Boolean(body.failedOnly),
@@ -484,10 +572,23 @@ export async function createAgentSocket(
       return respond(401, { ok: false, error: 'missing or invalid x-troy-agent token' })
     }
 
+    const parsedHeaderSession = parseSessionId(req.headers[SESSION_HEADER])
+    if (!parsedHeaderSession.ok) {
+      return respond(400, { ok: false, error: parsedHeaderSession.error })
+    }
+    const headerSessionId = parsedHeaderSession.sessionId
+
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      handleRoute('/health', {})
+      handleRoute('/health', {}, headerSessionId)
+        .then((r) => respond(r.status, r.payload))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/sessions') {
+      handleRoute('/sessions', {}, headerSessionId)
         .then((r) => respond(r.status, r.payload))
         .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
       return
@@ -529,7 +630,7 @@ export async function createAgentSocket(
       } catch {
         return respond(400, { ok: false, error: 'body must be JSON' })
       }
-      handleRoute(url.pathname, body)
+      handleRoute(url.pathname, body, headerSessionId)
         .then((r) => respond(r.status, r.payload))
         .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
     })

@@ -14,6 +14,16 @@ export interface TabSummary {
   active: boolean
   loading: boolean
   engine: 'chromium' | 'lite'
+  ownerSession?: string
+}
+
+export interface AgentSessionSummary {
+  id: string
+  createdAt: number
+  lastActiveAt: number
+  ownedTabIds: number[]
+  activeTabId: number | null
+  allowedOrigins: string[]
 }
 
 export interface ElementDescriptor {
@@ -159,6 +169,7 @@ export interface AgentActivityEntry {
   id: number
   ts: number
   tabId?: number
+  sessionId?: string
   tool: string
   summary: string
   ok: boolean
@@ -783,6 +794,7 @@ export interface AuditEntry {
   kind: AuditEventKind
   tool: string
   tabId?: number
+  sessionId?: string
   ok: boolean
   refused: boolean
   refusal?: AuditRefusalInfo
@@ -811,6 +823,7 @@ export interface AuditQueryOptions {
   kind?: AuditEventKind
   tool?: string
   tabId?: number
+  sessionId?: string
   refusedOnly?: boolean
   urlChangedOnly?: boolean
   failedOnly?: boolean

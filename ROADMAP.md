@@ -72,7 +72,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M59: OpenAI / Anthropic / Gemini JSON tool-schema generator (`troy-advanced schema --format openai|anthropic|gemini|mcp`)
 - [x] M60: Agent action audit log (`audit.jsonl`) recording every tool call, refusal, timing, and URL transition
 - [x] M61: Token-budget estimator & auto-trimmer (`--max-tokens N`) that fits ASCII page output cleanly into any LLM context window
-- [ ] M62: Multi-agent tab isolation: named agent sessions (`x-troy-session`) with per-session owned-tab tracking and origin scopes
+- [x] M62: Multi-agent tab isolation: named agent sessions (`x-troy-session`) with per-session owned-tab tracking and origin scopes
 - [ ] M63: Structured data extractor (`page_extract` tool) returning tables, forms, links, headings, and JSON-LD/OpenGraph metadata
 - [ ] M64: Replayable macro/script runner (`troy-advanced run <flow.json>`) with assertions and ASCII failure dumps
 - [ ] M65: Streaming SSE `/stream` live ASCII frame broadcasts whenever the active tab navigates or mutates

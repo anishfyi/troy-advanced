@@ -7,6 +7,7 @@ import os from 'node:os'
 import type {
   ActStep,
   AgentActivityEntry,
+  AgentSessionSummary,
   AsciiRenderOptions,
   AuditEntry,
   AuditLogOptions,
@@ -57,6 +58,7 @@ import {
 } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
 import { AuditLogger, extractRefusalInfo } from '../agent/audit.js'
+import { SessionRegistry } from '../agent/sessions.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
@@ -129,6 +131,7 @@ interface TabSession {
   elements: ElementRegistry
   lastSnapshot: PageSnapshot | null
   ownedByBridge: boolean
+  ownerSession?: string
 }
 
 export interface BrowserManagerOptions {
@@ -162,6 +165,7 @@ export class BrowserManager {
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
+  private sessions = new SessionRegistry()
   private eventListeners = new Set<(event: Record<string, unknown>) => void>()
   private activityLog: AgentActivityEntry[] = []
   private nextActivityId = 1
@@ -388,7 +392,77 @@ export class BrowserManager {
     })
   }
 
-  listTabs(): TabSummary[] {
+  listSessions(): AgentSessionSummary[] {
+    return this.sessions.list()
+  }
+
+  getSession(sessionId: string): AgentSessionSummary | null {
+    return this.sessions.get(sessionId)
+  }
+
+  async closeSession(
+    sessionId: string,
+    opts: { closeTabs?: boolean } = {},
+  ): Promise<{ ok: boolean; sessionId: string; closedTabIds: number[]; removed: boolean; error?: string }> {
+    const startedAt = Date.now()
+    const summary = this.sessions.get(sessionId)
+    if (!summary) {
+      return { ok: false, sessionId, closedTabIds: [], removed: false, error: `no session "${sessionId}"` }
+    }
+    const closeTabs = opts.closeTabs !== false
+    const closedTabIds: number[] = []
+    if (closeTabs) {
+      for (const tabId of [...summary.ownedTabIds]) {
+        const tab = this.tabs.get(tabId)
+        if (!tab) continue
+        await tab.driver.close()
+        this.tabs.delete(tabId)
+        closedTabIds.push(tabId)
+        if (this.activeTabId === tabId) {
+          const next = this.tabs.keys().next()
+          this.activeTabId = next.done ? null : next.value
+        }
+        this.emit({ type: 'tab_closed', tabId, sessionId })
+      }
+    } else {
+      for (const tabId of summary.ownedTabIds) {
+        const tab = this.tabs.get(tabId)
+        if (tab) tab.ownerSession = undefined
+      }
+    }
+    const del = this.sessions.delete(sessionId)
+    this.emit({ type: 'session_closed', sessionId, closedTabIds })
+    this.audit.record({
+      tsMs: startedAt,
+      kind: 'tab_action',
+      tool: 'session_close',
+      sessionId,
+      ok: true,
+      refused: false,
+      durationMs: Date.now() - startedAt,
+      args: { sessionId, closeTabs },
+      summary: `closed session "${sessionId}" (${closedTabIds.length} tabs)`,
+    })
+    return { ok: true, sessionId, closedTabIds, removed: del.removed }
+  }
+
+  listTabs(opts: { sessionId?: string } = {}): TabSummary[] {
+    const sessionId = opts.sessionId
+    if (sessionId) {
+      const ownedSet = new Set(this.sessions.getOwnedTabIds(sessionId))
+      const sessionActive = this.sessions.getActiveTabId(sessionId)
+      return [...this.tabs.values()]
+        .filter((s) => ownedSet.has(s.driver.id))
+        .map((s) => ({
+          id: s.driver.id,
+          url: s.driver.getUrl(),
+          title: s.driver.getTitle(),
+          active: s.driver.id === sessionActive,
+          loading: s.driver.isLoading(),
+          engine: s.driver.engine,
+          ...(s.ownerSession ? { ownerSession: s.ownerSession } : {}),
+        }))
+    }
     return [...this.tabs.values()].map((s) => ({
       id: s.driver.id,
       url: s.driver.getUrl(),
@@ -396,23 +470,41 @@ export class BrowserManager {
       active: s.driver.id === this.activeTabId,
       loading: s.driver.isLoading(),
       engine: s.driver.engine,
+      ...(s.ownerSession ? { ownerSession: s.ownerSession } : {}),
     }))
   }
 
   private refreshOrigins(): void {
     for (const s of this.tabs.values()) {
       const origin = exactOrigin(s.driver.getUrl())
-      if (origin) this.allowedOrigins.add(origin)
+      if (!origin) continue
+      if (s.ownerSession) {
+        this.sessions.grantOrigin(s.ownerSession, origin)
+      } else {
+        this.allowedOrigins.add(origin)
+      }
     }
   }
 
-  grantOrigin(originOrUrl: string): { ok: boolean; origin?: string; error?: string } {
+  private getAllowedOrigins(sessionId?: string): Set<string> {
+    if (sessionId) {
+      return this.sessions.getAllowedOrigins(sessionId)
+    }
+    return this.allowedOrigins
+  }
+
+  grantOrigin(
+    originOrUrl: string,
+    opts: { sessionId?: string } = {},
+  ): { ok: boolean; origin?: string; sessionId?: string; error?: string } {
     const startedAt = Date.now()
+    const sessionId = opts.sessionId
     const origin = normalizeOrigin(originOrUrl)
     if (!origin) {
       const durationMs = Date.now() - startedAt
       this.recordActivity({
         ts: startedAt,
+        ...(sessionId ? { sessionId } : {}),
         tool: 'origin_grant',
         summary: originOrUrl || '(empty)',
         ok: false,
@@ -423,6 +515,7 @@ export class BrowserManager {
         tsMs: startedAt,
         kind: 'refusal',
         tool: 'origin_grant',
+        ...(sessionId ? { sessionId } : {}),
         ok: false,
         refused: true,
         refusal: { status: 'blocked', code: 'origin', reason: 'grant needs an http(s) origin' },
@@ -433,11 +526,16 @@ export class BrowserManager {
       })
       return { ok: false, error: 'grant needs an http(s) origin' }
     }
-    this.allowedOrigins.add(origin)
-    this.emit({ type: 'origin_granted', origin })
+    if (sessionId) {
+      this.sessions.grantOrigin(sessionId, origin)
+    } else {
+      this.allowedOrigins.add(origin)
+    }
+    this.emit({ type: 'origin_granted', origin, ...(sessionId ? { sessionId } : {}) })
     const durationMs = Date.now() - startedAt
     this.recordActivity({
       ts: startedAt,
+      ...(sessionId ? { sessionId } : {}),
       tool: 'origin_grant',
       summary: origin,
       ok: true,
@@ -448,6 +546,7 @@ export class BrowserManager {
       tsMs: startedAt,
       kind: 'origin_grant',
       tool: 'origin_grant',
+      ...(sessionId ? { sessionId } : {}),
       ok: true,
       refused: false,
       durationMs,
@@ -455,11 +554,15 @@ export class BrowserManager {
       summary: origin,
       toUrl: origin,
     })
-    return { ok: true, origin }
+    return { ok: true, origin, ...(sessionId ? { sessionId } : {}) }
   }
 
-  async openTab(inputUrl?: string, opts: { activate?: boolean; ownedByBridge?: boolean } = {}) {
+  async openTab(
+    inputUrl?: string,
+    opts: { activate?: boolean; ownedByBridge?: boolean; sessionId?: string } = {},
+  ): Promise<{ ok: boolean; id?: number; url?: string; title?: string; sessionId?: string; error?: string }> {
     const startedAt = Date.now()
+    const sessionId = opts.sessionId
     let targetUrl: string | undefined
     if (inputUrl && inputUrl.trim()) {
       const resolved = resolveInput(inputUrl)
@@ -468,6 +571,7 @@ export class BrowserManager {
         const durationMs = Date.now() - startedAt
         this.recordActivity({
           ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
           tool: 'tab_open',
           summary: inputUrl,
           ok: false,
@@ -478,6 +582,7 @@ export class BrowserManager {
           tsMs: startedAt,
           kind: 'refusal',
           tool: 'tab_open',
+          ...(sessionId ? { sessionId } : {}),
           ok: false,
           refused: true,
           refusal: { status: 'blocked', code: 'scheme', reason: resolved.reason },
@@ -490,7 +595,13 @@ export class BrowserManager {
       }
       targetUrl = resolved.url
       const origin = exactOrigin(targetUrl)
-      if (origin) this.allowedOrigins.add(origin)
+      if (origin) {
+        if (sessionId) {
+          this.sessions.grantOrigin(sessionId, origin)
+        } else {
+          this.allowedOrigins.add(origin)
+        }
+      }
     }
 
     const driver = await this.engine.createTab(targetUrl)
@@ -499,19 +610,32 @@ export class BrowserManager {
       elements: new ElementRegistry(),
       lastSnapshot: null,
       ownedByBridge: opts.ownedByBridge ?? true,
+      ...(sessionId ? { ownerSession: sessionId } : {}),
     }
     this.tabs.set(driver.id, session)
-    if (this.activeTabId === null || opts.activate) {
+    if (sessionId) {
+      this.sessions.addOwnedTab(sessionId, driver.id, Boolean(opts.activate))
+      if (this.activeTabId === null) {
+        this.activeTabId = driver.id
+      }
+    } else if (this.activeTabId === null || opts.activate) {
       this.activeTabId = driver.id
     }
     const finalUrl = driver.getUrl()
     const finalOrigin = exactOrigin(finalUrl)
-    if (finalOrigin) this.allowedOrigins.add(finalOrigin)
-    this.emit({ type: 'tab_opened', tabId: driver.id, url: finalUrl })
+    if (finalOrigin) {
+      if (sessionId) {
+        this.sessions.grantOrigin(sessionId, finalOrigin)
+      } else {
+        this.allowedOrigins.add(finalOrigin)
+      }
+    }
+    this.emit({ type: 'tab_opened', tabId: driver.id, url: finalUrl, ...(sessionId ? { sessionId } : {}) })
     const durationMs = Date.now() - startedAt
     this.recordActivity({
       ts: startedAt,
       tabId: driver.id,
+      ...(sessionId ? { sessionId } : {}),
       tool: 'tab_open',
       summary: finalUrl,
       ok: true,
@@ -523,6 +647,7 @@ export class BrowserManager {
       kind: 'tab_action',
       tool: 'tab_open',
       tabId: driver.id,
+      ...(sessionId ? { sessionId } : {}),
       ok: true,
       refused: false,
       durationMs,
@@ -531,22 +656,85 @@ export class BrowserManager {
       toUrl: finalUrl,
       urlChanged: Boolean(finalUrl && finalUrl !== 'about:blank'),
     })
-    return { ok: true, id: driver.id, url: finalUrl, title: driver.getTitle() }
+    return {
+      ok: true,
+      id: driver.id,
+      url: finalUrl,
+      title: driver.getTitle(),
+      ...(sessionId ? { sessionId } : {}),
+    }
   }
 
-  activateTab(tabId: number): { ok: boolean; error?: string } {
+  activateTab(
+    tabId: number,
+    opts: { sessionId?: string } = {},
+  ): { ok: boolean; status?: 'blocked'; code?: string; error?: string } {
+    const startedAt = Date.now()
+    const sessionId = opts.sessionId
     if (!this.tabs.has(tabId)) return { ok: false, error: `no tab ${tabId}` }
+    if (sessionId) {
+      this.sessions.touch(sessionId)
+      if (!this.sessions.isTabOwnedBy(tabId, sessionId)) {
+        const owner = this.sessions.getTabOwner(tabId)
+        const error = owner
+          ? `tab ${tabId} is owned by session "${owner}"; session "${sessionId}" cannot activate it`
+          : `tab ${tabId} is not owned by session "${sessionId}"`
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_activate',
+          tabId,
+          sessionId,
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'session_isolation', reason: error },
+          durationMs: Date.now() - startedAt,
+          error,
+        })
+        return { ok: false, status: 'blocked', code: 'session_isolation', error }
+      }
+      this.sessions.setActiveTabId(sessionId, tabId)
+      this.emit({ type: 'tab_activated', tabId, sessionId })
+      return { ok: true }
+    }
     this.activeTabId = tabId
     this.emit({ type: 'tab_activated', tabId })
     return { ok: true }
   }
 
-  async closeTab(tabId: number, requireOwned = false): Promise<{ ok: boolean; error?: string }> {
+  async closeTab(
+    tabId: number,
+    requireOwned = false,
+    opts: { sessionId?: string } = {},
+  ): Promise<{ ok: boolean; status?: 'blocked'; code?: string; error?: string }> {
     const startedAt = Date.now()
+    const sessionId = opts.sessionId
     const session = this.tabs.get(tabId)
     if (!session) return { ok: false, error: `no tab ${tabId}` }
     const fromUrl = session.driver.getUrl()
-    if (requireOwned && !session.ownedByBridge) {
+    if (sessionId) {
+      this.sessions.touch(sessionId)
+      if (!this.sessions.isTabOwnedBy(tabId, sessionId)) {
+        const owner = this.sessions.getTabOwner(tabId)
+        const error = owner
+          ? `tab ${tabId} is owned by session "${owner}"; session "${sessionId}" cannot close it`
+          : `tab ${tabId} is not owned by session "${sessionId}"`
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_close',
+          tabId,
+          sessionId,
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'session_isolation', reason: error },
+          durationMs: Date.now() - startedAt,
+          fromUrl,
+          error,
+        })
+        return { ok: false, status: 'blocked', code: 'session_isolation', error }
+      }
+    } else if (requireOwned && !session.ownedByBridge) {
       const error = 'this bridge session did not open that tab; refusing to close it'
       this.audit.record({
         tsMs: startedAt,
@@ -564,16 +752,18 @@ export class BrowserManager {
     }
     await session.driver.close()
     this.tabs.delete(tabId)
+    this.sessions.removeTab(tabId)
     if (this.activeTabId === tabId) {
       const next = this.tabs.keys().next()
       this.activeTabId = next.done ? null : next.value
     }
-    this.emit({ type: 'tab_closed', tabId })
+    this.emit({ type: 'tab_closed', tabId, ...(sessionId ? { sessionId } : {}) })
     this.audit.record({
       tsMs: startedAt,
       kind: 'tab_action',
       tool: 'tab_close',
       tabId,
+      ...(sessionId ? { sessionId } : {}),
       ok: true,
       refused: false,
       durationMs: Date.now() - startedAt,
@@ -587,6 +777,40 @@ export class BrowserManager {
     if (this.activeTabId !== null) return this.tabs.get(this.activeTabId) ?? null
     const first = this.tabs.values().next()
     return first.done ? null : first.value
+  }
+
+  private resolveTabForSession(
+    tabId: number | undefined,
+    sessionId?: string,
+  ): { ok: true; session: TabSession } | { ok: false; error: string; status?: 'blocked'; code?: string } {
+    if (!sessionId) {
+      const s = this.resolveSession(tabId)
+      if (!s) return { ok: false, error: tabId !== undefined ? `no tab ${tabId}` : 'no open tab' }
+      return { ok: true, session: s }
+    }
+    this.sessions.touch(sessionId)
+    if (tabId !== undefined) {
+      const s = this.tabs.get(tabId)
+      if (!s) return { ok: false, error: `no tab ${tabId}` }
+      if (!this.sessions.isTabOwnedBy(tabId, sessionId)) {
+        const owner = this.sessions.getTabOwner(tabId)
+        return {
+          ok: false,
+          status: 'blocked',
+          code: 'session_isolation',
+          error: owner
+            ? `tab ${tabId} is owned by session "${owner}"; session "${sessionId}" cannot access it`
+            : `tab ${tabId} is not owned by session "${sessionId}"`,
+        }
+      }
+      return { ok: true, session: s }
+    }
+    const activeId = this.sessions.getActiveTabId(sessionId)
+    if (activeId !== null) {
+      const s = this.tabs.get(activeId)
+      if (s) return { ok: true, session: s }
+    }
+    return { ok: false, error: `no open tab in session "${sessionId}"` }
   }
 
   private async takeIndexedSnapshot(session: TabSession): Promise<PageSnapshot> {
@@ -715,6 +939,7 @@ export class BrowserManager {
       crop?: Rect | string
       ref?: string
       settle?: boolean | SettleOptions
+      sessionId?: string
     } = {},
   ): Promise<{
     ok: boolean
@@ -734,10 +959,20 @@ export class BrowserManager {
     focusedLineIndex?: number
     estimatedTokens?: number
     tokenBudget?: TokenBudgetReport
+    status?: 'blocked'
+    code?: string
     error?: string
   }> {
-    const session = this.resolveSession(tabId)
-    if (!session) return { ok: false, error: 'no open tab' }
+    const resolvedTab = this.resolveTabForSession(tabId, opts.sessionId)
+    if (!resolvedTab.ok) {
+      return {
+        ok: false,
+        ...(resolvedTab.status ? { status: resolvedTab.status } : {}),
+        ...(resolvedTab.code ? { code: resolvedTab.code } : {}),
+        error: resolvedTab.error,
+      }
+    }
+    const session = resolvedTab.session
     const settleOpts = this.extractSettleOptions(opts as Record<string, unknown>)
     const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
     const cropRes = this.resolveCropArgs(session, { crop: opts.crop, ref: opts.ref })
@@ -778,14 +1013,14 @@ export class BrowserManager {
         ...(settleRes ? { settle: settleRes } : {}),
       }
     }
-    const { crop: _rawCrop, ref: _rawRef, since: _since, settle: _settle, ...renderOpts } = opts
+    const { crop: _rawCrop, ref: _rawRef, since: _since, settle: _settle, sessionId: _sessionId, ...renderOpts } = opts
     const rendered = renderPageAsciiWithMetrics(snap, {
       ...renderOpts,
       maxTokens,
       crop: cropRes.crop,
       cropLabel: cropRes.cropRef ?? opts.cropLabel,
-      tabs: this.listTabs(),
-      activeTabId: this.activeTabId ?? snap.tabId,
+      tabs: this.listTabs({ sessionId: opts.sessionId }),
+      activeTabId: (opts.sessionId ? this.sessions.getActiveTabId(opts.sessionId) : this.activeTabId) ?? snap.tabId,
     })
     const estimatedTokens = rendered.tokenBudget
       ? rendered.tokenBudget.finalTokens
@@ -816,6 +1051,7 @@ export class BrowserManager {
       crop?: Rect | string
       ref?: string
       settle?: boolean | SettleOptions
+      sessionId?: string
     } = {},
   ): Promise<{
     ok: boolean
@@ -824,17 +1060,27 @@ export class BrowserManager {
     settle?: SettleResult
     crop?: Rect
     cropRef?: string
+    status?: 'blocked'
+    code?: string
     error?: string
   }> {
-    const session = this.resolveSession(tabId)
-    if (!session) return { ok: false, error: 'no open tab' }
+    const resolvedTab = this.resolveTabForSession(tabId, opts.sessionId)
+    if (!resolvedTab.ok) {
+      return {
+        ok: false,
+        ...(resolvedTab.status ? { status: resolvedTab.status } : {}),
+        ...(resolvedTab.code ? { code: resolvedTab.code } : {}),
+        error: resolvedTab.error,
+      }
+    }
+    const session = resolvedTab.session
     const settleOpts = this.extractSettleOptions(opts as Record<string, unknown>)
     const settleRes = settleOpts ? await session.driver.waitForSettle(settleOpts) : undefined
     const cropRes = this.resolveCropArgs(session, { crop: opts.crop, ref: opts.ref })
     if ('error' in cropRes) return { ok: false, error: cropRes.error }
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
-    const { crop: _rawCrop, ref: _rawRef, settle: _settle, ...renderOpts } = opts
+    const { crop: _rawCrop, ref: _rawRef, settle: _settle, sessionId: _sessionId, ...renderOpts } = opts
     const markdown = renderPageMarkdown(snap, {
       ...renderOpts,
       crop: cropRes.crop,
@@ -891,15 +1137,23 @@ export class BrowserManager {
     }
   }
 
-  async runTool(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  async runTool(
+    tabId: number | undefined,
+    name: string,
+    args: Record<string, unknown> = {},
+    opts: { sessionId?: string } = {},
+  ): Promise<Record<string, unknown>> {
     const startedAt = Date.now()
-    const sessionBefore = this.resolveSession(tabId)
+    const sessionId = opts.sessionId
+    const beforeResolved = this.resolveTabForSession(tabId, sessionId)
+    const sessionBefore = beforeResolved.ok ? beforeResolved.session : null
     const resolvedTabId = sessionBefore?.driver.id ?? tabId
     const fromUrl = sessionBefore?.driver.getUrl()
     const summary = this.summarizeToolArgs(name, args)
     try {
-      const res = await this.runToolImpl(tabId, name, args)
-      const sessionAfter = this.resolveSession(tabId)
+      const res = await this.runToolImpl(tabId, name, args, sessionId)
+      const afterResolved = this.resolveTabForSession(tabId, sessionId)
+      const sessionAfter = afterResolved.ok ? afterResolved.session : null
       const durationMs = Date.now() - startedAt
       const toUrl = typeof res.url === 'string' ? res.url : sessionAfter?.driver.getUrl()
       const finalTabId = sessionAfter?.driver.id ?? resolvedTabId
@@ -911,6 +1165,7 @@ export class BrowserManager {
       this.recordActivity({
         ts: startedAt,
         tabId: finalTabId,
+        ...(sessionId ? { sessionId } : {}),
         tool: name,
         summary,
         ok,
@@ -923,6 +1178,7 @@ export class BrowserManager {
         kind: 'tool_call',
         tool: name,
         tabId: finalTabId,
+        ...(sessionId ? { sessionId } : {}),
         ok,
         refused: Boolean(refusal),
         refusal,
@@ -941,6 +1197,7 @@ export class BrowserManager {
       this.recordActivity({
         ts: startedAt,
         tabId: resolvedTabId,
+        ...(sessionId ? { sessionId } : {}),
         tool: name,
         summary,
         ok: false,
@@ -952,6 +1209,7 @@ export class BrowserManager {
         kind: 'tool_call',
         tool: name,
         tabId: resolvedTabId,
+        ...(sessionId ? { sessionId } : {}),
         ok: false,
         refused: false,
         durationMs,
@@ -964,9 +1222,18 @@ export class BrowserManager {
     }
   }
 
-  private async runToolImpl(tabId: number | undefined, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    const session = this.resolveSession(tabId)
+  private async runToolImpl(
+    tabId: number | undefined,
+    name: string,
+    args: Record<string, unknown> = {},
+    sessionId?: string,
+  ): Promise<Record<string, unknown>> {
+    const resolvedTab = this.resolveTabForSession(tabId, sessionId)
+    const session = resolvedTab.ok ? resolvedTab.session : null
     if (name === 'page_dialogs') {
+      if (!resolvedTab.ok && resolvedTab.code === 'session_isolation') {
+        return { ok: false, status: resolvedTab.status, code: resolvedTab.code, error: resolvedTab.error }
+      }
       if (args.clearQueue) {
         this.clearDialogQueue()
       }
@@ -1017,8 +1284,17 @@ export class BrowserManager {
         ascii: formatDialogsAscii(entries, stats, queue),
       }
     }
+    if (!resolvedTab.ok) {
+      return {
+        ok: false,
+        ...(resolvedTab.status ? { status: resolvedTab.status } : {}),
+        code: resolvedTab.code ?? 'no-tab',
+        error: resolvedTab.error,
+      }
+    }
     if (!session) return { ok: false, error: 'no such tab', code: 'no-tab' }
     this.refreshOrigins()
+    const allowedOrigins = this.getAllowedOrigins(sessionId)
     const ctx = () => ({ tabId: session.driver.id, url: session.driver.getUrl(), epoch: session.driver.getEpoch() })
 
     switch (name) {
@@ -1085,8 +1361,8 @@ export class BrowserManager {
           maxTokens,
           crop: cropRes.crop,
           cropLabel: cropRes.cropRef,
-          tabs: this.listTabs(),
-          activeTabId: this.activeTabId ?? snap.tabId,
+          tabs: this.listTabs({ sessionId }),
+          activeTabId: (sessionId ? this.sessions.getActiveTabId(sessionId) : this.activeTabId) ?? snap.tabId,
         })
         const ascii = renderedAscii.ascii
         const tokenBudget = renderedAscii.tokenBudget
@@ -1235,7 +1511,7 @@ export class BrowserManager {
         const decision = authorizeAction({
           name: 'page_navigate',
           targetUrl: resolved.url,
-          allowedOrigins: this.allowedOrigins,
+          allowedOrigins,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -1244,7 +1520,7 @@ export class BrowserManager {
         const nav = await session.driver.navigate(resolved.url)
         session.elements.invalidate()
         this.memory?.recordAction({ kind: 'navigate', selector: '', text: input, fromUrl, toUrl: nav.url, ok: true })
-        this.emit({ type: 'navigated', tabId: session.driver.id, url: nav.url, title: nav.title })
+        this.emit({ type: 'navigated', tabId: session.driver.id, url: nav.url, title: nav.title, ...(sessionId ? { sessionId } : {}) })
         return { ok: true, ...nav }
       }
 
@@ -1256,7 +1532,7 @@ export class BrowserManager {
           name: 'page_click',
           item: resolved.item,
           allowSubmit: Boolean(args.allowSubmit),
-          allowedOrigins: this.allowedOrigins,
+          allowedOrigins,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -1282,7 +1558,7 @@ export class BrowserManager {
               name: 'page_click',
               item: domRec.item,
               allowSubmit: Boolean(args.allowSubmit),
-              allowedOrigins: this.allowedOrigins,
+              allowedOrigins,
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }
@@ -1325,7 +1601,7 @@ export class BrowserManager {
         const decision = authorizeAction({
           name: 'page_fill',
           item: resolved.item,
-          allowedOrigins: this.allowedOrigins,
+          allowedOrigins,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -1351,7 +1627,7 @@ export class BrowserManager {
             const reDecision = authorizeAction({
               name: 'page_fill',
               item: domRec.item,
-              allowedOrigins: this.allowedOrigins,
+              allowedOrigins,
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }
@@ -1392,7 +1668,7 @@ export class BrowserManager {
         const decision = authorizeAction({
           name: 'page_select',
           item: resolved.item,
-          allowedOrigins: this.allowedOrigins,
+          allowedOrigins,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -1416,7 +1692,7 @@ export class BrowserManager {
             const reDecision = authorizeAction({
               name: 'page_select',
               item: domRec.item,
-              allowedOrigins: this.allowedOrigins,
+              allowedOrigins,
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }
@@ -1754,7 +2030,7 @@ export class BrowserManager {
         const decision = authorizeAction({
           name: 'page_eval',
           currentUrl: session.driver.getUrl(),
-          allowedOrigins: this.allowedOrigins,
+          allowedOrigins,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -1769,10 +2045,15 @@ export class BrowserManager {
         const startUrl = session.driver.getUrl()
         for (const step of steps) {
           const toolName = step.op === 'read_ascii' ? 'page_read_ascii' : `page_${step.op}`
-          const stepRes = await this.runTool(session.driver.id, toolName, {
-            ...step,
-            allowSubmit: step.allowSubmit ?? args.allowSubmit,
-          })
+          const stepRes = await this.runTool(
+            session.driver.id,
+            toolName,
+            {
+              ...step,
+              allowSubmit: step.allowSubmit ?? args.allowSubmit,
+            },
+            { sessionId },
+          )
           results.push({ op: step.op, ref: step.ref, ...stepRes })
           if (!stepRes.ok) {
             return { ok: false, stoppedAt: results.length - 1, results, error: stepRes.error }
