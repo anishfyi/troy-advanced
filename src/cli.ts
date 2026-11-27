@@ -23,6 +23,14 @@ import {
   parseAuditEventKind,
   readAuditJsonl,
 } from './agent/audit.js'
+import {
+  createDaemonFlowExecutor,
+  createManagerFlowExecutor,
+  formatFlowReportAscii,
+  parseFlowJson,
+  parseVarOverrides,
+  runFlow,
+} from './agent/flow-runner.js'
 import { parseSessionId, SESSION_HEADER } from './agent/sessions.js'
 import { parseDialogMode, parseDialogType } from './engine/dialogs.js'
 import { parseDownloadMode } from './engine/downloads.js'
@@ -73,6 +81,8 @@ Daemon & Modes:
                                                          Model Context Protocol stdio server (auto-detects NDJSON & Content-Length framing)
   schema       [--format openai|anthropic|gemini|mcp] [--tools a,b] [--prefix <str>] [--strict] [--compact] [--out <file>]
                                                          Generate provider-ready JSON tool schemas for OpenAI, Anthropic, Gemini, or MCP
+  run          <flow.json|-> [--var k=v] [--base-url <url>] [--dump-dir <dir>] [--continue-on-error] [--oneshot] [--width N] [--height N] [--json]
+                                                         Execute a replayable JSON macro/flow with assertions and ASCII failure dumps
   pipe         [--json] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Streaming stdin/stdout AI REPL
   doctor       [--json]                                  EC2 / Linux / Chrome environment check
@@ -189,9 +199,12 @@ const VALUE_FLAGS = new Set([
   '--file',
   '--kind',
   '--tool',
+  '--var',
+  '--base-url',
+  '--dump-dir',
 ])
 
-const REPEATABLE_FLAGS = new Set(['--header', '--remove-header'])
+const REPEATABLE_FLAGS = new Set(['--header', '--remove-header', '--var'])
 
 async function readStdinUtf8(): Promise<string> {
   const chunks: Buffer[] = []
@@ -376,6 +389,103 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           width: flags.width !== undefined ? Number(flags.width) : undefined,
         }),
       )
+    }
+    return
+  }
+
+  if (cmd === 'run') {
+    const flowPath = positional[1]
+    if (!flowPath) {
+      console.error(
+        JSON.stringify(
+          { ok: false, error: 'Usage: troy-advanced run <flow.json|-> [--var k=v] [--base-url <url>] [--dump-dir <dir>] [--continue-on-error] [--oneshot] [--json]' },
+          null,
+          2,
+        ),
+      )
+      process.exit(1)
+    }
+
+    let rawFlow: string
+    try {
+      rawFlow = flowPath === '-' ? await readStdinUtf8() : fs.readFileSync(path.resolve(flowPath), 'utf8')
+    } catch (err) {
+      console.error(JSON.stringify({ ok: false, error: `Failed to read flow "${flowPath}": ${(err as Error).message}` }, null, 2))
+      process.exit(1)
+    }
+
+    let flow
+    let varOverrides: Record<string, string>
+    try {
+      flow = parseFlowJson(rawFlow)
+      varOverrides = parseVarOverrides(multiFlags.var ?? [])
+    } catch (err) {
+      console.error(JSON.stringify({ ok: false, error: (err as Error).message }, null, 2))
+      process.exit(1)
+    }
+
+    const runOpts = {
+      vars: varOverrides,
+      baseUrl: typeof flags['base-url'] === 'string' ? flags['base-url'] : undefined,
+      stopOnFailure: flags['continue-on-error'] ? false : undefined,
+      dumpDir: typeof flags['dump-dir'] === 'string' ? path.resolve(flags['dump-dir']) : undefined,
+      dumpWidth: flags.width !== undefined ? Number(flags.width) : undefined,
+      dumpHeight: flags.height !== undefined ? Number(flags.height) : undefined,
+    }
+
+    const rawSession = typeof flags.session === 'string' ? flags.session : process.env.TROY_SESSION
+    const parsedSession = parseSessionId(rawSession)
+    if (!parsedSession.ok) {
+      console.error(JSON.stringify({ ok: false, error: parsedSession.error }, null, 2))
+      process.exit(1)
+    }
+    const sessionId = parsedSession.sessionId
+    const explicitTabId = flags.tab !== undefined ? Number(flags.tab) : undefined
+    const live = flags.oneshot ? null : readLiveEndpoint(endpointFlag)
+
+    let report
+    if (live) {
+      const executor = createDaemonFlowExecutor(
+        { ...live.endpoint, sessionId },
+        { tabId: explicitTabId },
+      )
+      report = await runFlow(flow, executor, runOpts)
+    } else {
+      const manager = await BrowserManager.create({
+        engine,
+        profileDir: typeof flags.profile === 'string' ? path.resolve(flags.profile) : undefined,
+        remoteCdpPort: remoteCdpPortFlag,
+        cdpUrl: cdpUrlFlag,
+        trackerBlocking,
+        crashRecovery,
+        downloads: downloadsOpts,
+        dialogs: dialogsOpts,
+        audit: auditOpts,
+        emulation: cliEmulation,
+        memoryEnabled: false,
+      })
+      try {
+        const executor = createManagerFlowExecutor(manager, {
+          tabId: explicitTabId,
+          sessionId,
+        })
+        report = await runFlow(flow, executor, runOpts)
+      } finally {
+        await manager.close()
+      }
+    }
+
+    if (flags.json) {
+      console.log(JSON.stringify(report, null, 2))
+    } else {
+      console.log(
+        formatFlowReportAscii(report, {
+          width: flags.width !== undefined ? Number(flags.width) : undefined,
+        }),
+      )
+    }
+    if (!report.ok) {
+      process.exitCode = 1
     }
     return
   }
