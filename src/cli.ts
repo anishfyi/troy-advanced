@@ -1606,7 +1606,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     case 'recall':
-      res = await callDaemon(daemonEndpoint, '/recall', { query: args.join(' '), origin: flags.origin, limit: flags.limit ? Number(flags.limit) : 10 })
+      res = await callDaemon(daemonEndpoint, '/recall', {
+        tabId,
+        query: args.join(' '),
+        origin: flags.origin,
+        limit: flags.limit ? Number(flags.limit) : 10,
+        bind: !flags['no-bind'],
+        boundOnly: Boolean(flags['bound-only']),
+        currentOriginOnly: Boolean(flags['current-origin']),
+        ascii: Boolean(flags.ascii),
+      })
       break
     case 'forget':
       res = await callDaemon(daemonEndpoint, '/forget', { origin: args[0] })

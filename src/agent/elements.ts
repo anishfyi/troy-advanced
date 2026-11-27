@@ -200,6 +200,36 @@ export class ElementRegistry {
     })
   }
 
+  /**
+   * Deterministically bind a live ElementDescriptor into this registry for `context`,
+   * reusing its existing `eN` ref if an identical (selector, frameId) entry is already
+   * registered on the same (tabId, url, epoch). Never invalidates other valid same-epoch refs.
+   */
+  bindOrFind(item: ElementDescriptor, context: RefContext): { item: ElementDescriptor; reused: boolean } {
+    if (this.lastContext && !sameContext(this.lastContext, context)) {
+      this.invalidate()
+    }
+    this.lastContext = { ...context }
+    const targetFrame = item.frameId ?? ''
+    for (const [ref, entry] of this.entries.entries()) {
+      if (
+        sameContext(entry, context) &&
+        entry.selector === item.selector &&
+        (entry.item.frameId ?? '') === targetFrame
+      ) {
+        const updatedItem: ElementDescriptor = { ...item, ref }
+        this.entries.set(ref, {
+          ...entry,
+          selector: item.selector,
+          item: updatedItem,
+        })
+        return { item: { ...updatedItem }, reused: true }
+      }
+    }
+    const [bound] = this.add([item], context)
+    return { item: { ...bound! }, reused: false }
+  }
+
   updateEntry(ref: string, selector: string, item: ElementDescriptor, context: RefContext): boolean {
     const name = ref.trim()
     const entry = this.entries.get(name)

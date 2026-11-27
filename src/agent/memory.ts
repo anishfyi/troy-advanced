@@ -23,6 +23,8 @@ export interface MemoryElement {
   key: string
   origin: string
   selector: string
+  id?: string
+  frameId?: string
   tag: string
   type: string
   role: string
@@ -121,6 +123,8 @@ export class PageMemory {
         key,
         origin,
         selector: el.selector,
+        ...(el.id ? { id: el.id } : {}),
+        ...(el.frameId ? { frameId: el.frameId } : {}),
         tag: el.tag,
         type: el.type,
         role: el.role ?? '',
@@ -155,6 +159,15 @@ export class PageMemory {
         el.lastSeenAt = now
       }
     }
+    this.flush()
+  }
+
+  recordVerification(key: string, matched: boolean): void {
+    const el = this.elements.get(key)
+    if (!el) return
+    if (matched) el.verified += 1
+    else el.failed += 1
+    el.lastSeenAt = Date.now()
     this.flush()
   }
 

@@ -329,10 +329,29 @@ export async function executePipeCommand(
       return { output: format(manager.activateTab(Number(rest[0]))) }
     case 'grant':
       return { output: format(manager.grantOrigin(argStr)) }
-    case 'recall':
-      return {
-        output: format(manager.memory ? { ok: true, ...manager.memory.recall(argStr) } : { ok: false, error: 'memory disabled' }),
+    case 'recall': {
+      const tokens = tokenizePipeArgs(argStr)
+      let bind = true
+      let boundOnly = false
+      let currentOriginOnly = false
+      let ascii = false
+      const queryParts: string[] = []
+      for (const tok of tokens) {
+        if (tok === '--no-bind') bind = false
+        else if (tok === '--bound-only') boundOnly = true
+        else if (tok === '--current-origin') currentOriginOnly = true
+        else if (tok === '--ascii') ascii = true
+        else queryParts.push(tok)
       }
+      const res = await manager.recall({
+        query: queryParts.join(' '),
+        bind,
+        boundOnly,
+        currentOriginOnly,
+        ascii,
+      })
+      return { output: format(res) }
+    }
     case 'emulate':
     case 'viewport': {
       const tokens = tokenizePipeArgs(argStr)

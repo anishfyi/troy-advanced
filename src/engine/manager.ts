@@ -57,6 +57,12 @@ import {
   type RefRecoveryStrategy,
 } from '../agent/elements.js'
 import { PageMemory } from '../agent/memory.js'
+import {
+  bindRecalledElements,
+  formatRecallAscii,
+  type BoundRecallElement,
+  type RecallAutoBindResult,
+} from '../agent/recall-bind.js'
 import { AuditLogger, extractRefusalInfo } from '../agent/audit.js'
 import {
   extractStructuredData,
@@ -828,6 +834,127 @@ export class BrowserManager {
     return { ok: false, error: `no open tab in session "${sessionId}"` }
   }
 
+  async recall(opts: {
+    query?: string
+    origin?: string
+    limit?: number
+    tabId?: number
+    sessionId?: string
+    bind?: boolean
+    boundOnly?: boolean
+    currentOriginOnly?: boolean
+    recordVerification?: boolean
+    ascii?: boolean
+  } = {}): Promise<Record<string, unknown>> {
+    if (!this.memory) {
+      return { ok: false, error: 'page memory is not enabled' }
+    }
+
+    const query = String(opts.query ?? '')
+    const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) ? opts.limit : undefined
+    const shouldBind = opts.bind !== false
+
+    let session: TabSession | null = null
+    if (shouldBind) {
+      const resolved = this.resolveTabForSession(opts.tabId, opts.sessionId)
+      if (!resolved.ok) {
+        if (resolved.status === 'blocked') {
+          return {
+            ok: false,
+            status: resolved.status,
+            code: resolved.code,
+            error: resolved.error,
+          }
+        }
+        // If caller explicitly passed a non-existent tabId, fail deterministically
+        if (opts.tabId !== undefined) {
+          return { ok: false, error: resolved.error }
+        }
+      } else {
+        session = resolved.session
+      }
+    }
+
+    if (session) {
+      const snap = await session.driver.snapshot()
+      const liveOrigin = exactOrigin(snap.url)
+      const effectiveOrigin =
+        typeof opts.origin === 'string' && opts.origin.trim()
+          ? opts.origin.trim()
+          : opts.currentOriginOnly && liveOrigin
+            ? liveOrigin
+            : undefined
+
+      const raw = this.memory.recall(query, { origin: effectiveOrigin, limit })
+      const ctx: RefContext = { tabId: session.driver.id, url: snap.url, epoch: snap.epoch }
+      const bound = bindRecalledElements(raw.elements, {
+        liveElements: snap.elements,
+        liveUrl: snap.url,
+        liveOrigin,
+        registry: session.elements,
+        context: ctx,
+        onVerify:
+          opts.recordVerification === false
+            ? undefined
+            : (el, matched) => {
+                this.memory?.recordVerification(el.key, matched)
+              },
+      })
+
+      const elements = opts.boundOnly ? bound.boundElements : bound.elements
+      const payload: RecallAutoBindResult = {
+        pages: raw.pages,
+        elements,
+        boundElements: bound.boundElements,
+        actions: raw.actions,
+        binding: bound.binding,
+      }
+      const ascii = opts.ascii ? formatRecallAscii(payload, query) : undefined
+      return {
+        ok: true,
+        query,
+        tabId: session.driver.id,
+        url: snap.url,
+        ...payload,
+        ...(ascii ? { ascii } : {}),
+      }
+    }
+
+    const raw = this.memory.recall(query, {
+      origin: typeof opts.origin === 'string' && opts.origin.trim() ? opts.origin.trim() : undefined,
+      limit,
+    })
+    const elements: BoundRecallElement[] = raw.elements.map((el) => ({
+      ...el,
+      bound: false,
+      status: 'unbound',
+    }))
+    const payload: RecallAutoBindResult = {
+      pages: raw.pages,
+      elements: opts.boundOnly ? [] : elements,
+      boundElements: [],
+      actions: raw.actions,
+      binding: {
+        attempted: false,
+        total: raw.elements.length,
+        boundCount: 0,
+        staleCount: 0,
+        ambiguousCount: 0,
+        otherOriginCount: 0,
+        unboundCount: raw.elements.length,
+        reusedRefCount: 0,
+        freshRefCount: 0,
+      },
+    }
+    const ascii = opts.ascii ? formatRecallAscii(payload, query) : undefined
+    return {
+      ok: true,
+      query,
+      ...payload,
+      ...(ascii ? { ascii } : {}),
+    }
+  }
+
   private async takeIndexedSnapshot(session: TabSession): Promise<PageSnapshot> {
     const snap = await session.driver.snapshot()
     const ctx = { tabId: session.driver.id, url: snap.url, epoch: snap.epoch }
@@ -1493,6 +1620,21 @@ export class BrowserManager {
             return pub
           })
         return { ok: true, query, count: matches.length, matches }
+      }
+
+      case 'page_recall': {
+        return this.recall({
+          query: String(args.query ?? ''),
+          origin: typeof args.origin === 'string' ? args.origin : undefined,
+          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          tabId: session.driver.id,
+          sessionId,
+          bind: args.bind !== false,
+          boundOnly: Boolean(args.boundOnly),
+          currentOriginOnly: Boolean(args.currentOriginOnly),
+          recordVerification: args.recordVerification !== false,
+          ascii: Boolean(args.ascii),
+        })
       }
 
       case 'page_text': {

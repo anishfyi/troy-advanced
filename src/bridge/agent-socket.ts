@@ -278,12 +278,19 @@ export async function createAgentSocket(
         return { status: 200, payload: result }
       }
       case '/recall': {
-        if (!manager.memory) return { status: 200, payload: { ok: false, error: 'page memory is not enabled' } }
-        const data = manager.memory.recall(String(body.query ?? ''), {
+        const data = await manager.recall({
+          query: String(body.query ?? ''),
           origin: typeof body.origin === 'string' ? body.origin : undefined,
           limit: typeof body.limit === 'number' ? body.limit : undefined,
+          tabId: body.tabId !== undefined ? Number(body.tabId) : undefined,
+          sessionId,
+          bind: body.bind !== false,
+          boundOnly: Boolean(body.boundOnly),
+          currentOriginOnly: Boolean(body.currentOriginOnly),
+          recordVerification: body.recordVerification !== false,
+          ascii: Boolean(body.ascii),
         })
-        return { status: 200, payload: { ok: true, ...data } }
+        return { status: 200, payload: data }
       }
       case '/forget': {
         if (!manager.memory) return { status: 200, payload: { ok: false, error: 'page memory is not enabled' } }

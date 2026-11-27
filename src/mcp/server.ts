@@ -310,10 +310,26 @@ export const MCP_TOOLS = [
   },
   {
     name: 'troy_recall',
-    description: 'Search persistent cross-session page memory.',
+    description:
+      'Search persistent cross-session page memory and deterministically auto-bind verified selectors on the live DOM to immediate eN refs.',
     inputSchema: {
       type: 'object',
-      properties: { query: { type: 'string' }, origin: { type: 'string' }, limit: { type: 'number' } },
+      properties: {
+        query: { type: 'string' },
+        origin: { type: 'string' },
+        limit: { type: 'number' },
+        tabId: { type: 'number', description: 'Optional tab ID to verify recalled selectors against' },
+        bind: {
+          type: 'boolean',
+          description: 'Verify recalled selectors on the live DOM and issue immediate eN refs (default: true)',
+        },
+        boundOnly: { type: 'boolean', description: 'Return only elements verified and bound to live eN refs' },
+        currentOriginOnly: {
+          type: 'boolean',
+          description: 'Restrict memory recall to the active tab origin when origin is omitted',
+        },
+        ascii: { type: 'boolean', description: 'Include a strict 7-bit ASCII summary of recalled and bound elements' },
+      },
       required: ['query'],
     },
   },
@@ -862,15 +878,16 @@ export async function handleMcpRequest(
         result = manager.grantOrigin(String(args.origin ?? ''))
         break
       case 'troy_recall':
-        result = manager.memory
-          ? {
-              ok: true,
-              ...manager.memory.recall(String(args.query ?? ''), {
-                origin: typeof args.origin === 'string' ? args.origin : undefined,
-                limit: typeof args.limit === 'number' ? args.limit : undefined,
-              }),
-            }
-          : { ok: false, error: 'memory disabled' }
+        result = await manager.recall({
+          query: String(args.query ?? ''),
+          origin: typeof args.origin === 'string' ? args.origin : undefined,
+          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          tabId,
+          bind: args.bind !== false,
+          boundOnly: Boolean(args.boundOnly),
+          currentOriginOnly: Boolean(args.currentOriginOnly),
+          ascii: Boolean(args.ascii),
+        })
         break
       case 'troy_emulate': {
         const hasUpdate =
