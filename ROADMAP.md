@@ -95,7 +95,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M80: Comprehensive security regression suite testing XSS/scheme disguises, IMDS blocking, sensitive field blocking, and submit guards
 
 ## Track 7: EC2, Cloud & Ops Excellence (Milestones 81–90)
-- [ ] M81: EC2 Instance Metadata Service (IMDSv2) detection in `doctor` (instance type, region, AZ without failing outside AWS)
+- [x] M81: EC2 Instance Metadata Service (IMDSv2) detection in `doctor` (instance type, region, AZ without failing outside AWS)
 - [ ] M82: Daemon log rotation & `troy-advanced daemon logs [--tail N] [--follow]` command
 - [ ] M83: Health-check HTTP probe + Prometheus-compatible `/metrics` endpoint (tabs, requests, memory RSS, uptime, tool latency)
 - [ ] M84: Multi-profile management (`troy-advanced profile list|create|delete|export|import`)

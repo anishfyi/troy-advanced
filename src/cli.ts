@@ -79,7 +79,7 @@ import {
   persistDaemonOriginRules,
   readDaemonConfig,
 } from './cloud/daemon-config.js'
-import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
+import { formatDoctorAscii, runDoctorAsync } from './cloud/doctor.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
   TOOL_SCHEMA_FORMATS,
@@ -111,7 +111,8 @@ Daemon & Modes:
                                                          Execute a replayable JSON macro/flow with assertions and ASCII failure dumps
   pipe         [--json] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Streaming stdin/stdout AI REPL
-  doctor       [--json]                                  EC2 / Linux / Chrome environment check
+  doctor       [--json] [--no-imds] [--imds-timeout <ms>] [--imds-endpoint <url>]
+                                                         EC2 (IMDSv2) / Linux / Chrome environment check
   ec2 setup                                              Print EC2 systemd & SSH forwarding guide
 
 Client Commands (talk to running daemon, or use --oneshot):
@@ -246,6 +247,8 @@ const VALUE_FLAGS = new Set([
   '--heartbeat-ms',
   '--max-frames',
   '--ssrf-allow-host',
+  '--imds-timeout',
+  '--imds-endpoint',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -523,7 +526,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   const remoteCdpPortFlag = flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined
 
   if (cmd === 'doctor') {
-    const report = runDoctor()
+    const imdsTimeoutRaw =
+      typeof flags['imds-timeout'] === 'string' && flags['imds-timeout'].trim()
+        ? Number(flags['imds-timeout'].trim())
+        : undefined
+    const report = await runDoctorAsync({
+      imds: {
+        skip: Boolean(flags['no-imds']),
+        ...(typeof flags['imds-endpoint'] === 'string' && flags['imds-endpoint'].trim()
+          ? { baseUrl: flags['imds-endpoint'].trim() }
+          : {}),
+        ...(imdsTimeoutRaw !== undefined && Number.isFinite(imdsTimeoutRaw)
+          ? { timeoutMs: imdsTimeoutRaw }
+          : {}),
+      },
+    })
     console.log(flags.json ? JSON.stringify(report, null, 2) : formatDoctorAscii(report))
     return
   }

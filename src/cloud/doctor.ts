@@ -5,6 +5,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { findChromeBinary } from '../engine/chromium.js'
 import { defaultEndpointPath, readLiveEndpoint } from '../bridge/endpoint.js'
+import { probeEc2ImdsV2, type Ec2ImdsMetadata, type ImdsProbeOptions } from './imds.js'
+
+export interface DoctorOptions {
+  /** IMDSv2 probe options (e.g. skip, baseUrl, timeoutMs). */
+  imds?: ImdsProbeOptions
+}
 
 export interface DoctorReport {
   nodeVersion: string
@@ -17,6 +23,7 @@ export interface DoctorReport {
   term: string
   sshSession: boolean
   ec2Hint: boolean
+  ec2Imds: Ec2ImdsMetadata | null
   chromeBinary: string | null
   chromeVersion: string | null
   devShmMb: number | null
@@ -66,7 +73,7 @@ function detectChromeVersion(bin: string | null): string | null {
   }
 }
 
-export function runDoctor(): DoctorReport {
+function buildDoctorReport(ec2Imds: Ec2ImdsMetadata | null): DoctorReport {
   const chromeBinary = findChromeBinary()
   const chromeVersion = detectChromeVersion(chromeBinary)
   const totalMemMb = Math.round(os.totalmem() / (1024 * 1024))
@@ -74,6 +81,8 @@ export function runDoctor(): DoctorReport {
   const devShmMb = detectDevShmMb()
   const live = readLiveEndpoint()
   const warnings: string[] = []
+  const localEc2Hint = detectEc2Hint()
+  const ec2Hint = localEc2Hint || Boolean(ec2Imds?.available)
 
   if (!chromeBinary) {
     warnings.push('No Chrome/Chromium binary found. troy-advanced will run on the zero-dependency Lite engine (no JS/screenshots). Run deploy/ec2-bootstrap.sh to install Chromium.')
@@ -83,6 +92,15 @@ export function runDoctor(): DoctorReport {
   }
   if (totalMemMb < 1024) {
     warnings.push(`Low RAM (${totalMemMb}MB). Consider --engine lite or adding swap on small EC2 instances.`)
+  }
+  if (localEc2Hint && ec2Imds && !ec2Imds.available) {
+    if (ec2Imds.status === 'timeout') {
+      warnings.push(
+        'EC2 environment detected but IMDSv2 timed out. If running inside Docker on EC2, set HttpPutResponseHopLimit=2 on instance metadata options.',
+      )
+    } else if (ec2Imds.status === 'disabled') {
+      warnings.push('EC2 environment detected but IMDSv2 is disabled (HTTP 403 or AWS_EC2_METADATA_DISABLED).')
+    }
   }
 
   let systemdAvailable = false
@@ -105,7 +123,8 @@ export function runDoctor(): DoctorReport {
     isTTY: Boolean(process.stdout.isTTY),
     term: process.env.TERM || 'dumb',
     sshSession: Boolean(process.env.SSH_CONNECTION || process.env.SSH_TTY),
-    ec2Hint: detectEc2Hint(),
+    ec2Hint,
+    ec2Imds,
     chromeBinary,
     chromeVersion,
     devShmMb,
@@ -118,6 +137,15 @@ export function runDoctor(): DoctorReport {
   }
 }
 
+export function runDoctor(): DoctorReport {
+  return buildDoctorReport(null)
+}
+
+export async function runDoctorAsync(options: DoctorOptions = {}): Promise<DoctorReport> {
+  const ec2Imds = await probeEc2ImdsV2(options.imds)
+  return buildDoctorReport(ec2Imds)
+}
+
 export function formatDoctorAscii(report: DoctorReport): string {
   const lines = [
     '+----------------------------------------------------------------------+',
@@ -126,13 +154,34 @@ export function formatDoctorAscii(report: DoctorReport): string {
     `  Node.js       : ${report.nodeVersion} (${report.platform}/${report.arch}, ${report.cpus} CPUs)`,
     `  Memory        : ${report.freeMemMb}MB free / ${report.totalMemMb}MB total`,
     `  Terminal      : TERM=${report.term} | TTY=${report.isTTY} | SSH=${report.sshSession} | EC2=${report.ec2Hint}`,
+  ]
+  if (report.ec2Imds) {
+    if (report.ec2Imds.available) {
+      const parts = [
+        report.ec2Imds.instanceType ?? 'unknown-type',
+        report.ec2Imds.region ?? 'unknown-region',
+        report.ec2Imds.availabilityZone ? `AZ ${report.ec2Imds.availabilityZone}` : 'AZ unknown',
+      ]
+      lines.push(`  EC2 IMDSv2    : ${parts.join(' | ')} (${report.ec2Imds.latencyMs}ms)`)
+      if (report.ec2Imds.instanceId || report.ec2Imds.amiId) {
+        const idParts = [
+          report.ec2Imds.instanceId,
+          report.ec2Imds.amiId ? `(${report.ec2Imds.amiId})` : null,
+        ].filter(Boolean)
+        lines.push(`  EC2 Instance  : ${idParts.join(' ')}`)
+      }
+    } else {
+      lines.push(`  EC2 IMDSv2    : not available (${report.ec2Imds.status})`)
+    }
+  }
+  lines.push(
     `  Chromium      : ${report.chromeBinary ? `${report.chromeBinary} (${report.chromeVersion ?? 'detected'})` : 'not installed (lite engine ready)'}`,
     `  /dev/shm      : ${report.devShmMb !== null ? `${report.devShmMb}MB` : 'n/a'}`,
     `  systemd       : ${report.systemdAvailable ? 'available' : 'unavailable'}`,
     `  Recommended   : --engine ${report.recommendedEngine}`,
     `  Daemon        : ${report.daemonRunning ? `RUNNING (pid ${report.daemonPid})` : 'stopped'}`,
     `  Endpoint file : ${report.endpointFile}`,
-  ]
+  )
   if (report.warnings.length > 0) {
     lines.push('  Warnings:')
     for (const w of report.warnings) lines.push(`    ! ${w}`)
