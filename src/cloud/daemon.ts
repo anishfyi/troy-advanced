@@ -10,6 +10,7 @@ import type {
   DownloadPolicyOptions,
   EmulationOptions,
   EngineKind,
+  PolicyProfileInput,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
   UntrustedMarkersOptions,
@@ -43,6 +44,8 @@ export interface DaemonOptions {
   audit?: AuditLogOptions
   ssrf?: SsrfProtectionOptions
   untrustedMarkers?: boolean | UntrustedMarkersOptions
+  policy?: PolicyProfileInput
+  policyFile?: string
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -60,6 +63,8 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     audit: opts.audit,
     ssrf: opts.ssrf,
     untrustedMarkers: opts.untrustedMarkers,
+    policy: opts.policy,
+    policyFile: opts.policyFile,
   })
 
   if (opts.initialUrl) {
@@ -129,6 +134,8 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       ...(manager.engine.remoteCdpUrl ? { remoteCdpUrl: manager.engine.remoteCdpUrl } : {}),
       blockPrivateNet: manager.ssrf.enabled,
       untrustedMarkers: manager.untrustedMarkers.enabled,
+      policyProfile: manager.policy.profile,
+      ...(manager.policy.resolved.sourceFile ? { policyFile: manager.policy.resolved.sourceFile } : {}),
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
     }),
@@ -206,6 +213,14 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
     if (typeof opts.untrustedMarkers === 'object' && opts.untrustedMarkers.style) {
       args.push('--untrusted-style', opts.untrustedMarkers.style)
     }
+  }
+  if (typeof opts.policy === 'string') {
+    args.push('--policy', opts.policy)
+  } else if (opts.policy && typeof opts.policy === 'object' && opts.policy.profile) {
+    args.push('--policy', opts.policy.profile)
+  }
+  if (opts.policyFile) {
+    args.push('--policy-file', opts.policyFile)
   }
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport

@@ -41,7 +41,10 @@ import type {
   OriginStorageSnapshot,
   PageSnapshot,
   PixelAsciiOptions,
+  PolicyProfileInput,
+  PolicyProfileStats,
   Rect,
+  ResolvedPolicyProfile,
   SettleOptions,
   SettleResult,
   SsrfProtectionOptions,
@@ -82,6 +85,7 @@ import {
 import { SessionRegistry } from '../agent/sessions.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
+import { PolicyProfileGuard, resolvePolicyProfile } from '../agent/policy-profile.js'
 import { SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
 import {
   UntrustedContentGuard,
@@ -186,6 +190,9 @@ export interface BrowserManagerOptions {
   loopGuard?: LoopGuardOptions
   ssrf?: SsrfProtectionOptions
   untrustedMarkers?: boolean | UntrustedMarkersOptions
+  policy?: PolicyProfileInput
+  policyFile?: string
+  autoLoadPolicyFile?: boolean
 }
 
 export class BrowserManager {
@@ -196,6 +203,7 @@ export class BrowserManager {
   readonly loopGuard: AgentLoopGuard
   readonly ssrf: SsrfGuard
   readonly untrustedMarkers: UntrustedContentGuard
+  readonly policy: PolicyProfileGuard
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
@@ -215,6 +223,7 @@ export class BrowserManager {
     loopGuard: AgentLoopGuard,
     ssrf: SsrfGuard,
     untrustedMarkers: UntrustedContentGuard,
+    policy: PolicyProfileGuard,
   ) {
     this.engine = engine
     this.profileDir = profileDir
@@ -223,6 +232,12 @@ export class BrowserManager {
     this.loopGuard = loopGuard
     this.ssrf = ssrf
     this.untrustedMarkers = untrustedMarkers
+    this.policy = policy
+    for (const origin of policy.resolved.allowedOrigins) {
+      if (!policy.isOriginDenied(origin)) {
+        this.allowedOrigins.add(origin)
+      }
+    }
     if (engine.onCrashRecovery) {
       this.unsubscribeCrash = engine.onCrashRecovery((ev) => {
         if (ev.kind === 'chromium_recovered') {
@@ -249,11 +264,31 @@ export class BrowserManager {
     const profileDir =
       opts.profileDir || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'troy-advanced', 'profile')
 
+    const resolvedPolicy = resolvePolicyProfile(opts.policy, {
+      policyFile: opts.policyFile,
+      profileDir,
+      autoLoadPolicyFile: opts.autoLoadPolicyFile,
+    })
+    const policyGuard = new PolicyProfileGuard(resolvedPolicy)
+
     const downloadsOpts: DownloadPolicyOptions = {
+      mode: resolvedPolicy.downloadMode,
       ...opts.downloads,
       quarantineDir: opts.downloads?.quarantineDir || path.join(profileDir, 'quarantine'),
     }
-    const ssrfGuard = new SsrfGuard(opts.ssrf)
+    const trackerBlockingOpts: TrackerBlockingOptions | undefined =
+      opts.trackerBlocking !== undefined
+        ? opts.trackerBlocking
+        : resolvedPolicy.blockTrackers
+          ? undefined
+          : { enabled: false }
+    const ssrfOpts: SsrfProtectionOptions | undefined =
+      opts.ssrf !== undefined
+        ? opts.ssrf
+        : resolvedPolicy.blockPrivateNet
+          ? { enabled: true }
+          : undefined
+    const ssrfGuard = new SsrfGuard(ssrfOpts)
 
     let engine: BrowserEngine
     const requested = opts.engine ?? 'auto'
@@ -280,7 +315,7 @@ export class BrowserManager {
         cdpUrl: opts.cdpUrl,
         cdpConnectTimeoutMs: opts.cdpConnectTimeoutMs,
         profileDir: path.join(profileDir, 'chrome-data'),
-        trackerBlocking: opts.trackerBlocking,
+        trackerBlocking: trackerBlockingOpts,
         emulation: opts.emulation,
         crashRecovery: opts.crashRecovery,
         downloads: downloadsOpts,
@@ -296,7 +331,7 @@ export class BrowserManager {
             cdpPort: opts.cdpPort,
             remoteCdpPort: opts.remoteCdpPort,
             profileDir: path.join(profileDir, 'chrome-data'),
-            trackerBlocking: opts.trackerBlocking,
+            trackerBlocking: trackerBlockingOpts,
             emulation: opts.emulation,
             crashRecovery: opts.crashRecovery,
             downloads: downloadsOpts,
@@ -343,8 +378,22 @@ export class BrowserManager {
       redactArgs: opts.audit?.redactArgs,
     })
     const loopGuard = new AgentLoopGuard(opts.loopGuard)
-    const untrustedMarkersGuard = new UntrustedContentGuard(opts.untrustedMarkers)
-    return new BrowserManager(engine, profileDir, memory, audit, loopGuard, ssrfGuard, untrustedMarkersGuard)
+    const untrustedMarkersOpts =
+      opts.untrustedMarkers !== undefined
+        ? opts.untrustedMarkers
+        : resolvedPolicy.untrustedMarkers
+          ? { enabled: true }
+          : undefined
+    const untrustedMarkersGuard = new UntrustedContentGuard(untrustedMarkersOpts)
+    return new BrowserManager(engine, profileDir, memory, audit, loopGuard, ssrfGuard, untrustedMarkersGuard, policyGuard)
+  }
+
+  getPolicyStats(): PolicyProfileStats {
+    return this.policy.getStats()
+  }
+
+  getPolicyProfile(): ResolvedPolicyProfile {
+    return this.policy.resolved
   }
 
   getSsrfStats(): SsrfProtectionStats {
@@ -627,6 +676,39 @@ export class BrowserManager {
       })
       return { ok: false, error: 'grant needs an http(s) origin' }
     }
+    const deniedOrigin = this.policy.isOriginDenied(origin)
+    if (deniedOrigin) {
+      const reason = `origin ${deniedOrigin} is denied by policy`
+      const durationMs = Date.now() - startedAt
+      this.recordActivity({
+        ts: startedAt,
+        ...(sessionId ? { sessionId } : {}),
+        tool: 'origin_grant',
+        summary: origin,
+        ok: false,
+        durationMs,
+        error: reason,
+      })
+      this.audit.record({
+        tsMs: startedAt,
+        kind: 'refusal',
+        tool: 'origin_grant',
+        ...(sessionId ? { sessionId } : {}),
+        ok: false,
+        refused: true,
+        refusal: { status: 'blocked', code: 'origin_denied', reason },
+        durationMs,
+        args: { origin: originOrUrl },
+        summary: origin,
+        error: reason,
+      })
+      return { ok: false, status: 'blocked', code: 'origin_denied', error: reason } as {
+        ok: boolean
+        origin?: string
+        sessionId?: string
+        error?: string
+      }
+    }
     if (this.ssrf.enabled) {
       const ssrfRes = this.ssrf.checkSync(origin)
       if (ssrfRes.blocked && ssrfRes.reason) {
@@ -730,6 +812,41 @@ export class BrowserManager {
         return { ok: false, error }
       }
       targetUrl = resolved.url
+      const deniedOpenOrigin = this.policy.isOriginDenied(targetUrl)
+      if (deniedOpenOrigin) {
+        const reason = `opening ${deniedOpenOrigin} is denied by policy`
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'tab_open',
+          summary: targetUrl,
+          ok: false,
+          durationMs,
+          error: reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_open',
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'origin_denied', reason },
+          durationMs,
+          args: { url: inputUrl },
+          summary: targetUrl,
+          error: reason,
+        })
+        return { ok: false, status: 'blocked', code: 'origin_denied', error: reason } as {
+          ok: boolean
+          id?: number
+          url?: string
+          title?: string
+          sessionId?: string
+          error?: string
+        }
+      }
       if (this.ssrf.enabled) {
         const ssrfRes = await this.ssrf.checkAsync(targetUrl)
         if (ssrfRes.blocked && ssrfRes.reason) {
@@ -1784,6 +1901,14 @@ export class BrowserManager {
     args: Record<string, unknown> = {},
     sessionId?: string,
   ): Promise<Record<string, unknown>> {
+    if (this.policy.isToolBlocked(name)) {
+      return {
+        ok: false,
+        status: 'blocked',
+        code: 'policy_tool_blocked',
+        error: `tool "${name}" is blocked by the active policy profile (${this.policy.profile})`,
+      }
+    }
     const resolvedTab = this.resolveTabForSession(tabId, sessionId)
     const session = resolvedTab.ok ? resolvedTab.session : null
     if (name === 'page_dialogs') {
@@ -2256,6 +2381,7 @@ export class BrowserManager {
           targetUrl: resolved.url,
           allowedOrigins,
           ssrf: this.ssrf.getOptions(),
+          policy: this.policy,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -2290,6 +2416,7 @@ export class BrowserManager {
           allowSubmit: Boolean(args.allowSubmit),
           allowedOrigins,
           ssrf: this.ssrf.getOptions(),
+          policy: this.policy,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -2317,6 +2444,7 @@ export class BrowserManager {
               allowSubmit: Boolean(args.allowSubmit),
               allowedOrigins,
               ssrf: this.ssrf.getOptions(),
+              policy: this.policy,
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }
@@ -2371,6 +2499,7 @@ export class BrowserManager {
           name: 'page_fill',
           item: resolved.item,
           allowedOrigins,
+          policy: this.policy,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -2397,6 +2526,7 @@ export class BrowserManager {
               name: 'page_fill',
               item: domRec.item,
               allowedOrigins,
+              policy: this.policy,
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }
@@ -2448,6 +2578,7 @@ export class BrowserManager {
           name: 'page_select',
           item: resolved.item,
           allowedOrigins,
+          policy: this.policy,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -2472,6 +2603,7 @@ export class BrowserManager {
               name: 'page_select',
               item: domRec.item,
               allowedOrigins,
+              policy: this.policy,
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }
@@ -2856,6 +2988,7 @@ export class BrowserManager {
           name: 'page_eval',
           currentUrl: session.driver.getUrl(),
           allowedOrigins,
+          policy: this.policy,
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -2873,7 +3006,17 @@ export class BrowserManager {
       }
 
       case 'page_act': {
-        const steps = Array.isArray(args.steps) ? (args.steps as ActStep[]).slice(0, 20) : []
+        const rawSteps = Array.isArray(args.steps) ? (args.steps as ActStep[]) : []
+        const maxSteps = this.policy.resolved.maxActSteps
+        if (rawSteps.length > maxSteps) {
+          return {
+            ok: false,
+            status: 'blocked',
+            code: 'policy_act_limit',
+            error: `page_act received ${rawSteps.length} steps, exceeding policy limit of ${maxSteps} (${this.policy.profile})`,
+          }
+        }
+        const steps = rawSteps.slice(0, maxSteps)
         const results: Array<Record<string, unknown>> = []
         const startUrl = session.driver.getUrl()
         for (const step of steps) {

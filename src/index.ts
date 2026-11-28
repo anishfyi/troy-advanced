@@ -1,6 +1,7 @@
 export * from './types.js'
 export * from './agent/omnibox.js'
 export * from './agent/policy.js'
+export * from './agent/policy-profile.js'
 export * from './agent/ssrf.js'
 export * from './agent/untrusted-markers.js'
 export * from './agent/elements.js'

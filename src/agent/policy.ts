@@ -1,8 +1,9 @@
 // Deterministic autonomy policy modeled directly on Troy's refusal rules.
 // The AI agent can request an action; only this deterministic code authorizes it.
 
-import type { ElementDescriptor, PolicyDecision, SsrfProtectionOptions } from '../types.js'
+import type { ElementDescriptor, PolicyDecision, ResolvedPolicyProfile, SsrfProtectionOptions } from '../types.js'
 import { exactOrigin } from './omnibox.js'
+import { PolicyProfileGuard, compilePolicyPatterns } from './policy-profile.js'
 import { checkUrlSsrfSync } from './ssrf.js'
 
 export const SENSITIVE_PATTERNS = Object.freeze({
@@ -36,7 +37,10 @@ function descriptorText(item: Partial<ElementDescriptor>): string {
     .join(' | ')
 }
 
-export function sensitiveElementReason(item: Partial<ElementDescriptor>): string | null {
+export function sensitiveElementReason(
+  item: Partial<ElementDescriptor>,
+  extraPatterns?: readonly RegExp[],
+): string | null {
   const type = String(item.type ?? '').toLowerCase()
   const tag = String(item.tag ?? '').toLowerCase()
   const autocomplete = String(item.autocomplete ?? '').toLowerCase()
@@ -50,13 +54,29 @@ export function sensitiveElementReason(item: Partial<ElementDescriptor>): string
   if (SENSITIVE_PATTERNS.secret.test(words)) return 'this control appears to contain a credential, code, or secret'
   if (SENSITIVE_PATTERNS.payment.test(words)) return 'payment and bank fields are never operated by the agent'
   if (SENSITIVE_PATTERNS.identity.test(words)) return 'government identity fields are never operated by the agent'
+  if (extraPatterns && extraPatterns.length > 0) {
+    for (const rx of extraPatterns) {
+      if (rx.test(words)) {
+        return `this control matches a custom sensitive policy pattern (${rx.source})`
+      }
+    }
+  }
   return null
 }
 
-export function isCommitLikeElement(item: Partial<ElementDescriptor>): boolean {
+export function isCommitLikeElement(
+  item: Partial<ElementDescriptor>,
+  extraPatterns?: readonly RegExp[],
+): boolean {
   if (item.defaultSubmit) return true
   const words = [item.text, item.label, item.ariaLabel, item.name, item.value].filter(Boolean).join(' ')
-  return SUBMIT_PATTERN.test(words)
+  if (SUBMIT_PATTERN.test(words)) return true
+  if (extraPatterns && extraPatterns.length > 0) {
+    for (const rx of extraPatterns) {
+      if (rx.test(words)) return true
+    }
+  }
+  return false
 }
 
 export function authorizeAction(request: {
@@ -68,10 +88,41 @@ export function authorizeAction(request: {
   allowedOrigins: Iterable<string>
   blockPrivateNet?: boolean
   ssrf?: SsrfProtectionOptions
+  policy?: ResolvedPolicyProfile | PolicyProfileGuard
 }): PolicyDecision {
   const allowed = new Set(request.allowedOrigins)
+  const guard =
+    request.policy instanceof PolicyProfileGuard
+      ? request.policy
+      : request.policy
+        ? new PolicyProfileGuard(request.policy)
+        : null
+  const policy = guard?.resolved
   const ssrfOpts: SsrfProtectionOptions | undefined =
-    request.ssrf ?? (request.blockPrivateNet ? { enabled: true } : undefined)
+    request.ssrf ?? (request.blockPrivateNet || policy?.blockPrivateNet ? { enabled: true } : undefined)
+
+  const requireOriginGrant = policy ? policy.requireOriginGrant : true
+  const requireSubmitConfirmation = policy ? policy.requireSubmitConfirmation : true
+  const blockSensitiveFields = policy ? policy.blockSensitiveFields : true
+  const extraSensitiveRegexes = guard
+    ? guard.extraSensitiveRegexes
+    : policy?.extraSensitivePatterns?.length
+      ? compilePolicyPatterns(policy.extraSensitivePatterns)
+      : undefined
+  const extraSubmitRegexes = guard
+    ? guard.extraSubmitRegexes
+    : policy?.extraSubmitPatterns?.length
+      ? compilePolicyPatterns(policy.extraSubmitPatterns)
+      : undefined
+
+  if (guard?.isToolBlocked(request.name)) {
+    return {
+      allowed: false,
+      status: 'blocked',
+      code: 'policy_tool_blocked',
+      reason: `tool "${request.name}" is blocked by the active policy profile (${policy!.profile})`,
+    }
+  }
 
   if (request.name === 'page_navigate') {
     const origin = exactOrigin(request.targetUrl)
@@ -95,7 +146,16 @@ export function authorizeAction(request: {
         }
       }
     }
-    if (!allowed.has(origin)) {
+    if (guard?.isOriginDenied(origin)) {
+      return {
+        allowed: false,
+        status: 'blocked',
+        code: 'origin_denied',
+        reason: `navigation to ${origin} is denied by policy`,
+        origin,
+      }
+    }
+    if (requireOriginGrant && !allowed.has(origin)) {
       return {
         allowed: false,
         status: 'boundary',
@@ -108,6 +168,14 @@ export function authorizeAction(request: {
   }
 
   if (request.name === 'page_eval') {
+    if (policy && !policy.allowEval) {
+      return {
+        allowed: false,
+        status: 'blocked',
+        code: 'policy_eval_disabled',
+        reason: `page_eval is disabled by the active policy profile (${policy.profile})`,
+      }
+    }
     const origin = exactOrigin(request.currentUrl)
     if (!origin) {
       return {
@@ -117,7 +185,16 @@ export function authorizeAction(request: {
         reason: 'page_eval may run only on HTTP or HTTPS pages',
       }
     }
-    if (!allowed.has(origin)) {
+    if (guard?.isOriginDenied(origin)) {
+      return {
+        allowed: false,
+        status: 'blocked',
+        code: 'origin_denied',
+        reason: `page_eval on ${origin} is denied by policy`,
+        origin,
+      }
+    }
+    if (requireOriginGrant && !allowed.has(origin)) {
       return {
         allowed: false,
         status: 'boundary',
@@ -130,9 +207,11 @@ export function authorizeAction(request: {
   }
 
   const item = request.item ?? {}
-  const sensitive = sensitiveElementReason(item)
-  if (sensitive) {
-    return { allowed: false, status: 'blocked', code: 'sensitive', reason: sensitive }
+  if (blockSensitiveFields) {
+    const sensitive = sensitiveElementReason(item, extraSensitiveRegexes)
+    if (sensitive) {
+      return { allowed: false, status: 'blocked', code: 'sensitive', reason: sensitive }
+    }
   }
 
   if (item.href) {
@@ -149,7 +228,16 @@ export function authorizeAction(request: {
       }
     }
     const origin = exactOrigin(item.href)
-    if (origin && !allowed.has(origin)) {
+    if (origin && guard?.isOriginDenied(origin)) {
+      return {
+        allowed: false,
+        status: 'blocked',
+        code: 'origin_denied',
+        reason: `that control targets ${origin}, which is denied by policy`,
+        origin,
+      }
+    }
+    if (requireOriginGrant && origin && !allowed.has(origin)) {
       return {
         allowed: false,
         status: 'boundary',
@@ -160,7 +248,12 @@ export function authorizeAction(request: {
     }
   }
 
-  if (request.name === 'page_click' && !request.allowSubmit && isCommitLikeElement(item)) {
+  if (
+    request.name === 'page_click' &&
+    requireSubmitConfirmation &&
+    !request.allowSubmit &&
+    isCommitLikeElement(item, extraSubmitRegexes)
+  ) {
     return {
       allowed: false,
       status: 'boundary',

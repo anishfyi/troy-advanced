@@ -2,6 +2,7 @@
 
 import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import type {
   AuditLogOptions,
@@ -12,11 +13,23 @@ import type {
   EmulationOptions,
   EngineKind,
   OriginStorageSnapshot,
+  PolicyProfileName,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
   TrackerBlockMode,
   UntrustedMarkersOptions,
 } from './types.js'
+import {
+  POLICY_PROFILE_NAMES,
+  PolicyProfileGuard,
+  createPolicyTemplate,
+  defaultPolicyFilePath,
+  formatPolicyAscii,
+  parsePolicyProfileName,
+  resolvePolicyProfile,
+  validatePolicyConfig,
+  writePolicyFile,
+} from './agent/policy-profile.js'
 import { parseSsrfAllowHosts } from './agent/ssrf.js'
 import { parseUntrustedMarkersStyle } from './agent/untrusted-markers.js'
 import { BrowserManager } from './engine/manager.js'
@@ -76,7 +89,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -126,6 +139,8 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect captured JS dialogs, configure auto-dismiss/accept policy, or queue next response
   audit [--limit N] [--tool <name>] [--kind <k>] [--refused] [--transitions] [--failed] [--tab <id>] [--session <id>] [--disk] [--file <path>] [--clear] [--truncate] [--json]
                                           Inspect persistent agent action audit log (audit.jsonl) with refusals, timing, and URL transitions
+  policy [show|init|validate] [--policy strict|standard|permissive] [--file <path>] [--force] [--json]
+                                          Inspect active policy profile, generate policy.json template, or validate policy.json
   sessions [id | close <id> [--keep-tabs]] [--json]
                                           List, inspect, or close isolated multi-agent sessions (x-troy-session)
   act <json-steps> [--allow-submit]       Run batched action list
@@ -148,7 +163,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -161,6 +176,8 @@ const VALUE_FLAGS = new Set([
   '--remote-cdp-port',
   '--cdp-url',
   '--profile',
+  '--policy',
+  '--policy-file',
   '--url',
   '--width',
   '--height',
@@ -368,6 +385,34 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         ...(untrustedStyleFlag ? { style: untrustedStyleFlag } : {}),
       }
     : undefined
+  const rawPolicyFlag =
+    typeof flags.policy === 'string' && flags.policy.trim()
+      ? flags.policy.trim()
+      : process.env.TROY_POLICY_PROFILE?.trim() || undefined
+  let policyProfileFlag: PolicyProfileName | undefined
+  if (rawPolicyFlag) {
+    const parsedPolicy = parsePolicyProfileName(rawPolicyFlag)
+    if (!parsedPolicy) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            error: `Invalid --policy "${rawPolicyFlag}". Valid profiles: ${POLICY_PROFILE_NAMES.join(', ')}`,
+          },
+          null,
+          2,
+        ),
+      )
+      process.exit(1)
+    }
+    policyProfileFlag = parsedPolicy
+  }
+  const policyFileFlag =
+    typeof flags['policy-file'] === 'string' && flags['policy-file'].trim()
+      ? path.resolve(flags['policy-file'].trim())
+      : process.env.TROY_POLICY_FILE?.trim()
+        ? path.resolve(process.env.TROY_POLICY_FILE.trim())
+        : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -400,6 +445,127 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     const report = runDoctor()
     console.log(flags.json ? JSON.stringify(report, null, 2) : formatDoctorAscii(report))
     return
+  }
+
+  if (cmd === 'policy') {
+    const sub = positional[1] ?? 'show'
+    const defaultProfileDir =
+      typeof flags.profile === 'string' && flags.profile.trim()
+        ? path.resolve(flags.profile.trim())
+        : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'troy-advanced', 'profile')
+    const explicitFile =
+      typeof flags.file === 'string' && flags.file.trim()
+        ? path.resolve(flags.file.trim())
+        : policyFileFlag
+
+    if (sub === 'init') {
+      const targetPath = explicitFile ?? defaultPolicyFilePath(defaultProfileDir)
+      const targetProfile: PolicyProfileName = policyProfileFlag ?? 'standard'
+      if (fs.existsSync(targetPath) && !flags.force) {
+        console.error(
+          JSON.stringify(
+            { ok: false, error: `Policy file already exists at "${targetPath}". Pass --force to overwrite.` },
+            null,
+            2,
+          ),
+        )
+        process.exit(1)
+      }
+      const template = createPolicyTemplate(targetProfile)
+      const resolved = writePolicyFile(targetPath, template)
+      const guard = new PolicyProfileGuard(resolved)
+      const stats = guard.getStats()
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: true, path: targetPath, policy: resolved, stats }, null, 2))
+      } else {
+        console.log(`Wrote ${targetProfile} policy template to ${targetPath} (0600)`)
+        console.log(
+          formatPolicyAscii(stats, {
+            width: flags.width !== undefined ? Number(flags.width) : undefined,
+          }),
+        )
+      }
+      return
+    }
+
+    if (sub === 'validate') {
+      const targetPath = explicitFile ?? defaultPolicyFilePath(defaultProfileDir)
+      let rawText: string
+      try {
+        rawText = fs.readFileSync(targetPath, 'utf8')
+      } catch (err) {
+        console.error(
+          JSON.stringify({ ok: false, path: targetPath, error: `Failed to read "${targetPath}": ${(err as Error).message}` }, null, 2),
+        )
+        process.exit(1)
+      }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(rawText)
+      } catch (err) {
+        console.error(
+          JSON.stringify({ ok: false, path: targetPath, error: `Invalid JSON in "${targetPath}": ${(err as Error).message}` }, null, 2),
+        )
+        process.exit(1)
+      }
+      const validation = validatePolicyConfig(parsed, {
+        sourceFile: targetPath,
+        overrideProfile: policyProfileFlag,
+      })
+      if (!validation.ok || !validation.resolved) {
+        console.error(
+          JSON.stringify({ ok: false, path: targetPath, errors: validation.errors, warnings: validation.warnings }, null, 2),
+        )
+        process.exit(1)
+      }
+      const stats = new PolicyProfileGuard(validation.resolved).getStats()
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: true, path: targetPath, policy: validation.resolved, stats, warnings: validation.warnings }, null, 2))
+      } else {
+        console.log(`Valid policy file: ${targetPath}`)
+        console.log(
+          formatPolicyAscii(stats, {
+            width: flags.width !== undefined ? Number(flags.width) : undefined,
+          }),
+        )
+      }
+      return
+    }
+
+    if (sub === 'show') {
+      const live = !explicitFile && !policyProfileFlag && !flags.oneshot ? readLiveEndpoint(endpointFlag) : null
+      if (live) {
+        const res = await callDaemon(live.endpoint, '/policy', {
+          width: flags.width !== undefined ? Number(flags.width) : undefined,
+        })
+        if (flags.json) {
+          console.log(JSON.stringify(res, null, 2))
+        } else if (typeof res.ascii === 'string') {
+          console.log(res.ascii)
+        } else {
+          console.log(JSON.stringify(res, null, 2))
+        }
+        return
+      }
+      const resolved = resolvePolicyProfile(policyProfileFlag, {
+        policyFile: explicitFile,
+        profileDir: defaultProfileDir,
+      })
+      const stats = new PolicyProfileGuard(resolved).getStats()
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: true, profile: stats.profile, policy: resolved, stats }, null, 2))
+      } else {
+        console.log(
+          formatPolicyAscii(stats, {
+            width: flags.width !== undefined ? Number(flags.width) : undefined,
+          }),
+        )
+      }
+      return
+    }
+
+    console.error('Usage: troy-advanced policy [show|init|validate] [--policy strict|standard|permissive] [--file <path>] [--force] [--json]')
+    process.exit(1)
   }
 
   if (cmd === 'audit' && typeof flags.file === 'string' && flags.file.trim()) {
@@ -497,6 +663,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         audit: auditOpts,
         ssrf: ssrfOpts,
         untrustedMarkers: untrustedMarkersOpts,
+        policy: policyProfileFlag,
+        policyFile: policyFileFlag,
         emulation: cliEmulation,
         memoryEnabled: false,
       })
@@ -635,6 +803,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      policy: policyProfileFlag,
+      policyFile: policyFileFlag,
     }
 
     if (sub === 'run') {
@@ -678,6 +848,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      policy: policyProfileFlag,
+      policyFile: policyFileFlag,
     })
     try {
       const inspectorTabFlag =
@@ -724,6 +896,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      policy: policyProfileFlag,
+      policyFile: policyFileFlag,
     })
     try {
       await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
@@ -747,6 +921,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      policy: policyProfileFlag,
+      policyFile: policyFileFlag,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1223,6 +1399,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       emulation: cliEmulation,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      policy: policyProfileFlag,
+      policyFile: policyFileFlag,
     })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })

@@ -11,6 +11,7 @@ import { formatDialogsAscii, parseDialogMode, parseDialogType } from '../engine/
 import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
 import { formatAuditAscii, parseAuditEventKind } from '../agent/audit.js'
 import { formatLoopGuardAscii, parseLoopGuardMode } from '../agent/loop-guard.js'
+import { formatPolicyAscii } from '../agent/policy-profile.js'
 import { formatSessionsAscii, parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
@@ -71,6 +72,7 @@ export async function createAgentSocket(
             dialogs: manager.getDialogStats(),
             audit: manager.getAuditStats(),
             loopGuard: manager.getLoopGuardStats(),
+            policy: manager.getPolicyStats(),
             ssrf: manager.getSsrfStats(),
             untrustedMarkers: manager.getUntrustedMarkersStats(),
             stream: streamHub.getStats(),
@@ -83,6 +85,21 @@ export async function createAgentSocket(
               framesSkippedDuplicate: 0,
               eventsSent: 0,
             },
+          },
+        }
+      }
+      case '/policy': {
+        const stats = manager.getPolicyStats()
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            profile: stats.profile,
+            policy: manager.getPolicyProfile(),
+            stats,
+            ascii: formatPolicyAscii(stats, {
+              width: typeof body.width === 'number' ? body.width : undefined,
+            }),
           },
         }
       }
@@ -706,6 +723,13 @@ export async function createAgentSocket(
 
     if (req.method === 'GET' && url.pathname === '/health') {
       handleRoute('/health', {}, headerSessionId)
+        .then((r) => respond(r.status, r.payload))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/policy') {
+      handleRoute('/policy', {}, headerSessionId)
         .then((r) => respond(r.status, r.payload))
         .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
       return

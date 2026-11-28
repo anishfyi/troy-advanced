@@ -1060,3 +1060,92 @@ export interface UntrustedMarkersStats {
   suspiciousPagesDetected: number
   recentDetections: UntrustedDetectionEntry[]
 }
+
+export type PolicyProfileName = 'strict' | 'standard' | 'permissive'
+
+export interface PolicyFileConfig {
+  /** Base policy profile preset ('strict' | 'standard' | 'permissive'). Default: 'standard'. */
+  profile?: PolicyProfileName
+  /** Whether page_eval is allowed on authorized origins. */
+  allowEval?: boolean
+  /** Whether cross-origin navigation, links, and eval require an explicit origin grant. */
+  requireOriginGrant?: boolean
+  /** Whether commit/submit clicks require allowSubmit: true. */
+  requireSubmitConfirmation?: boolean
+  /** Whether sensitive fields (password, file upload, OTP, payment, identity) are blocked. */
+  blockSensitiveFields?: boolean
+  /** Whether SSRF private-network / IMDS blocking is enabled by default. */
+  blockPrivateNet?: boolean
+  /** Whether untrusted content markers (--untrusted-markers) are enabled by default. */
+  untrustedMarkers?: boolean
+  /** Whether tracker & ad-beacon blocking is enabled by default. */
+  blockTrackers?: boolean
+  /** Default download policy mode ('deny' | 'quarantine' | 'allow'). */
+  downloadMode?: DownloadPolicyMode
+  /** Maximum number of steps permitted in a single page_act batch (1..200). */
+  maxActSteps?: number
+  /** Tool names deterministically refused by policy (e.g. ['page_eval']). */
+  blockedTools?: string[]
+  /** Pre-authorized http(s) origins seeded into the session at startup. */
+  allowedOrigins?: string[]
+  /** Explicitly denied http(s) origins (always blocked across all profiles, even permissive). */
+  deniedOrigins?: string[]
+  /** Extra case-insensitive regex patterns treated as sensitive fields. */
+  extraSensitivePatterns?: string[]
+  /** Extra case-insensitive regex patterns treated as commit/submit actions. */
+  extraSubmitPatterns?: string[]
+}
+
+export type PolicyProfileInput = PolicyProfileName | PolicyFileConfig
+
+export interface ResolvedPolicyProfile {
+  profile: PolicyProfileName
+  allowEval: boolean
+  requireOriginGrant: boolean
+  requireSubmitConfirmation: boolean
+  blockSensitiveFields: boolean
+  blockPrivateNet: boolean
+  untrustedMarkers: boolean
+  blockTrackers: boolean
+  downloadMode: DownloadPolicyMode
+  maxActSteps: number
+  blockedTools: string[]
+  allowedOrigins: string[]
+  deniedOrigins: string[]
+  extraSensitivePatterns: string[]
+  extraSubmitPatterns: string[]
+  /** Path to policy.json if loaded from disk. */
+  sourceFile?: string
+  /** Whether any explicit overrides were applied on top of the base profile preset. */
+  customized: boolean
+  /** Non-fatal warnings encountered while loading policy.json (e.g. unknown keys). */
+  warnings: string[]
+}
+
+export interface PolicyProfileStats {
+  profile: PolicyProfileName
+  sourceFile?: string
+  customized: boolean
+  allowEval: boolean
+  requireOriginGrant: boolean
+  requireSubmitConfirmation: boolean
+  blockSensitiveFields: boolean
+  blockPrivateNet: boolean
+  untrustedMarkers: boolean
+  blockTrackers: boolean
+  downloadMode: DownloadPolicyMode
+  maxActSteps: number
+  blockedTools: string[]
+  allowedOrigins: string[]
+  deniedOrigins: string[]
+  extraSensitivePatternCount: number
+  extraSubmitPatternCount: number
+  warnings: string[]
+}
+
+export interface PolicyValidationResult {
+  ok: boolean
+  resolved?: ResolvedPolicyProfile
+  errors: string[]
+  warnings: string[]
+}
