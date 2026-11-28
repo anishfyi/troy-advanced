@@ -14,6 +14,7 @@ import type {
   EngineKind,
   OriginStorageSnapshot,
   PolicyProfileName,
+  ProxyOptions,
   SecretRedactionOptions,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
@@ -35,6 +36,7 @@ import { parseSsrfAllowHosts } from './agent/ssrf.js'
 import { parseUntrustedMarkersStyle } from './agent/untrusted-markers.js'
 import { parseSecretRedactionMode } from './agent/secret-redactor.js'
 import { BrowserManager } from './engine/manager.js'
+import { parseProxyUrl } from './engine/proxy.js'
 import {
   computeAuditStats,
   filterAuditEntries,
@@ -131,7 +133,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--max-rss-mb N] [--watchdog-interval-ms N] [--watchdog-idle-ttl-ms N] [--public-metrics] [--no-health-probe] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--proxy http://...|socks5://...] [--proxy-bypass <hosts>] [--no-env-proxy] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--max-rss-mb N] [--watchdog-interval-ms N] [--watchdog-idle-ttl-ms N] [--public-metrics] [--no-health-probe] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   daemon logs  [--tail N | -n N] [--follow | -f] [--all] [--rotate] [--clear] [--log-file <path>] [--log-max-files N] [--json]
@@ -218,7 +220,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --allow-origin <origin>  --deny-origin <origin>  --daemon-config <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --proxy <http://...|socks5://...>  --proxy-bypass <hosts>  --no-env-proxy  --policy <strict|standard|permissive>  --policy-file <path>  --allow-origin <origin>  --deny-origin <origin>  --daemon-config <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -230,6 +232,8 @@ const VALUE_FLAGS = new Set([
   '--cdp-port',
   '--remote-cdp-port',
   '--cdp-url',
+  '--proxy',
+  '--proxy-bypass',
   '--profile',
   '--policy',
   '--policy-file',
@@ -334,6 +338,7 @@ const REPEATABLE_FLAGS = new Set([
   '--ssrf-allow-host',
   '--allow-origin',
   '--deny-origin',
+  '--proxy-bypass',
   '--tag',
 ])
 
@@ -625,6 +630,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       ? flags['cdp-url'].trim()
       : process.env.TROY_CDP_URL?.trim() || undefined
   const remoteCdpPortFlag = flags['remote-cdp-port'] ? Number(flags['remote-cdp-port']) : undefined
+
+  const rawProxyFlag = typeof flags.proxy === 'string' && flags.proxy.trim() ? flags.proxy.trim() : undefined
+  if (rawProxyFlag) {
+    // Fail fast on malformed proxy URL before launching daemon or browser
+    parseProxyUrl(rawProxyFlag)
+  }
+  const rawProxyBypass = multiFlags['proxy-bypass'] ?? []
+  const noEnvProxyFlag = Boolean(flags['no-env-proxy'])
+  const proxyFlag: ProxyOptions | undefined =
+    rawProxyFlag || rawProxyBypass.length > 0 || noEnvProxyFlag
+      ? {
+          ...(rawProxyFlag ? { server: rawProxyFlag } : {}),
+          ...(rawProxyBypass.length > 0 ? { bypass: rawProxyBypass } : {}),
+          ...(noEnvProxyFlag ? { useEnv: false } : {}),
+        }
+      : undefined
 
   if (cmd === 'doctor') {
     const imdsTimeoutRaw =
@@ -1142,6 +1163,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         profileDir: resolvedProfileFlag,
         remoteCdpPort: remoteCdpPortFlag,
         cdpUrl: cdpUrlFlag,
+        proxy: proxyFlag,
         trackerBlocking,
         crashRecovery,
         downloads: downloadsOpts,
@@ -1563,6 +1585,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       cdpPort: flags['cdp-port'] ? Number(flags['cdp-port']) : undefined,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
+      proxy: proxyFlag,
       profileDir: resolvedProfileFlag,
       endpointFile: endpointFlag,
       compatTroy: Boolean(flags['compat-troy']),
@@ -1725,6 +1748,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       profileDir: resolvedProfileFlag,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
+      proxy: proxyFlag,
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
@@ -1778,6 +1802,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       profileDir: resolvedProfileFlag,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
+      proxy: proxyFlag,
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
@@ -1808,6 +1833,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       profileDir: resolvedProfileFlag,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
+      proxy: proxyFlag,
       trackerBlocking,
       emulation: cliEmulation,
       crashRecovery,
@@ -1883,6 +1909,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -1963,6 +1990,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -2000,6 +2028,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -2053,6 +2082,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -2118,6 +2148,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -2213,6 +2244,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -2270,6 +2302,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           profileDir: explicitProfile,
           remoteCdpPort: remoteCdpPortFlag,
           cdpUrl: cdpUrlFlag,
+          proxy: proxyFlag,
           trackerBlocking,
           memoryEnabled: false,
         })
@@ -2295,6 +2328,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       engine,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
+      proxy: proxyFlag,
       trackerBlocking,
       emulation: cliEmulation,
       ssrf: ssrfOpts,

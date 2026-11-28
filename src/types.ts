@@ -1421,4 +1421,68 @@ export interface MemoryWatchdogStats {
   recentEvents: MemoryWatchdogEvent[]
 }
 
+export type ProxyScheme = 'http' | 'https' | 'socks5' | 'socks5h'
+
+export interface ProxyEndpoint {
+  /** Raw normalized URL including credentials (never log directly; use displayUrl). */
+  url: string
+  /** Redacted URL safe for logs, diagnostics, and API responses. */
+  displayUrl: string
+  scheme: ProxyScheme
+  hostname: string
+  port: number
+  username?: string
+  password?: string
+  hasAuth: boolean
+  /** Chromium-compatible `--proxy-server` authority string (no inline credentials). */
+  chromiumServer: string
+}
+
+export interface ProxyOptions {
+  /** Explicit proxy URL applied to both HTTP and HTTPS (`--proxy`). Overrides env vars. */
+  server?: string
+  /** Explicit HTTP proxy URL (falls back to `HTTP_PROXY` / `http_proxy` when `useEnv !== false`). */
+  httpProxy?: string
+  /** Explicit HTTPS proxy URL (falls back to `HTTPS_PROXY` / `https_proxy` when `useEnv !== false`). */
+  httpsProxy?: string
+  /** Explicit fallback proxy URL (falls back to `ALL_PROXY` / `all_proxy` when `useEnv !== false`). */
+  allProxy?: string
+  /** Comma-separated bypass hosts or array of host patterns (`--proxy-bypass` / `NO_PROXY`). */
+  bypass?: string | string[]
+  /** Whether to read `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` from env (default: true). */
+  useEnv?: boolean
+  /** Connection / tunnel handshake timeout in ms (default: 15000). */
+  timeoutMs?: number
+}
+
+export interface ResolvedProxyConfig {
+  enabled: boolean
+  /** Explicit `--proxy` override if provided. */
+  server: ProxyEndpoint | null
+  /** Effective proxy for `http:` requests when `server` is not set. */
+  httpProxy: ProxyEndpoint | null
+  /** Effective proxy for `https:` requests when `server` is not set. */
+  httpsProxy: ProxyEndpoint | null
+  /** Effective fallback proxy when `server` and scheme-specific proxies are not set. */
+  allProxy: ProxyEndpoint | null
+  /** Normalized host bypass patterns (from `--proxy-bypass` and/or `NO_PROXY`). */
+  bypassList: string[]
+  /** Origin of configuration: `'cli' | 'env' | 'none'`. */
+  source: 'cli' | 'env' | 'none'
+  /** Connection / tunnel handshake timeout in ms. */
+  timeoutMs: number
+}
+
+export interface ProxyInfoSummary {
+  enabled: boolean
+  source: 'cli' | 'env' | 'none'
+  server: string | null
+  httpProxy: string | null
+  httpsProxy: string | null
+  allProxy: string | null
+  bypassList: string[]
+  hasAuth: boolean
+}
+
+
 

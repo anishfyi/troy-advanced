@@ -38,6 +38,9 @@ import type {
   NetworkListOptions,
   OriginStorageSnapshot,
   PageSnapshot,
+  ProxyInfoSummary,
+  ProxyOptions,
+  ResolvedProxyConfig,
   SettleOptions,
   SettleResult,
   StorageArea,
@@ -82,6 +85,7 @@ import { normalizeStorageArea, normalizeStorageMap, normalizeStorageOrigin } fro
 import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
 import { SHADOW_DOM_QUERY_HELPER } from './shadow-dom.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
+import { buildChromiumProxyArgs, resolveProxyConfig, summarizeProxyConfig } from './proxy.js'
 import type { SsrfGuard } from '../agent/ssrf.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import { describeWaitCondition, matchesText, matchesUrlPattern, pollUntil } from './wait.js'
@@ -2417,6 +2421,7 @@ export interface ChromiumLaunchOptions {
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
   ssrfGuard?: SsrfGuard
+  proxy?: string | ProxyOptions | ResolvedProxyConfig
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
@@ -2435,6 +2440,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   private downloads: DownloadQuarantineManager
   private dialogs: DialogManager
   private ssrfGuard?: SsrfGuard
+  private proxyConfig: ResolvedProxyConfig
   private closing = false
   private status: CrashRecoveryStatus = 'healthy'
   private restartCount = 0
@@ -2464,6 +2470,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     downloads?: DownloadPolicyOptions
     dialogs?: DialogPolicyOptions
     ssrfGuard?: SsrfGuard
+    proxyConfig?: ResolvedProxyConfig
   }) {
     this._cdpPort = cfg.cdpPort
     this.preferredCdpPort = cfg.preferredCdpPort
@@ -2481,6 +2488,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     this.downloads = new DownloadQuarantineManager(cfg.downloads, defaultQuarantineDir)
     this.dialogs = new DialogManager(cfg.dialogs)
     this.ssrfGuard = cfg.ssrfGuard
+    this.proxyConfig = cfg.proxyConfig ?? resolveProxyConfig()
     if (this.proc) {
       this.attachProcessExitHandler(this.proc)
     }
@@ -2529,6 +2537,10 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         // ignore listener failure
       }
     }
+  }
+
+  getProxyInfo(): ProxyInfoSummary {
+    return summarizeProxyConfig(this.proxyConfig)
   }
 
   getCrashRecoveryStats(): CrashRecoveryStats {
@@ -2589,6 +2601,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     viewport: { width: number; height: number },
     preferredPort?: number,
     cleanLocks = false,
+    proxyConfig?: ResolvedProxyConfig,
   ): Promise<{ proc: ChildProcess; port: number }> {
     fs.mkdirSync(profileDir, { recursive: true })
     if (cleanLocks) {
@@ -2602,6 +2615,8 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       port = await allocateFreePort()
     }
 
+    const proxyArgs = proxyConfig ? buildChromiumProxyArgs(proxyConfig) : []
+
     const args = [
       '--headless=new',
       '--no-sandbox',
@@ -2614,6 +2629,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       '--disable-sync',
       '--no-first-run',
       '--no-default-browser-check',
+      ...proxyArgs,
       `--window-size=${viewport.width},${viewport.height}`,
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
@@ -2646,6 +2662,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
 
   static async launch(opts: ChromiumLaunchOptions = {}): Promise<ChromiumBrowserEngine> {
     const initialEmulation = resolveEmulationProfile(opts.emulation)
+    const proxyConfig = resolveProxyConfig(opts.proxy)
 
     if (opts.cdpUrl && opts.cdpUrl.trim()) {
       const timeoutMs = opts.cdpConnectTimeoutMs ?? 10000
@@ -2690,6 +2707,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         downloads: opts.downloads,
         dialogs: opts.dialogs,
         ssrfGuard: opts.ssrfGuard,
+        proxyConfig,
       })
     }
 
@@ -2722,6 +2740,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       initialEmulation.viewport,
       preferredCdpPort,
       false,
+      proxyConfig,
     )
 
     return new ChromiumBrowserEngine({
@@ -2736,6 +2755,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       downloads: opts.downloads,
       dialogs: opts.dialogs,
       ssrfGuard: opts.ssrfGuard,
+      proxyConfig,
     })
   }
 
@@ -2799,6 +2819,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         this.defaultEmulation.viewport,
         this.preferredCdpPort,
         true,
+        this.proxyConfig,
       )
 
       if (this.closing) {

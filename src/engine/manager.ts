@@ -46,10 +46,13 @@ import type {
   PixelAsciiOptions,
   PolicyProfileInput,
   PolicyProfileStats,
+  ProxyInfoSummary,
+  ProxyOptions,
   ReadonlyModeOptions,
   ReadonlyModeStats,
   Rect,
   ResolvedPolicyProfile,
+  ResolvedProxyConfig,
   SecretRedactionMetadata,
   SecretRedactionOptions,
   SecretRedactionStats,
@@ -156,6 +159,7 @@ import {
   redactStorageSnapshots,
 } from './storage.js'
 import { LiteBrowserEngine } from './lite.js'
+import { resolveProxyConfig, summarizeProxyConfig } from './proxy.js'
 import type { ResponseCacheHooks, ResponseCacheOptions } from './response-cache.js'
 import type {
   RateLimitOptions,
@@ -224,6 +228,7 @@ export interface BrowserManagerOptions {
   denyOrigins?: string[]
   daemonConfigFile?: string
   autoLoadDaemonConfig?: boolean
+  proxy?: string | ProxyOptions | ResolvedProxyConfig
 }
 
 export class BrowserManager {
@@ -355,6 +360,7 @@ export class BrowserManager {
           ? { enabled: true }
           : undefined
     const ssrfGuard = new SsrfGuard(ssrfOpts)
+    const proxyConfig = resolveProxyConfig(opts.proxy)
 
     let engine: BrowserEngine
     const requested = opts.engine ?? 'auto'
@@ -371,6 +377,7 @@ export class BrowserManager {
         cache: opts.cache,
         cacheHooks: opts.cacheHooks,
         ssrfGuard,
+        proxy: proxyConfig,
       })
     } else if (requested === 'chromium' || opts.cdpUrl) {
       // Explicit --engine chromium or explicit --cdp-url must fail loudly if unreachable
@@ -387,6 +394,7 @@ export class BrowserManager {
         downloads: downloadsOpts,
         dialogs: opts.dialogs,
         ssrfGuard,
+        proxy: proxyConfig,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -403,6 +411,7 @@ export class BrowserManager {
             downloads: downloadsOpts,
             dialogs: opts.dialogs,
             ssrfGuard,
+            proxy: proxyConfig,
           })
         } catch {
           engine = new LiteBrowserEngine({
@@ -417,6 +426,7 @@ export class BrowserManager {
             cache: opts.cache,
             cacheHooks: opts.cacheHooks,
             ssrfGuard,
+            proxy: proxyConfig,
           })
         }
       } else {
@@ -432,6 +442,7 @@ export class BrowserManager {
           cache: opts.cache,
           cacheHooks: opts.cacheHooks,
           ssrfGuard,
+          proxy: proxyConfig,
         })
       }
     }
@@ -4141,6 +4152,12 @@ export class BrowserManager {
     } catch (err) {
       return { ok: false, error: String((err as Error)?.message ?? err) }
     }
+  }
+
+  getProxyInfo(): ProxyInfoSummary {
+    return this.engine.getProxyInfo
+      ? this.engine.getProxyInfo()
+      : summarizeProxyConfig(resolveProxyConfig({ useEnv: false }))
   }
 
   getCrashRecoveryStats(): CrashRecoveryStats {

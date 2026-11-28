@@ -12,6 +12,7 @@ import type {
   EngineKind,
   MemoryWatchdogOptions,
   PolicyProfileInput,
+  ProxyOptions,
   ReadonlyModeOptions,
   SecretRedactionOptions,
   SsrfProtectionOptions,
@@ -77,6 +78,7 @@ export interface DaemonOptions {
   watchdogIntervalMs?: number
   watchdogIdleTtlMs?: number
   memoryWatchdog?: MemoryWatchdogOptions
+  proxy?: string | ProxyOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -113,6 +115,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     allowOrigins: opts.allowOrigins,
     denyOrigins: opts.denyOrigins,
     daemonConfigFile,
+    proxy: opts.proxy,
   })
 
   if (opts.initialUrl) {
@@ -251,6 +254,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
             watchdogIdleTtlMs: memoryWatchdog.idleTabTtlMs,
           }
         : {}),
+      ...(manager.getProxyInfo().enabled ? { proxy: manager.getProxyInfo() } : {}),
       ...(managedLogFile ? { logFile: managedLogFile } : {}),
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
@@ -329,6 +333,18 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.cdpPort) args.push('--cdp-port', String(opts.cdpPort))
   if (opts.remoteCdpPort) args.push('--remote-cdp-port', String(opts.remoteCdpPort))
   if (opts.cdpUrl) args.push('--cdp-url', opts.cdpUrl)
+  if (typeof opts.proxy === 'string') {
+    args.push('--proxy', opts.proxy)
+  } else if (opts.proxy && typeof opts.proxy === 'object') {
+    if (opts.proxy.server) args.push('--proxy', opts.proxy.server)
+    if (opts.proxy.bypass) {
+      const list = Array.isArray(opts.proxy.bypass) ? opts.proxy.bypass : [opts.proxy.bypass]
+      for (const item of list) {
+        if (item.trim()) args.push('--proxy-bypass', item.trim())
+      }
+    }
+    if (opts.proxy.useEnv === false) args.push('--no-env-proxy')
+  }
   if (opts.profileDir) args.push('--profile', opts.profileDir)
   if (opts.endpointFile) args.push('--endpoint', opts.endpointFile)
   if (opts.compatTroy) args.push('--compat-troy')

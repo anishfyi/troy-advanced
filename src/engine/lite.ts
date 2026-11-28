@@ -34,6 +34,9 @@ import type {
   NetworkListOptions,
   OriginStorageSnapshot,
   PageSnapshot,
+  ProxyInfoSummary,
+  ProxyOptions,
+  ResolvedProxyConfig,
   SettleOptions,
   SettleResult,
   StorageArea,
@@ -47,6 +50,7 @@ import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
 import { SsrfBlockedError, SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
 import { CookieJar } from './cookie-jar.js'
+import { createProxiedFetch, proxiedFetch, resolveProxyConfig, summarizeProxyConfig } from './proxy.js'
 import { DialogManager } from './dialogs.js'
 import {
   NetworkRecorder,
@@ -1532,6 +1536,7 @@ class LiteTab implements TabDriver {
   private robotsRetry: RobotsRetryController
   private responseCache: ResponseCache
   private ssrfGuard?: SsrfGuard
+  private proxyConfig?: ResolvedProxyConfig
 
   constructor(
     id: number,
@@ -1544,6 +1549,7 @@ class LiteTab implements TabDriver {
     robotsRetry?: RobotsRetryController,
     responseCache?: ResponseCache,
     ssrfGuard?: SsrfGuard,
+    proxyConfig?: ResolvedProxyConfig,
   ) {
     this.id = id
     this.cookieJar = cookieJar
@@ -1555,6 +1561,7 @@ class LiteTab implements TabDriver {
     this.robotsRetry = robotsRetry ?? new RobotsRetryController()
     this.responseCache = responseCache ?? new ResponseCache()
     this.ssrfGuard = ssrfGuard
+    this.proxyConfig = proxyConfig
   }
 
   getEmulation(): EmulationProfile {
@@ -1714,7 +1721,7 @@ class LiteTab implements TabDriver {
           : 1
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          res = await fetch(currentUrl, { ...currentInit, headers: hopHeaders, redirect: 'manual' })
+          res = await proxiedFetch(currentUrl, { ...currentInit, headers: hopHeaders, redirect: 'manual' }, this.proxyConfig)
           this.storeCookies(currentUrl, res.headers)
 
           if (
@@ -2887,6 +2894,8 @@ export interface LiteEngineOptions {
   cacheHooks?: ResponseCacheHooks
   /** Optional SSRF protection guard (`--block-private-net`). */
   ssrfGuard?: SsrfGuard
+  /** Optional proxy configuration (`--proxy`, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`). */
+  proxy?: string | ProxyOptions | ResolvedProxyConfig
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -2902,9 +2911,11 @@ export class LiteBrowserEngine implements BrowserEngine {
   private robotsRetry: RobotsRetryController
   private responseCache: ResponseCache
   private ssrfGuard?: SsrfGuard
+  private proxyConfig: ResolvedProxyConfig
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
+    this.proxyConfig = resolveProxyConfig(opts.proxy)
     const cookieJarPath =
       opts.cookieJarPath !== undefined
         ? opts.cookieJarPath
@@ -2921,14 +2932,21 @@ export class LiteBrowserEngine implements BrowserEngine {
     this.downloads = new DownloadQuarantineManager(opts.downloads, defaultQuarantineDir)
     this.dialogs = new DialogManager(opts.dialogs)
     this.maxMetaRefreshDelaySeconds = opts.maxMetaRefreshDelaySeconds ?? 5
+    const robotsHooks: RobotsRetryHooks | undefined = this.proxyConfig.enabled
+      ? { fetchFn: createProxiedFetch(this.proxyConfig), ...opts.robotsRetryHooks }
+      : opts.robotsRetryHooks
     this.robotsRetry = new RobotsRetryController({
       robots: opts.robots,
       retry: opts.retry,
       rateLimit: opts.rateLimit,
-      hooks: opts.robotsRetryHooks,
+      hooks: robotsHooks,
     })
     this.responseCache = new ResponseCache(opts.cache, opts.cacheHooks)
     this.ssrfGuard = opts.ssrfGuard
+  }
+
+  getProxyInfo(): ProxyInfoSummary {
+    return summarizeProxyConfig(this.proxyConfig)
   }
 
   getCachePolicy(): ResolvedResponseCachePolicy {
@@ -3072,6 +3090,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       this.robotsRetry,
       this.responseCache,
       this.ssrfGuard,
+      this.proxyConfig,
     )
     if (initialUrl) {
       await tab.navigate(initialUrl)

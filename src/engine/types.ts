@@ -26,6 +26,7 @@ import type {
   NetworkListOptions,
   OriginStorageSnapshot,
   PageSnapshot,
+  ProxyInfoSummary,
   SettleOptions,
   SettleResult,
   StorageArea,
@@ -83,6 +84,7 @@ export interface BrowserEngine {
   readonly cdpPort: number
   readonly remoteCdpUrl?: string
   getRemoteCdpInfo?(): RemoteCdpInfo | null
+  getProxyInfo?(): ProxyInfoSummary
   createTab(initialUrl?: string): Promise<TabDriver>
   getDefaultEmulation?(): EmulationProfile
   setDefaultEmulation?(opts: EmulationOptions, mode?: EmulationUpdateMode): EmulationProfile
