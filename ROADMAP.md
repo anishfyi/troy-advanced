@@ -110,7 +110,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M91: Interactive demo server (`scripts/demo-site.mjs`) showcasing forms, tables, dynamic JS, and canvas art in ASCII
 - [x] M92: Architecture documentation (`docs/ARCHITECTURE.md`) with ASCII system diagrams
 - [x] M93: Protocol specification (`docs/PROTOCOL.md`) documenting Agent Socket, MCP, and Pipe REPL contracts
-- [ ] M94: EC2 Production Operations Guide (`docs/EC2_GUIDE.md`) covering t3/t4g sizing, IAM/IMDS hardening, systemd, and SSH tunneling
+- [x] M94: EC2 Production Operations Guide (`docs/EC2_GUIDE.md`) covering t3/t4g sizing, IAM/IMDS hardening, systemd, and SSH tunneling
 - [ ] M95: Shell completion generator (`troy-advanced completions bash|zsh|fish`)
 - [ ] M96: CLI `--quiet` / `--verbose` / `--timeout` global flags with clean exit codes (`0` ok, `1` error, `2` policy refusal, `3` daemon offline)
 - [ ] M97: Package export map (`exports` in `package.json`) with clean ESM subpath imports (`@anishfyi/troy-advanced/ascii`, `/engine`, `/mcp`)
