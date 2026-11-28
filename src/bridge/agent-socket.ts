@@ -12,6 +12,8 @@ import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
 import { formatAuditAscii, parseAuditEventKind } from '../agent/audit.js'
 import { formatLoopGuardAscii, parseLoopGuardMode } from '../agent/loop-guard.js'
 import { formatPolicyAscii } from '../agent/policy-profile.js'
+import { formatOriginRulesAscii } from '../cloud/daemon-config.js'
+import type { OriginRuleAction } from '../types.js'
 import { formatSessionsAscii, parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
@@ -195,6 +197,7 @@ export async function createAgentSocket(
             audit: manager.getAuditStats(),
             loopGuard: manager.getLoopGuardStats(),
             policy: manager.getPolicyStats(),
+            originRules: manager.getOriginRules(),
             readonly: manager.getReadonlyStats(),
             ssrf: manager.getSsrfStats(),
             untrustedMarkers: manager.getUntrustedMarkersStats(),
@@ -225,6 +228,53 @@ export async function createAgentSocket(
             ascii: formatPolicyAscii(stats, {
               width: typeof body.width === 'number' ? body.width : undefined,
             }),
+          },
+        }
+      }
+      case '/origins': {
+        const rawAction = typeof body.action === 'string' ? body.action.trim().toLowerCase() : 'list'
+        const validActions = new Set<OriginRuleAction>(['list', 'allow', 'deny', 'unallow', 'undeny', 'clear'])
+        if (!validActions.has(rawAction as OriginRuleAction)) {
+          return {
+            status: 400,
+            payload: {
+              ok: false,
+              error: `Invalid action "${rawAction}". Valid actions: list, allow, deny, unallow, undeny, clear`,
+            },
+          }
+        }
+        const action = rawAction as OriginRuleAction
+        const width = typeof body.width === 'number' ? body.width : undefined
+        if (action === 'list') {
+          const rules = manager.getOriginRules()
+          return {
+            status: 200,
+            payload: {
+              ok: true,
+              action,
+              ...rules,
+              rules,
+              ascii: formatOriginRulesAscii(rules, { width }),
+            },
+          }
+        }
+        const res = manager.updateOriginRules({
+          action,
+          origin: typeof body.origin === 'string' ? body.origin : undefined,
+          persist: body.persist !== false,
+          sessionId: headerSessionId,
+        })
+        if (!res.ok) {
+          return {
+            status: res.status === 'blocked' ? 403 : 400,
+            payload: res,
+          }
+        }
+        return {
+          status: 200,
+          payload: {
+            ...res,
+            ...(res.rules ? { ...res.rules, ascii: formatOriginRulesAscii(res.rules, { width }) } : {}),
           },
         }
       }
@@ -932,6 +982,13 @@ export async function createAgentSocket(
 
     if (req.method === 'GET' && url.pathname === '/policy') {
       handleRoute('/policy', {}, headerSessionId)
+        .then((r) => respond(r.status, r.payload, rateHeaders))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/origins') {
+      handleRoute('/origins', { action: 'list' }, headerSessionId)
         .then((r) => respond(r.status, r.payload, rateHeaders))
         .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
       return

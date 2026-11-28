@@ -168,7 +168,7 @@ export function authorizeAction(request: {
         origin,
       }
     }
-    if (requireOriginGrant && !allowed.has(origin)) {
+    if (requireOriginGrant && !allowed.has(origin) && !guard?.isOriginAllowed(origin)) {
       return {
         allowed: false,
         status: 'boundary',
@@ -207,7 +207,7 @@ export function authorizeAction(request: {
         origin,
       }
     }
-    if (requireOriginGrant && !allowed.has(origin)) {
+    if (requireOriginGrant && !allowed.has(origin) && !guard?.isOriginAllowed(origin)) {
       return {
         allowed: false,
         status: 'boundary',
@@ -250,7 +250,7 @@ export function authorizeAction(request: {
         origin,
       }
     }
-    if (requireOriginGrant && origin && !allowed.has(origin)) {
+    if (requireOriginGrant && origin && !allowed.has(origin) && !guard?.isOriginAllowed(origin)) {
       return {
         allowed: false,
         status: 'boundary',

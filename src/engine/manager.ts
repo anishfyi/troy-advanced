@@ -2,6 +2,7 @@
 // per-tab ElementRegistry, deterministic Policy enforcement, PageMemory,
 // Delta reads, and ASCII / Pixel-ASCII rendering.
 
+import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import type {
@@ -38,6 +39,8 @@ import type {
   LoopGuardStats,
   MarkdownRenderOptions,
   NetworkEntry,
+  OriginRuleAction,
+  OriginRulesSummary,
   OriginStorageSnapshot,
   PageSnapshot,
   PixelAsciiOptions,
@@ -92,6 +95,14 @@ import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { PolicyProfileGuard, resolvePolicyProfile } from '../agent/policy-profile.js'
 import { ReadonlyObserverGuard } from '../agent/readonly.js'
+import {
+  defaultDaemonConfigPath,
+  isWildcardOriginRule,
+  mergeOriginRuleLists,
+  normalizeOriginRule,
+  persistDaemonOriginRules,
+  readDaemonConfig,
+} from '../cloud/daemon-config.js'
 import { SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
 import {
   UntrustedContentGuard,
@@ -206,11 +217,16 @@ export interface BrowserManagerOptions {
   policyFile?: string
   autoLoadPolicyFile?: boolean
   readonly?: boolean | ReadonlyModeOptions
+  allowOrigins?: string[]
+  denyOrigins?: string[]
+  daemonConfigFile?: string
+  autoLoadDaemonConfig?: boolean
 }
 
 export class BrowserManager {
   readonly engine: BrowserEngine
   readonly profileDir: string
+  readonly daemonConfigFile: string
   readonly memory: PageMemory | null
   readonly audit: AuditLogger
   readonly loopGuard: AgentLoopGuard
@@ -233,6 +249,7 @@ export class BrowserManager {
   private constructor(
     engine: BrowserEngine,
     profileDir: string,
+    daemonConfigFile: string,
     memory: PageMemory | null,
     audit: AuditLogger,
     loopGuard: AgentLoopGuard,
@@ -244,6 +261,7 @@ export class BrowserManager {
   ) {
     this.engine = engine
     this.profileDir = profileDir
+    this.daemonConfigFile = daemonConfigFile
     this.memory = memory
     this.audit = audit
     this.loopGuard = loopGuard
@@ -253,7 +271,7 @@ export class BrowserManager {
     this.policy = policy
     this.readonlyGuard = readonlyGuard
     for (const origin of policy.resolved.allowedOrigins) {
-      if (!policy.isOriginDenied(origin)) {
+      if (!isWildcardOriginRule(origin) && !policy.isOriginDenied(origin)) {
         this.allowedOrigins.add(origin)
       }
     }
@@ -283,12 +301,38 @@ export class BrowserManager {
     const profileDir =
       opts.profileDir || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'troy-advanced', 'profile')
 
+    const daemonConfigFile = defaultDaemonConfigPath({
+      configFile: opts.daemonConfigFile,
+      profileDir,
+    })
+    const persistedDaemonConfig =
+      opts.autoLoadDaemonConfig !== false ? readDaemonConfig(daemonConfigFile) : null
+
     const resolvedPolicy = resolvePolicyProfile(opts.policy, {
       policyFile: opts.policyFile,
       profileDir,
       autoLoadPolicyFile: opts.autoLoadPolicyFile,
     })
     const policyGuard = new PolicyProfileGuard(resolvedPolicy)
+
+    const mergedAllowedOrigins = mergeOriginRuleLists(
+      resolvedPolicy.allowedOrigins,
+      persistedDaemonConfig?.allowedOrigins,
+      opts.allowOrigins,
+    )
+    const mergedDeniedOrigins = mergeOriginRuleLists(
+      resolvedPolicy.deniedOrigins,
+      persistedDaemonConfig?.deniedOrigins,
+      opts.denyOrigins,
+    )
+    if (
+      mergedAllowedOrigins.length !== resolvedPolicy.allowedOrigins.length ||
+      mergedDeniedOrigins.length !== resolvedPolicy.deniedOrigins.length ||
+      mergedAllowedOrigins.some((o, i) => o !== resolvedPolicy.allowedOrigins[i]) ||
+      mergedDeniedOrigins.some((o, i) => o !== resolvedPolicy.deniedOrigins[i])
+    ) {
+      policyGuard.setOriginLists(mergedAllowedOrigins, mergedDeniedOrigins)
+    }
 
     const downloadsOpts: DownloadPolicyOptions = {
       mode: resolvedPolicy.downloadMode,
@@ -409,6 +453,7 @@ export class BrowserManager {
     return new BrowserManager(
       engine,
       profileDir,
+      daemonConfigFile,
       memory,
       audit,
       loopGuard,
@@ -434,6 +479,185 @@ export class BrowserManager {
 
   getPolicyProfile(): ResolvedPolicyProfile {
     return this.policy.resolved
+  }
+
+  getOriginRules(): OriginRulesSummary {
+    const configExists = fs.existsSync(this.daemonConfigFile)
+    let persistedAllowedOrigins: string[] = []
+    let persistedDeniedOrigins: string[] = []
+    if (configExists) {
+      try {
+        const persisted = readDaemonConfig(this.daemonConfigFile)
+        persistedAllowedOrigins = persisted?.allowedOrigins ?? []
+        persistedDeniedOrigins = persisted?.deniedOrigins ?? []
+      } catch {
+        // leave persisted lists empty if file was externally corrupted
+      }
+    }
+    return {
+      allowedOrigins: [...this.policy.resolved.allowedOrigins],
+      deniedOrigins: [...this.policy.resolved.deniedOrigins],
+      persistedAllowedOrigins,
+      persistedDeniedOrigins,
+      configFile: this.daemonConfigFile,
+      configExists,
+    }
+  }
+
+  updateOriginRules(req: {
+    action: OriginRuleAction
+    origin?: string
+    persist?: boolean
+    sessionId?: string
+    bypassReadonly?: boolean
+  }): {
+    ok: boolean
+    action: OriginRuleAction
+    origin?: string
+    rules?: OriginRulesSummary
+    status?: 'blocked'
+    code?: string
+    error?: string
+  } {
+    const startedAt = Date.now()
+    const action = req.action
+    const sessionId = req.sessionId
+
+    if (action === 'list') {
+      return { ok: true, action, rules: this.getOriginRules() }
+    }
+
+    if (this.readonlyGuard.enabled && !req.bypassReadonly) {
+      const decision = this.readonlyGuard.checkEndpoint('/origins', { action, origin: req.origin }, { sessionId })
+      if (!decision.allowed) {
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'origin_rules_update',
+          summary: `${action} ${req.origin ?? ''}`.trim(),
+          ok: false,
+          durationMs,
+          error: decision.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'origin_rules_update',
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: decision.status, code: decision.code, reason: decision.reason },
+          durationMs,
+          args: { action, origin: req.origin },
+          summary: `${action} ${req.origin ?? ''}`.trim(),
+          error: decision.reason,
+        })
+        return {
+          ok: false,
+          action,
+          status: 'blocked',
+          code: decision.code,
+          error: decision.reason,
+        }
+      }
+    }
+
+    const persist = req.persist !== false
+    let currentAllowed = [...this.policy.resolved.allowedOrigins]
+    let currentDenied = [...this.policy.resolved.deniedOrigins]
+    let normalizedRule: string | undefined
+
+    if (action === 'clear') {
+      const target = (req.origin ?? '').trim().toLowerCase()
+      const clearAllowed = !target || target === 'all' || target === 'allow' || target === 'allowed'
+      const clearDenied = !target || target === 'all' || target === 'deny' || target === 'denied'
+      if (clearAllowed) currentAllowed = []
+      if (clearDenied) currentDenied = []
+      this.policy.setOriginLists(currentAllowed, currentDenied)
+      if (persist) {
+        persistDaemonOriginRules(this.daemonConfigFile, {
+          clearAllowed,
+          clearDenied,
+        })
+      }
+    } else {
+      const normalized = normalizeOriginRule(req.origin)
+      if (!normalized) {
+        return {
+          ok: false,
+          action,
+          error: `invalid http(s) origin or wildcard rule: ${JSON.stringify(req.origin ?? '')}`,
+        }
+      }
+      normalizedRule = normalized
+
+      if (action === 'allow') {
+        currentAllowed = mergeOriginRuleLists(currentAllowed, [normalized])
+        this.policy.setOriginLists(currentAllowed, currentDenied)
+        if (!isWildcardOriginRule(normalized) && !this.policy.isOriginDenied(normalized)) {
+          this.allowedOrigins.add(normalized)
+        }
+        if (persist) {
+          persistDaemonOriginRules(this.daemonConfigFile, { allowOrigins: [normalized] })
+        }
+      } else if (action === 'deny') {
+        currentDenied = mergeOriginRuleLists(currentDenied, [normalized])
+        this.policy.setOriginLists(currentAllowed, currentDenied)
+        // Immediately revoke any previously allowed exact origins now matched by the denylist
+        for (const existing of [...this.allowedOrigins]) {
+          if (this.policy.isOriginDenied(existing)) {
+            this.allowedOrigins.delete(existing)
+          }
+        }
+        if (persist) {
+          persistDaemonOriginRules(this.daemonConfigFile, { denyOrigins: [normalized] })
+        }
+      } else if (action === 'unallow') {
+        currentAllowed = currentAllowed.filter((o) => o !== normalized)
+        this.policy.setOriginLists(currentAllowed, currentDenied)
+        if (!isWildcardOriginRule(normalized)) {
+          this.allowedOrigins.delete(normalized)
+        }
+        if (persist) {
+          persistDaemonOriginRules(this.daemonConfigFile, { removeAllowed: [normalized] })
+        }
+      } else if (action === 'undeny') {
+        currentDenied = currentDenied.filter((o) => o !== normalized)
+        this.policy.setOriginLists(currentAllowed, currentDenied)
+        if (persist) {
+          persistDaemonOriginRules(this.daemonConfigFile, { removeDenied: [normalized] })
+        }
+      }
+    }
+
+    const durationMs = Date.now() - startedAt
+    const rules = this.getOriginRules()
+    this.recordActivity({
+      ts: startedAt,
+      ...(sessionId ? { sessionId } : {}),
+      tool: 'origin_rules_update',
+      summary: `${action}${normalizedRule ? ` ${normalizedRule}` : ''}`,
+      ok: true,
+      durationMs,
+    })
+    this.audit.record({
+      tsMs: startedAt,
+      kind: 'origin_grant',
+      tool: 'origin_rules_update',
+      ...(sessionId ? { sessionId } : {}),
+      ok: true,
+      refused: false,
+      durationMs,
+      args: { action, ...(normalizedRule ? { origin: normalizedRule } : {}), persist },
+      summary: `${action}${normalizedRule ? ` ${normalizedRule}` : ''}`,
+    })
+    return {
+      ok: true,
+      action,
+      ...(normalizedRule ? { origin: normalizedRule } : {}),
+      rules,
+    }
   }
 
   getSsrfStats(): SsrfProtectionStats {

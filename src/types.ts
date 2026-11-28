@@ -1235,3 +1235,28 @@ export interface ReadonlyModeStats {
   blockedByTool: Record<string, number>
   recentBlocked: ReadonlyRefusalEvent[]
 }
+
+export interface DaemonConfigFile {
+  version: 1
+  updatedAt: string
+  allowedOrigins: string[]
+  deniedOrigins: string[]
+}
+
+export interface DaemonConfigValidationResult {
+  ok: boolean
+  config?: DaemonConfigFile
+  errors: string[]
+  warnings: string[]
+}
+
+export interface OriginRulesSummary {
+  allowedOrigins: string[]
+  deniedOrigins: string[]
+  persistedAllowedOrigins: string[]
+  persistedDeniedOrigins: string[]
+  configFile: string
+  configExists: boolean
+}
+
+export type OriginRuleAction = 'list' | 'allow' | 'deny' | 'unallow' | 'undeny' | 'clear'

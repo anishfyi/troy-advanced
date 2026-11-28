@@ -27,6 +27,10 @@ import {
   troyCompatEndpointPath,
   writeEndpoint,
 } from '../bridge/endpoint.js'
+import {
+  defaultDaemonConfigPath,
+  persistDaemonOriginRules,
+} from './daemon-config.js'
 
 export interface DaemonOptions {
   engine?: EngineKind
@@ -50,9 +54,24 @@ export interface DaemonOptions {
   policy?: PolicyProfileInput
   policyFile?: string
   readonly?: boolean | ReadonlyModeOptions
+  allowOrigins?: string[]
+  denyOrigins?: string[]
+  daemonConfigFile?: string
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
+  const daemonConfigFile = defaultDaemonConfigPath({
+    configFile: opts.daemonConfigFile,
+    profileDir: opts.profileDir,
+    endpointFile: opts.endpointFile,
+  })
+  if ((opts.allowOrigins && opts.allowOrigins.length > 0) || (opts.denyOrigins && opts.denyOrigins.length > 0)) {
+    persistDaemonOriginRules(daemonConfigFile, {
+      allowOrigins: opts.allowOrigins,
+      denyOrigins: opts.denyOrigins,
+    })
+  }
+
   const manager = await BrowserManager.create({
     engine: opts.engine ?? 'auto',
     profileDir: opts.profileDir,
@@ -71,6 +90,9 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     policy: opts.policy,
     policyFile: opts.policyFile,
     readonly: opts.readonly,
+    allowOrigins: opts.allowOrigins,
+    denyOrigins: opts.denyOrigins,
+    daemonConfigFile,
   })
 
   if (opts.initialUrl) {
@@ -144,6 +166,9 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       readonly: manager.readonlyGuard.enabled,
       policyProfile: manager.policy.profile,
       ...(manager.policy.resolved.sourceFile ? { policyFile: manager.policy.resolved.sourceFile } : {}),
+      allowedOrigins: manager.policy.resolved.allowedOrigins,
+      deniedOrigins: manager.policy.resolved.deniedOrigins,
+      daemonConfigFile: manager.daemonConfigFile,
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
     }),
@@ -175,6 +200,17 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   }
 
   const endpointFile = opts.endpointFile || defaultEndpointPath()
+  const daemonConfigFile = defaultDaemonConfigPath({
+    configFile: opts.daemonConfigFile,
+    profileDir: opts.profileDir,
+    endpointFile,
+  })
+  if ((opts.allowOrigins && opts.allowOrigins.length > 0) || (opts.denyOrigins && opts.denyOrigins.length > 0)) {
+    persistDaemonOriginRules(daemonConfigFile, {
+      allowOrigins: opts.allowOrigins,
+      denyOrigins: opts.denyOrigins,
+    })
+  }
   const logFile = path.join(path.dirname(endpointFile), 'daemon.log')
   fs.mkdirSync(path.dirname(logFile), { recursive: true })
   const outFd = fs.openSync(logFile, 'a')
@@ -238,6 +274,19 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   }
   if (opts.readonly === true || (typeof opts.readonly === 'object' && opts.readonly?.enabled)) {
     args.push('--readonly')
+  }
+  if (opts.daemonConfigFile) {
+    args.push('--daemon-config', opts.daemonConfigFile)
+  }
+  if (opts.allowOrigins && opts.allowOrigins.length > 0) {
+    for (const origin of opts.allowOrigins) {
+      args.push('--allow-origin', origin)
+    }
+  }
+  if (opts.denyOrigins && opts.denyOrigins.length > 0) {
+    for (const origin of opts.denyOrigins) {
+      args.push('--deny-origin', origin)
+    }
   }
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport

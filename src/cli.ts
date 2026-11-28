@@ -72,6 +72,13 @@ import {
 } from './engine/storage.js'
 import { readLiveEndpoint } from './bridge/endpoint.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
+import {
+  defaultDaemonConfigPath,
+  formatOriginRulesAscii,
+  parseOriginFlagValues,
+  persistDaemonOriginRules,
+  readDaemonConfig,
+} from './cloud/daemon-config.js'
 import { formatDoctorAscii, runDoctor } from './cloud/doctor.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
@@ -91,7 +98,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -143,6 +150,8 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect persistent agent action audit log (audit.jsonl) with refusals, timing, and URL transitions
   policy [show|init|validate] [--policy strict|standard|permissive] [--file <path>] [--force] [--json]
                                           Inspect active policy profile, generate policy.json template, or validate policy.json
+  origins [list|allow <origin>|deny <origin>|unallow <origin>|undeny <origin>|clear] [--daemon-config <path>] [--json]
+                                          Inspect or update persisted origin allowlist / denylist rules in daemon.json
   sessions [id | close <id> [--keep-tabs]] [--json]
                                           List, inspect, or close isolated multi-agent sessions (x-troy-session)
   act <json-steps> [--allow-submit]       Run batched action list
@@ -165,7 +174,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --allow-origin <origin>  --deny-origin <origin>  --daemon-config <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -180,6 +189,9 @@ const VALUE_FLAGS = new Set([
   '--profile',
   '--policy',
   '--policy-file',
+  '--allow-origin',
+  '--deny-origin',
+  '--daemon-config',
   '--url',
   '--width',
   '--height',
@@ -236,7 +248,14 @@ const VALUE_FLAGS = new Set([
   '--ssrf-allow-host',
 ])
 
-const REPEATABLE_FLAGS = new Set(['--header', '--remove-header', '--var', '--ssrf-allow-host'])
+const REPEATABLE_FLAGS = new Set([
+  '--header',
+  '--remove-header',
+  '--var',
+  '--ssrf-allow-host',
+  '--allow-origin',
+  '--deny-origin',
+])
 
 async function readStdinUtf8(): Promise<string> {
   const chunks: Buffer[] = []
@@ -431,6 +450,50 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       : process.env.TROY_POLICY_FILE?.trim()
         ? path.resolve(process.env.TROY_POLICY_FILE.trim())
         : undefined
+  const daemonConfigFileFlag =
+    typeof flags['daemon-config'] === 'string' && flags['daemon-config'].trim()
+      ? path.resolve(flags['daemon-config'].trim())
+      : process.env.TROY_ADVANCED_DAEMON_CONFIG?.trim()
+        ? path.resolve(process.env.TROY_ADVANCED_DAEMON_CONFIG.trim())
+        : undefined
+  const envAllowOrigins = process.env.TROY_ADVANCED_ALLOW_ORIGINS || process.env.TROY_ALLOW_ORIGINS || ''
+  const envDenyOrigins = process.env.TROY_ADVANCED_DENY_ORIGINS || process.env.TROY_DENY_ORIGINS || ''
+  const parsedAllowOrigins = parseOriginFlagValues([
+    ...(envAllowOrigins ? [envAllowOrigins] : []),
+    ...(multiFlags['allow-origin'] ?? []),
+  ])
+  if (parsedAllowOrigins.invalid.length > 0) {
+    console.error(
+      JSON.stringify(
+        {
+          ok: false,
+          error: `Invalid --allow-origin value(s): ${parsedAllowOrigins.invalid.join(', ')}. Expected http(s) origin or wildcard subdomain (e.g. https://example.com or https://*.example.com).`,
+        },
+        null,
+        2,
+      ),
+    )
+    process.exit(1)
+  }
+  const parsedDenyOrigins = parseOriginFlagValues([
+    ...(envDenyOrigins ? [envDenyOrigins] : []),
+    ...(multiFlags['deny-origin'] ?? []),
+  ])
+  if (parsedDenyOrigins.invalid.length > 0) {
+    console.error(
+      JSON.stringify(
+        {
+          ok: false,
+          error: `Invalid --deny-origin value(s): ${parsedDenyOrigins.invalid.join(', ')}. Expected http(s) origin or wildcard subdomain (e.g. https://evil.com or https://*.evil.com).`,
+        },
+        null,
+        2,
+      ),
+    )
+    process.exit(1)
+  }
+  const allowOriginsFlag = parsedAllowOrigins.valid.length > 0 ? parsedAllowOrigins.valid : undefined
+  const denyOriginsFlag = parsedDenyOrigins.valid.length > 0 ? parsedDenyOrigins.valid : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -586,6 +649,95 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     process.exit(1)
   }
 
+  if (cmd === 'origins') {
+    const sub = (positional[1] || 'list').toLowerCase()
+    const targetArg = positional[2]
+    const validSubs = new Set(['list', 'allow', 'deny', 'unallow', 'undeny', 'clear'])
+    if (!validSubs.has(sub)) {
+      console.error(
+        'Usage: troy-advanced origins [list|allow <origin>|deny <origin>|unallow <origin>|undeny <origin>|clear] [--daemon-config <path>] [--json]',
+      )
+      process.exit(1)
+    }
+
+    const explicitConfig =
+      daemonConfigFileFlag ??
+      (typeof flags.file === 'string' && flags.file.trim() ? path.resolve(flags.file.trim()) : undefined)
+    const live = !explicitConfig && !flags.oneshot ? readLiveEndpoint(endpointFlag) : null
+    if (live) {
+      const res = await callDaemon(live.endpoint, '/origins', {
+        action: sub,
+        ...(targetArg !== undefined ? { origin: targetArg } : {}),
+        width: flags.width !== undefined ? Number(flags.width) : undefined,
+      })
+      if (flags.json || !res.ok || typeof res.ascii !== 'string') {
+        console.log(JSON.stringify(res, null, 2))
+      } else {
+        console.log(res.ascii)
+      }
+      if (!res.ok) process.exit(1)
+      return
+    }
+
+    const configFile = defaultDaemonConfigPath({
+      configFile: explicitConfig,
+      profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
+      endpointFile: endpointFlag,
+    })
+
+    if (sub !== 'list') {
+      if (sub === 'clear') {
+        const target = (targetArg ?? '').trim().toLowerCase()
+        persistDaemonOriginRules(configFile, {
+          clearAllowed: !target || target === 'all' || target === 'allow' || target === 'allowed',
+          clearDenied: !target || target === 'all' || target === 'deny' || target === 'denied',
+        })
+      } else {
+        const parsed = parseOriginFlagValues(targetArg ? [targetArg] : [])
+        if (parsed.valid.length === 0 || parsed.invalid.length > 0) {
+          console.error(
+            JSON.stringify(
+              {
+                ok: false,
+                error: `Invalid origin rule for "${sub}": ${JSON.stringify(targetArg ?? '')}`,
+              },
+              null,
+              2,
+            ),
+          )
+          process.exit(1)
+        }
+        persistDaemonOriginRules(configFile, {
+          ...(sub === 'allow' ? { allowOrigins: parsed.valid } : {}),
+          ...(sub === 'deny' ? { denyOrigins: parsed.valid } : {}),
+          ...(sub === 'unallow' ? { removeAllowed: parsed.valid } : {}),
+          ...(sub === 'undeny' ? { removeDenied: parsed.valid } : {}),
+        })
+      }
+    }
+
+    const configExists = fs.existsSync(configFile)
+    const persisted = configExists ? readDaemonConfig(configFile) : null
+    const rules = {
+      allowedOrigins: persisted?.allowedOrigins ?? [],
+      deniedOrigins: persisted?.deniedOrigins ?? [],
+      persistedAllowedOrigins: persisted?.allowedOrigins ?? [],
+      persistedDeniedOrigins: persisted?.deniedOrigins ?? [],
+      configFile,
+      configExists,
+    }
+    if (flags.json) {
+      console.log(JSON.stringify({ ok: true, action: sub, ...rules, rules }, null, 2))
+    } else {
+      console.log(
+        formatOriginRulesAscii(rules, {
+          width: flags.width !== undefined ? Number(flags.width) : undefined,
+        }),
+      )
+    }
+    return
+  }
+
   if (cmd === 'audit' && typeof flags.file === 'string' && flags.file.trim()) {
     const filePath = path.resolve(flags.file.trim())
     const allEntries = readAuditJsonl(filePath)
@@ -685,6 +837,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         policy: policyProfileFlag,
         policyFile: policyFileFlag,
         readonly: readonlyFlag || undefined,
+        allowOrigins: allowOriginsFlag,
+        denyOrigins: denyOriginsFlag,
+        daemonConfigFile: daemonConfigFileFlag,
         emulation: cliEmulation,
         memoryEnabled: false,
       })
@@ -827,6 +982,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
       readonly: readonlyFlag || undefined,
+      allowOrigins: allowOriginsFlag,
+      denyOrigins: denyOriginsFlag,
+      daemonConfigFile: daemonConfigFileFlag,
     }
 
     if (sub === 'run') {
@@ -874,6 +1032,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
       readonly: readonlyFlag || undefined,
+      allowOrigins: allowOriginsFlag,
+      denyOrigins: denyOriginsFlag,
+      daemonConfigFile: daemonConfigFileFlag,
     })
     try {
       const inspectorTabFlag =
@@ -924,6 +1085,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
       readonly: readonlyFlag || undefined,
+      allowOrigins: allowOriginsFlag,
+      denyOrigins: denyOriginsFlag,
+      daemonConfigFile: daemonConfigFileFlag,
     })
     try {
       await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
@@ -951,6 +1115,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
       readonly: readonlyFlag || undefined,
+      allowOrigins: allowOriginsFlag,
+      denyOrigins: denyOriginsFlag,
+      daemonConfigFile: daemonConfigFileFlag,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1431,6 +1598,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
       readonly: readonlyFlag || undefined,
+      allowOrigins: allowOriginsFlag,
+      denyOrigins: denyOriginsFlag,
+      daemonConfigFile: daemonConfigFileFlag,
     })
     try {
       const opened = await manager.openTab(positional[1], { activate: true, bypassReadonly: true })

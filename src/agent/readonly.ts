@@ -304,6 +304,17 @@ export function isMutatingEndpoint(
         }
       }
       return { mutating: false, canonicalTool: 'sessions' }
+    case '/origins': {
+      const action = typeof body?.action === 'string' ? body.action.trim().toLowerCase() : 'list'
+      if (action && action !== 'list') {
+        return {
+          mutating: true,
+          canonicalTool: 'origin_rules_update',
+          reason: `modifying origin rules ("${action}") via /origins is refused in read-only observer mode (--readonly)`,
+        }
+      }
+      return { mutating: false, canonicalTool: 'origins' }
+    }
     default:
       return { mutating: false, canonicalTool: pathname }
   }

@@ -15,6 +15,12 @@ import type {
 } from '../types.js'
 import { sanitizeAscii } from '../ascii/sanitize.js'
 import { exactOrigin, normalizeOrigin } from './omnibox.js'
+import {
+  isWildcardOriginRule,
+  matchesOriginRule,
+  mergeOriginRuleLists,
+  normalizeOriginRule,
+} from '../cloud/daemon-config.js'
 
 export const POLICY_PROFILE_NAMES: readonly PolicyProfileName[] = Object.freeze([
   'strict',
@@ -135,7 +141,7 @@ function normalizeOriginList(raw: unknown, fieldName: string, errors: string[]):
       errors.push(`"${fieldName}[${i}]" must be a non-empty string`)
       continue
     }
-    const normalized = normalizeOrigin(entry)
+    const normalized = normalizeOriginRule(entry)
     if (!normalized) {
       errors.push(`"${fieldName}[${i}]" is not a valid http(s) origin: ${JSON.stringify(entry)}`)
       continue
@@ -465,16 +471,49 @@ export function compilePolicyPatterns(patterns: readonly string[]): RegExp[] {
 export class PolicyProfileGuard {
   readonly resolved: ResolvedPolicyProfile
   readonly blockedToolSet: ReadonlySet<string>
-  readonly deniedOriginSet: ReadonlySet<string>
   readonly extraSensitiveRegexes: readonly RegExp[]
   readonly extraSubmitRegexes: readonly RegExp[]
+  private allowedOriginExactSet: Set<string>
+  private allowedOriginWildcardRules: string[]
+  private deniedOriginExactSet: Set<string>
+  private deniedOriginWildcardRules: string[]
 
   constructor(resolved: ResolvedPolicyProfile) {
     this.resolved = resolved
     this.blockedToolSet = new Set(resolved.blockedTools)
-    this.deniedOriginSet = new Set(resolved.deniedOrigins)
     this.extraSensitiveRegexes = compilePolicyPatterns(resolved.extraSensitivePatterns)
     this.extraSubmitRegexes = compilePolicyPatterns(resolved.extraSubmitPatterns)
+    this.allowedOriginExactSet = new Set<string>()
+    this.allowedOriginWildcardRules = []
+    this.deniedOriginExactSet = new Set<string>()
+    this.deniedOriginWildcardRules = []
+    this.rebuildOriginIndexes()
+  }
+
+  private rebuildOriginIndexes(): void {
+    this.allowedOriginExactSet = new Set<string>()
+    this.allowedOriginWildcardRules = []
+    for (const rule of this.resolved.allowedOrigins) {
+      if (isWildcardOriginRule(rule)) {
+        this.allowedOriginWildcardRules.push(rule)
+      } else {
+        this.allowedOriginExactSet.add(rule)
+      }
+    }
+
+    this.deniedOriginExactSet = new Set<string>()
+    this.deniedOriginWildcardRules = []
+    for (const rule of this.resolved.deniedOrigins) {
+      if (isWildcardOriginRule(rule)) {
+        this.deniedOriginWildcardRules.push(rule)
+      } else {
+        this.deniedOriginExactSet.add(rule)
+      }
+    }
+  }
+
+  get deniedOriginSet(): ReadonlySet<string> {
+    return this.deniedOriginExactSet
   }
 
   get profile(): PolicyProfileName {
@@ -486,10 +525,42 @@ export class PolicyProfileGuard {
   }
 
   isOriginDenied(urlOrOrigin?: string | null): string | null {
-    if (!urlOrOrigin || this.deniedOriginSet.size === 0) return null
+    if (!urlOrOrigin) return null
+    if (this.deniedOriginExactSet.size === 0 && this.deniedOriginWildcardRules.length === 0) {
+      return null
+    }
     const origin = exactOrigin(urlOrOrigin) ?? normalizeOrigin(urlOrOrigin)
     if (!origin) return null
-    return this.deniedOriginSet.has(origin) ? origin : null
+    if (this.deniedOriginExactSet.has(origin)) return origin
+    for (const rule of this.deniedOriginWildcardRules) {
+      if (matchesOriginRule(rule, origin)) return origin
+    }
+    return null
+  }
+
+  isOriginAllowed(urlOrOrigin?: string | null): string | null {
+    if (!urlOrOrigin) return null
+    if (this.allowedOriginExactSet.size === 0 && this.allowedOriginWildcardRules.length === 0) {
+      return null
+    }
+    const origin = exactOrigin(urlOrOrigin) ?? normalizeOrigin(urlOrOrigin)
+    if (!origin) return null
+    // Deny always takes precedence over allow
+    if (this.isOriginDenied(origin)) return null
+    if (this.allowedOriginExactSet.has(origin)) return origin
+    for (const rule of this.allowedOriginWildcardRules) {
+      if (matchesOriginRule(rule, origin)) return origin
+    }
+    return null
+  }
+
+  setOriginLists(allowedOrigins: readonly string[], deniedOrigins: readonly string[]): void {
+    this.resolved.allowedOrigins = mergeOriginRuleLists(allowedOrigins)
+    this.resolved.deniedOrigins = mergeOriginRuleLists(deniedOrigins)
+    if (this.resolved.allowedOrigins.length > 0 || this.resolved.deniedOrigins.length > 0) {
+      this.resolved.customized = true
+    }
+    this.rebuildOriginIndexes()
   }
 
   getStats(): PolicyProfileStats {
