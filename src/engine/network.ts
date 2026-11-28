@@ -202,7 +202,7 @@ export function formatBodyPayload(
   let sizeBytes = base64Encoded
     ? Buffer.from(text, 'base64').byteLength
     : Buffer.byteLength(text, 'utf8')
-  let isBinary = !isTextMimeType(mimeType)
+  const isBinary = !isTextMimeType(mimeType)
 
   if (base64Encoded) {
     const buf = Buffer.from(text, 'base64')

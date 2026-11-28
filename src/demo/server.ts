@@ -754,7 +754,7 @@ export function createDemoServer(options: DemoServerOptions = {}): DemoServerHan
       if (pathname === '/forms' && method === 'POST') {
         const raw = await readRequestBody(req)
         const contentType = String(req.headers['content-type'] ?? '').toLowerCase()
-        let fields: Record<string, string> = {}
+        const fields: Record<string, string> = {}
 
         if (contentType.includes('application/json')) {
           const parsed = JSON.parse(raw || '{}') as Record<string, unknown>

@@ -67,6 +67,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node ./scripts/lint.mjs",
+    "lint:json": "node ./scripts/lint.mjs --json",
     "test": "vitest run",
     "test:unit": "vitest run --exclude test/chromium-e2e.test.ts",
     "test:e2e:chrome": "TROY_REQUIRE_CHROME=1 vitest run test/chromium-e2e.test.ts",

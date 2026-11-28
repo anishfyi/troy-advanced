@@ -338,7 +338,7 @@ export function trimAsciiToTokenBudget(
     return body.join('\n')
   }
 
-  let currentItems = [...orderedSelected]
+  const currentItems = [...orderedSelected]
   let includeMarker = markerReserve > 0
   let candidate = buildOutput(currentItems, includeMarker)
   let strategy: TokenBudgetStrategy = 'trim'

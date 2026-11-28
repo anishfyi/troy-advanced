@@ -494,7 +494,7 @@ export async function executePipeCommand(
       const tokens = tokenizePipeArgs(argStr)
       let clear = false
       let clearQueue = false
-      let allTabs = true
+      const allTabs = true
       let mode: string | undefined
       let type: string | undefined
       let queueAccept: boolean | undefined

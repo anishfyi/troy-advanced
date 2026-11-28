@@ -129,9 +129,9 @@ export function formatResizeStatus(event: ResizeEvent, opts: FormatResizeStatusO
   return notes.length > 0 ? `${base} (${notes.join('; ')})` : base
 }
 
-function detachListener(
-  target: { off?: (ev: any, fn: any) => unknown; removeListener?: (ev: any, fn: any) => unknown } | null | undefined,
-  event: string,
+function detachListener<E extends string>(
+  target: { off?: (ev: E, fn: () => void) => unknown; removeListener?: (ev: E, fn: () => void) => unknown } | null | undefined,
+  event: E,
   fn: () => void,
 ): void {
   if (!target) return

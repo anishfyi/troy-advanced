@@ -114,7 +114,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M95: Shell completion generator (`troy-advanced completions bash|zsh|fish`)
 - [x] M96: CLI `--quiet` / `--verbose` / `--timeout` global flags with clean exit codes (`0` ok, `1` error, `2` policy refusal, `3` daemon offline)
 - [x] M97: Package export map (`exports` in `package.json`) with clean ESM subpath imports (`@anishfyi/troy-advanced/ascii`, `/engine`, `/mcp`)
-- [ ] M98: ESLint / strict lint check script added to `package.json` and passing cleanly
+- [x] M98: ESLint / strict lint check script added to `package.json` and passing cleanly
 - [ ] M99: Zero-warning TypeScript build with `noUnusedLocals` and `noUnusedParameters` enabled
 - [ ] M100: Full E2E test suite verifying Daemon + Chromium + Lite + ASCII + Braille + Set-of-Marks + MCP + Pipe + Security Refusals + Memory Recall
 - [ ] M101: Stress test (`scripts/stress.mjs`) opening 10 concurrent tabs and verifying sub-50ms ASCII rendering and zero leaked sockets

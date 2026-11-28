@@ -3360,7 +3360,7 @@ export class BrowserManager {
         const resolved = session.elements.resolve(args.ref, startCtx)
         if ('error' in resolved) return { ok: false, error: resolved.error }
         let activeSelector = resolved.selector
-        let activeItem = resolved.item
+        const activeItem = resolved.item
         let recovered = Boolean(resolved.recovered)
         let recoveryStrategy = resolved.recoveryStrategy
         const recoveredRef = resolved.recoveredRef
