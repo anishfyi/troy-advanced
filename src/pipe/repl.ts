@@ -120,6 +120,7 @@ export async function executePipeCommand(
       let since = false
       let showMediaSummary = false
       let untrustedMarkers = false
+      let redactSecrets = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
         if (tok === '--since') {
@@ -128,6 +129,8 @@ export async function executePipeCommand(
           showMediaSummary = true
         } else if (tok === '--untrusted-markers') {
           untrustedMarkers = true
+        } else if (tok === '--redact-secrets') {
+          redactSecrets = true
         } else if (tok === '--density' && rest[i + 1]) {
           density = rest[++i]
         } else if (tok.startsWith('--density=')) {
@@ -159,6 +162,7 @@ export async function executePipeCommand(
         since,
         showMediaSummary,
         ...(untrustedMarkers ? { untrustedMarkers: true } : {}),
+        ...(redactSecrets ? { redactSecrets: true } : {}),
         asciiOnly: true,
       })
       return { output: format(res) }
@@ -173,6 +177,7 @@ export async function executePipeCommand(
       let crop: string | undefined
       let ref: string | undefined
       let untrustedMarkers = false
+      let redactSecrets = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
         if (tok === '--frontmatter') includeFrontmatter = true
@@ -181,6 +186,7 @@ export async function executePipeCommand(
         else if (tok === '--no-refs') showRefs = false
         else if (tok === '--no-urls') includeUrls = false
         else if (tok === '--untrusted-markers') untrustedMarkers = true
+        else if (tok === '--redact-secrets') redactSecrets = true
         else if (tok === '--crop' && rest[i + 1]) crop = rest[++i]
         else if (tok.startsWith('--crop=')) crop = tok.slice('--crop='.length)
         else if (tok === '--ref' && rest[i + 1]) ref = rest[++i]
@@ -195,6 +201,7 @@ export async function executePipeCommand(
         crop,
         ref,
         ...(untrustedMarkers ? { untrustedMarkers: true } : {}),
+        ...(redactSecrets ? { redactSecrets: true } : {}),
       })
       return { output: format(res) }
     }
@@ -233,9 +240,11 @@ export async function executePipeCommand(
     case 'read': {
       const since = rest.includes('--since')
       const untrustedMarkers = rest.includes('--untrusted-markers')
+      const redactSecrets = rest.includes('--redact-secrets')
       const res = await manager.runTool(undefined, 'page_read', {
         since,
         ...(untrustedMarkers ? { untrustedMarkers: true } : {}),
+        ...(redactSecrets ? { redactSecrets: true } : {}),
       })
       return { output: format(res) }
     }
@@ -283,17 +292,19 @@ export async function executePipeCommand(
       let externalLinksOnly = false
       let internalLinksOnly = false
       let includeObjects = true
+      let redactSecrets = false
       for (let i = 0; i < tokens.length; i++) {
         const tok = tokens[i]!
         if (tok === '--sections' && tokens[i + 1] !== undefined) sections = tokens[++i]
         else if (tok.startsWith('--sections=')) sections = tok.slice('--sections='.length)
         else if (tok === '--max-items' && tokens[i + 1] !== undefined) maxItems = Number(tokens[++i])
-        else if (tok.startsWith('--max-items=')) maxItems = Number(tok.slice('--max-items='.length))
+        else if (tok.startsWith('--max-items=')) maxItems = Number(tokens[i]!.slice('--max-items='.length))
         else if (tok === '--ascii') ascii = true
         else if (tok === '--ascii-only') asciiOnly = true
         else if (tok === '--external') externalLinksOnly = true
         else if (tok === '--internal') internalLinksOnly = true
         else if (tok === '--no-objects') includeObjects = false
+        else if (tok === '--redact-secrets') redactSecrets = true
       }
       const res = await manager.runTool(undefined, 'page_extract', {
         ...(sections ? { sections } : {}),
@@ -303,6 +314,7 @@ export async function executePipeCommand(
         asciiOnly,
         externalLinksOnly,
         internalLinksOnly,
+        ...(redactSecrets ? { redactSecrets: true } : {}),
       })
       return { output: format(res) }
     }

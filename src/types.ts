@@ -1149,3 +1149,67 @@ export interface PolicyValidationResult {
   errors: string[]
   warnings: string[]
 }
+
+export type SecretRedactionCategory =
+  | 'private-key'
+  | 'jwt'
+  | 'aws-access-key'
+  | 'aws-secret-key'
+  | 'provider-api-key'
+  | 'bearer-token'
+  | 'credit-card'
+  | 'custom'
+
+export type SecretRedactionMode = 'tag' | 'partial'
+
+export interface SecretRedactionCustomPattern {
+  name: string
+  pattern: string | RegExp
+  replacement?: string
+}
+
+export interface SecretRedactionOptions {
+  /** Automatically mask sensitive secrets (JWTs, AWS keys, credit cards, etc.) in page_text / ascii output (--redact-secrets). */
+  enabled?: boolean
+  /** Masking style: 'tag' (default, e.g. [REDACTED:AWS_KEY]) or 'partial' (e.g. AKIA****[REDACTED:AWS_KEY], ****-****-****-4242). */
+  mode?: SecretRedactionMode
+  /** Subset of secret categories to redact. Defaults to all built-in categories. */
+  categories?: SecretRedactionCategory[]
+  /** Optional custom regex patterns to redact in addition to built-in detectors. */
+  customPatterns?: SecretRedactionCustomPattern[]
+}
+
+export interface SecretRedactionMetadata {
+  redacted: boolean
+  totalRedactions: number
+  countsByCategory: Record<string, number>
+  categories: SecretRedactionCategory[]
+  source: string
+  kind: string
+  mode: SecretRedactionMode
+}
+
+export interface SecretRedactionResult {
+  text: string
+  meta: SecretRedactionMetadata
+}
+
+export interface SecretRedactionEvent {
+  ts: number
+  source: string
+  kind: string
+  totalRedactions: number
+  countsByCategory: Record<string, number>
+  categories: SecretRedactionCategory[]
+}
+
+export interface SecretRedactionStats {
+  enabled: boolean
+  mode: SecretRedactionMode
+  categories: SecretRedactionCategory[]
+  scansCount: number
+  pagesWithRedactions: number
+  totalRedactions: number
+  redactionsByCategory: Record<string, number>
+  recentRedactions: SecretRedactionEvent[]
+}

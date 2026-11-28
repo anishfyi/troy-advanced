@@ -180,6 +180,7 @@ export const MCP_TOOLS = [
         maxTokens: { type: 'number', description: 'Optional LLM token budget (e.g. 500, 2000); progressively compacts and trims ASCII output to fit <= maxTokens while preserving [eN] refs' },
         since: { type: 'boolean', description: 'Return only structural delta since previous read' },
         untrustedMarkers: { type: 'boolean', description: 'Wrap web page content in explicit untrusted delimiters with prompt-injection sanitization' },
+        redactSecrets: { type: 'boolean', description: 'Automatically mask sensitive secrets (JWTs, AWS keys AKIA..., credit cards, API keys) in output' },
       },
     },
   },
@@ -198,6 +199,7 @@ export const MCP_TOOLS = [
         crop: { type: 'string', description: 'Region crop in viewport pixels: "x,y,w,h"' },
         ref: { type: 'string', description: 'Element ref (e.g. "e5") whose bounding box to zoom into' },
         untrustedMarkers: { type: 'boolean', description: 'Wrap web page content in explicit untrusted delimiters with prompt-injection sanitization' },
+        redactSecrets: { type: 'boolean', description: 'Automatically mask sensitive secrets (JWTs, AWS keys AKIA..., credit cards, API keys) in output' },
       },
     },
   },
@@ -269,6 +271,7 @@ export const MCP_TOOLS = [
         ascii: { type: 'boolean', description: 'Also include a formatted strict 7-bit ASCII summary' },
         settle: { type: 'boolean', description: 'Wait for network idle and DOM mutations to settle before extracting' },
         untrustedMarkers: { type: 'boolean', description: 'Wrap ASCII extract summary in explicit untrusted delimiters with prompt-injection sanitization' },
+        redactSecrets: { type: 'boolean', description: 'Automatically mask sensitive secrets (JWTs, AWS keys AKIA..., credit cards, API keys) in ASCII extract output' },
       },
     },
   },
@@ -834,6 +837,7 @@ export async function handleMcpRequest(
           since: args.since,
           settle: args.settle,
           ...(args.untrustedMarkers !== undefined ? { untrustedMarkers: args.untrustedMarkers } : {}),
+          ...(args.redactSecrets !== undefined ? { redactSecrets: args.redactSecrets } : {}),
           asciiOnly: true,
         })
         break
@@ -848,6 +852,7 @@ export async function handleMcpRequest(
           ref: args.ref,
           settle: args.settle,
           ...(args.untrustedMarkers !== undefined ? { untrustedMarkers: args.untrustedMarkers } : {}),
+          ...(args.redactSecrets !== undefined ? { redactSecrets: args.redactSecrets } : {}),
         })
         break
       case 'troy_screenshot_ascii':
@@ -884,6 +889,7 @@ export async function handleMcpRequest(
           ascii: args.ascii,
           settle: args.settle,
           ...(args.untrustedMarkers !== undefined ? { untrustedMarkers: args.untrustedMarkers } : {}),
+          ...(args.redactSecrets !== undefined ? { redactSecrets: args.redactSecrets } : {}),
         })
         break
       case 'troy_click':

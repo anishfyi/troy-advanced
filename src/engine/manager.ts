@@ -45,6 +45,9 @@ import type {
   PolicyProfileStats,
   Rect,
   ResolvedPolicyProfile,
+  SecretRedactionMetadata,
+  SecretRedactionOptions,
+  SecretRedactionStats,
   SettleOptions,
   SettleResult,
   SsrfProtectionOptions,
@@ -93,6 +96,11 @@ import {
   parseUntrustedMarkersBoolean,
   parseUntrustedMarkersStyle,
 } from '../agent/untrusted-markers.js'
+import {
+  SecretRedactorGuard,
+  parseSecretRedactionBoolean,
+  parseSecretRedactionMode,
+} from '../agent/secret-redactor.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
 import {
   estimateTokens,
@@ -190,6 +198,7 @@ export interface BrowserManagerOptions {
   loopGuard?: LoopGuardOptions
   ssrf?: SsrfProtectionOptions
   untrustedMarkers?: boolean | UntrustedMarkersOptions
+  redactSecrets?: boolean | SecretRedactionOptions
   policy?: PolicyProfileInput
   policyFile?: string
   autoLoadPolicyFile?: boolean
@@ -203,6 +212,7 @@ export class BrowserManager {
   readonly loopGuard: AgentLoopGuard
   readonly ssrf: SsrfGuard
   readonly untrustedMarkers: UntrustedContentGuard
+  readonly secretRedactor: SecretRedactorGuard
   readonly policy: PolicyProfileGuard
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
@@ -223,6 +233,7 @@ export class BrowserManager {
     loopGuard: AgentLoopGuard,
     ssrf: SsrfGuard,
     untrustedMarkers: UntrustedContentGuard,
+    secretRedactor: SecretRedactorGuard,
     policy: PolicyProfileGuard,
   ) {
     this.engine = engine
@@ -232,6 +243,7 @@ export class BrowserManager {
     this.loopGuard = loopGuard
     this.ssrf = ssrf
     this.untrustedMarkers = untrustedMarkers
+    this.secretRedactor = secretRedactor
     this.policy = policy
     for (const origin of policy.resolved.allowedOrigins) {
       if (!policy.isOriginDenied(origin)) {
@@ -385,7 +397,18 @@ export class BrowserManager {
           ? { enabled: true }
           : undefined
     const untrustedMarkersGuard = new UntrustedContentGuard(untrustedMarkersOpts)
-    return new BrowserManager(engine, profileDir, memory, audit, loopGuard, ssrfGuard, untrustedMarkersGuard, policyGuard)
+    const secretRedactorGuard = new SecretRedactorGuard(opts.redactSecrets)
+    return new BrowserManager(
+      engine,
+      profileDir,
+      memory,
+      audit,
+      loopGuard,
+      ssrfGuard,
+      untrustedMarkersGuard,
+      secretRedactorGuard,
+      policyGuard,
+    )
   }
 
   getPolicyStats(): PolicyProfileStats {
@@ -402,6 +425,29 @@ export class BrowserManager {
 
   getUntrustedMarkersStats(): UntrustedMarkersStats {
     return this.untrustedMarkers.getStats()
+  }
+
+  getSecretRedactionStats(): SecretRedactionStats {
+    return this.secretRedactor.getStats()
+  }
+
+  private resolveRedactSecretsOverride(
+    rawFlag: unknown,
+    rawMode?: unknown,
+  ): boolean | SecretRedactionOptions | undefined {
+    const mode = parseSecretRedactionMode(rawMode)
+    if (rawFlag && typeof rawFlag === 'object' && !Array.isArray(rawFlag)) {
+      const obj = rawFlag as SecretRedactionOptions
+      return mode ? { ...obj, mode } : obj
+    }
+    const parsedBool = parseSecretRedactionBoolean(rawFlag)
+    if (parsedBool === undefined) {
+      return mode ? { enabled: this.secretRedactor.enabled, mode } : undefined
+    }
+    if (mode) {
+      return { enabled: parsedBool, mode }
+    }
+    return parsedBool
   }
 
   private resolveUntrustedOverride(
@@ -1398,6 +1444,7 @@ export class BrowserManager {
       settle?: boolean | SettleOptions
       sessionId?: string
       untrustedMarkers?: boolean | UntrustedMarkersOptions
+      redactSecrets?: boolean | SecretRedactionOptions
     } = {},
   ): Promise<{
     ok: boolean
@@ -1418,6 +1465,7 @@ export class BrowserManager {
     estimatedTokens?: number
     tokenBudget?: TokenBudgetReport
     untrustedMarkers?: UntrustedWrapMetadata
+    secretRedaction?: SecretRedactionMetadata
     status?: 'blocked'
     code?: string
     error?: string
@@ -1440,6 +1488,7 @@ export class BrowserManager {
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
     const maxTokens = parseMaxTokens(opts.maxTokens)
+    const redactSecrets = this.secretRedactor.shouldRedact(opts.redactSecrets)
     const wrapUntrusted = this.untrustedMarkers.shouldWrap(opts.untrustedMarkers)
     const innerMaxTokens =
       maxTokens && wrapUntrusted && maxTokens > 64
@@ -1466,6 +1515,16 @@ export class BrowserManager {
         ascii = trimmed.text
         tokenBudget = trimmed.report
       }
+      let secretRedactionMeta: SecretRedactionMetadata | undefined
+      if (redactSecrets) {
+        const redacted = this.secretRedactor.redact(ascii, {
+          source: snap.url,
+          kind: 'page_ascii_delta',
+          override: opts.redactSecrets,
+        })
+        ascii = redacted.text
+        secretRedactionMeta = redacted.meta
+      }
       let untrustedMeta: UntrustedWrapMetadata | undefined
       if (wrapUntrusted) {
         const wrapped = this.untrustedMarkers.wrap(ascii, {
@@ -1485,6 +1544,7 @@ export class BrowserManager {
         delta,
         estimatedTokens,
         ...(tokenBudget ? { tokenBudget } : {}),
+        ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
         ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
         ...(settleRes ? { settle: settleRes } : {}),
       }
@@ -1496,6 +1556,7 @@ export class BrowserManager {
       settle: _settle,
       sessionId: _sessionId,
       untrustedMarkers: _untrustedMarkers,
+      redactSecrets: _redactSecrets,
       ...renderOpts
     } = opts
     const rendered = renderPageAsciiWithMetrics(snap, {
@@ -1507,6 +1568,16 @@ export class BrowserManager {
       activeTabId: (opts.sessionId ? this.sessions.getActiveTabId(opts.sessionId) : this.activeTabId) ?? snap.tabId,
     })
     let finalAscii = rendered.ascii
+    let secretRedactionMeta: SecretRedactionMetadata | undefined
+    if (redactSecrets) {
+      const redacted = this.secretRedactor.redact(finalAscii, {
+        source: snap.url,
+        kind: 'page_ascii',
+        override: opts.redactSecrets,
+      })
+      finalAscii = redacted.text
+      secretRedactionMeta = redacted.meta
+    }
     let untrustedMeta: UntrustedWrapMetadata | undefined
     if (wrapUntrusted) {
       const wrapped = this.untrustedMarkers.wrap(finalAscii, {
@@ -1517,11 +1588,12 @@ export class BrowserManager {
       finalAscii = wrapped.text
       untrustedMeta = wrapped.meta
     }
-    const estimatedTokens = untrustedMeta
-      ? estimateTokens(finalAscii).tokens
-      : rendered.tokenBudget
-        ? rendered.tokenBudget.finalTokens
-        : estimateTokens(finalAscii).tokens
+    const estimatedTokens =
+      untrustedMeta || secretRedactionMeta
+        ? estimateTokens(finalAscii).tokens
+        : rendered.tokenBudget
+          ? rendered.tokenBudget.finalTokens
+          : estimateTokens(finalAscii).tokens
     return {
       ok: true,
       mode: 'full',
@@ -1535,6 +1607,7 @@ export class BrowserManager {
       },
       estimatedTokens,
       ...(rendered.tokenBudget ? { tokenBudget: rendered.tokenBudget } : {}),
+      ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
       ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
       ...(rendered.focusedLineIndex !== undefined ? { focusedLineIndex: rendered.focusedLineIndex } : {}),
       ...(settleRes ? { settle: settleRes } : {}),
@@ -1551,6 +1624,7 @@ export class BrowserManager {
       settle?: boolean | SettleOptions
       sessionId?: string
       untrustedMarkers?: boolean | UntrustedMarkersOptions
+      redactSecrets?: boolean | SecretRedactionOptions
     } = {},
   ): Promise<{
     ok: boolean
@@ -1560,6 +1634,7 @@ export class BrowserManager {
     crop?: Rect
     cropRef?: string
     untrustedMarkers?: UntrustedWrapMetadata
+    secretRedaction?: SecretRedactionMetadata
     status?: 'blocked'
     code?: string
     error?: string
@@ -1586,6 +1661,7 @@ export class BrowserManager {
       settle: _settle,
       sessionId: _sessionId,
       untrustedMarkers: _untrustedMarkers,
+      redactSecrets: _redactSecrets,
       ...renderOpts
     } = opts
     let markdown = renderPageMarkdown(snap, {
@@ -1593,6 +1669,16 @@ export class BrowserManager {
       crop: cropRes.crop,
       cropLabel: cropRes.cropRef ?? opts.cropLabel,
     })
+    let secretRedactionMeta: SecretRedactionMetadata | undefined
+    if (this.secretRedactor.shouldRedact(opts.redactSecrets)) {
+      const redacted = this.secretRedactor.redact(markdown, {
+        source: snap.url,
+        kind: 'page_markdown',
+        override: opts.redactSecrets,
+      })
+      markdown = redacted.text
+      secretRedactionMeta = redacted.meta
+    }
     let untrustedMeta: UntrustedWrapMetadata | undefined
     if (this.untrustedMarkers.shouldWrap(opts.untrustedMarkers)) {
       const wrapped = this.untrustedMarkers.wrap(markdown, {
@@ -1607,6 +1693,7 @@ export class BrowserManager {
       ok: true,
       markdown,
       snapshot: snap,
+      ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
       ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
       ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
@@ -1982,6 +2069,11 @@ export class BrowserManager {
       args.untrustedStyle ?? args.untrusted_style,
     )
     const wrapUntrusted = this.untrustedMarkers.shouldWrap(untrustedOverride)
+    const redactOverride = this.resolveRedactSecretsOverride(
+      args.redactSecrets ?? args.redact_secrets,
+      args.redactMode ?? args.redact_mode,
+    )
+    const shouldRedactSecrets = this.secretRedactor.shouldRedact(redactOverride)
 
     switch (name) {
       case 'page_read':
@@ -2023,6 +2115,16 @@ export class BrowserManager {
             ascii = trimmed.text
             tokenBudget = trimmed.report
           }
+          let secretRedactionMeta: SecretRedactionMetadata | undefined
+          if (shouldRedactSecrets) {
+            const redacted = this.secretRedactor.redact(ascii, {
+              source: snap.url,
+              kind: 'page_ascii_delta',
+              override: redactOverride,
+            })
+            ascii = redacted.text
+            secretRedactionMeta = redacted.meta
+          }
           let untrustedMeta: UntrustedWrapMetadata | undefined
           if (wrapUntrusted) {
             const wrapped = this.untrustedMarkers.wrap(ascii, {
@@ -2033,11 +2135,12 @@ export class BrowserManager {
             ascii = wrapped.text
             untrustedMeta = wrapped.meta
           }
-          const estimatedTokens = untrustedMeta
-            ? estimateTokens(ascii).tokens
-            : tokenBudget
-              ? tokenBudget.finalTokens
-              : estimateTokens(ascii).tokens
+          const estimatedTokens =
+            untrustedMeta || secretRedactionMeta
+              ? estimateTokens(ascii).tokens
+              : tokenBudget
+                ? tokenBudget.finalTokens
+                : estimateTokens(ascii).tokens
           return capPayload({
             ok: true,
             mode: 'delta',
@@ -2045,6 +2148,7 @@ export class BrowserManager {
             ascii,
             estimatedTokens,
             ...(tokenBudget ? { tokenBudget } : {}),
+            ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
             ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
             ...(settleRes ? { settle: settleRes } : {}),
             ...(name === 'page_read_ascii' ? { content: ascii } : {}),
@@ -2093,6 +2197,41 @@ export class BrowserManager {
           }
         }
 
+        let rawPageText = snap.text
+        let compactRefs = renderCompactRefsAscii(snap)
+        let publicElements = snap.elements.map(({ selector: _s, ...pub }) => pub)
+        let secretRedactionMeta: SecretRedactionMetadata | undefined
+        if (shouldRedactSecrets) {
+          const redactedAscii = this.secretRedactor.redact(ascii, {
+            source: snap.url,
+            kind: 'page_ascii',
+            override: redactOverride,
+          })
+          ascii = redactedAscii.text
+          secretRedactionMeta = redactedAscii.meta
+          if (name !== 'page_read_ascii') {
+            rawPageText = this.secretRedactor.redact(rawPageText, {
+              source: snap.url,
+              kind: 'page_text',
+              override: redactOverride,
+            }).text
+          }
+          compactRefs = this.secretRedactor.redact(compactRefs, {
+            source: snap.url,
+            kind: 'page_compact_refs',
+            override: redactOverride,
+          }).text
+          publicElements = publicElements.map((el) => ({
+            ...el,
+            ...(typeof el.text === 'string' && el.text
+              ? { text: this.secretRedactor.redact(el.text, { source: snap.url, kind: 'element_text', override: redactOverride }).text }
+              : {}),
+            ...(typeof el.value === 'string' && el.value
+              ? { value: this.secretRedactor.redact(el.value, { source: snap.url, kind: 'element_value', override: redactOverride }).text }
+              : {}),
+          }))
+        }
+
         let contentText: string
         let untrustedMeta: UntrustedWrapMetadata | undefined
         if (wrapUntrusted) {
@@ -2106,7 +2245,7 @@ export class BrowserManager {
           if (name === 'page_read_ascii') {
             contentText = ascii
           } else {
-            const wrappedContent = this.untrustedMarkers.wrap(snap.text, {
+            const wrappedContent = this.untrustedMarkers.wrap(rawPageText, {
               source: snap.url,
               kind: 'page_text',
               override: untrustedOverride,
@@ -2121,13 +2260,14 @@ export class BrowserManager {
             }).text
           }
         } else {
-          contentText = name === 'page_read_ascii' ? ascii : snap.text
+          contentText = name === 'page_read_ascii' ? ascii : rawPageText
         }
-        const estimatedTokens = untrustedMeta
-          ? estimateTokens(ascii).tokens
-          : tokenBudget
-            ? tokenBudget.finalTokens
-            : estimateTokens(ascii).tokens
+        const estimatedTokens =
+          untrustedMeta || secretRedactionMeta
+            ? estimateTokens(ascii).tokens
+            : tokenBudget
+              ? tokenBudget.finalTokens
+              : estimateTokens(ascii).tokens
 
         const media = extractMediaSummary(snap)
         const mediaSummaryAscii = media.length > 0 ? renderMediaSummaryAscii(snap) : undefined
@@ -2140,12 +2280,13 @@ export class BrowserManager {
           epoch: snap.epoch,
           engine: session.driver.engine,
           elementCount: snap.elements.length,
-          elements: snap.elements.map(({ selector: _s, ...pub }) => pub),
+          elements: publicElements,
           ascii,
           estimatedTokens,
           ...(tokenBudget ? { tokenBudget } : {}),
+          ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
           ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
-          compactRefs: renderCompactRefsAscii(snap),
+          compactRefs,
           ...(media.length > 0 ? { media, mediaSummaryAscii } : {}),
           ...(pixelAscii ? { pixelAscii } : {}),
           ...(settleRes ? { settle: settleRes } : {}),
@@ -2182,6 +2323,16 @@ export class BrowserManager {
           crop: cropRes.crop,
           cropLabel: cropRes.cropRef,
         })
+        let secretRedactionMeta: SecretRedactionMetadata | undefined
+        if (shouldRedactSecrets) {
+          const redacted = this.secretRedactor.redact(markdown, {
+            source: snap.url,
+            kind: 'page_markdown',
+            override: redactOverride,
+          })
+          markdown = redacted.text
+          secretRedactionMeta = redacted.meta
+        }
         let untrustedMeta: UntrustedWrapMetadata | undefined
         if (wrapUntrusted) {
           const wrapped = this.untrustedMarkers.wrap(markdown, {
@@ -2202,6 +2353,7 @@ export class BrowserManager {
           elementCount: snap.elements.length,
           markdown,
           content: markdown,
+          ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
           ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
           ...(settleRes ? { settle: settleRes } : {}),
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
@@ -2261,6 +2413,38 @@ export class BrowserManager {
           if ('error' in resolved) return { ok: false, error: resolved.error }
           let textOut = resolved.item.text
           let valueOut = resolved.item.value
+          let secretRedactionMeta: SecretRedactionMetadata | undefined
+          if (shouldRedactSecrets) {
+            const sourceUrl = session.driver.getUrl()
+            const redactedText = this.secretRedactor.redact(textOut ?? '', {
+              source: sourceUrl,
+              kind: 'element_text',
+              override: redactOverride,
+            })
+            textOut = redactedText.text
+            secretRedactionMeta = redactedText.meta
+            if (typeof valueOut === 'string' && valueOut.length > 0) {
+              const redactedVal = this.secretRedactor.redact(valueOut, {
+                source: sourceUrl,
+                kind: 'element_value',
+                override: redactOverride,
+              })
+              valueOut = redactedVal.text
+              if (redactedVal.meta.totalRedactions > 0) {
+                const mergedCounts: Record<string, number> = { ...secretRedactionMeta.countsByCategory }
+                for (const [k, v] of Object.entries(redactedVal.meta.countsByCategory)) {
+                  mergedCounts[k] = (mergedCounts[k] ?? 0) + v
+                }
+                secretRedactionMeta = {
+                  ...secretRedactionMeta,
+                  redacted: true,
+                  totalRedactions: secretRedactionMeta.totalRedactions + redactedVal.meta.totalRedactions,
+                  countsByCategory: mergedCounts,
+                  categories: Array.from(new Set([...secretRedactionMeta.categories, ...redactedVal.meta.categories])),
+                }
+              }
+            }
+          }
           let untrustedMeta: UntrustedWrapMetadata | undefined
           if (wrapUntrusted) {
             const sourceUrl = session.driver.getUrl()
@@ -2284,6 +2468,7 @@ export class BrowserManager {
             ref: args.ref,
             text: textOut,
             value: valueOut,
+            ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
             ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
             ...(resolved.recovered
               ? {
@@ -2296,9 +2481,19 @@ export class BrowserManager {
         }
         const snap = await session.driver.snapshot()
         let contentOut = snap.text
+        let secretRedactionMeta: SecretRedactionMetadata | undefined
+        if (shouldRedactSecrets) {
+          const redacted = this.secretRedactor.redact(contentOut, {
+            source: snap.url,
+            kind: 'page_text',
+            override: redactOverride,
+          })
+          contentOut = redacted.text
+          secretRedactionMeta = redacted.meta
+        }
         let untrustedMeta: UntrustedWrapMetadata | undefined
         if (wrapUntrusted) {
-          const wrapped = this.untrustedMarkers.wrap(snap.text, {
+          const wrapped = this.untrustedMarkers.wrap(contentOut, {
             source: snap.url,
             kind: 'page_text',
             override: untrustedOverride,
@@ -2311,6 +2506,7 @@ export class BrowserManager {
           url: snap.url,
           title: snap.title,
           content: contentOut,
+          ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
           ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
         })
       }
@@ -2351,6 +2547,16 @@ export class BrowserManager {
               width: typeof args.width === 'number' ? args.width : undefined,
             })
           : undefined
+        let secretRedactionMeta: SecretRedactionMetadata | undefined
+        if (ascii && shouldRedactSecrets) {
+          const redacted = this.secretRedactor.redact(ascii, {
+            source: snap.url,
+            kind: 'page_extract',
+            override: redactOverride,
+          })
+          ascii = redacted.text
+          secretRedactionMeta = redacted.meta
+        }
         let untrustedMeta: UntrustedWrapMetadata | undefined
         if (ascii && wrapUntrusted) {
           const wrapped = this.untrustedMarkers.wrap(ascii, {
@@ -2365,6 +2571,7 @@ export class BrowserManager {
         return capPayload({
           ...extracted,
           ...(ascii ? { ascii } : {}),
+          ...(secretRedactionMeta ? { secretRedaction: secretRedactionMeta } : {}),
           ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
           ...(settleRes ? { settle: settleRes } : {}),
         })

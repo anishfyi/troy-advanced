@@ -75,6 +75,7 @@ export async function createAgentSocket(
             policy: manager.getPolicyStats(),
             ssrf: manager.getSsrfStats(),
             untrustedMarkers: manager.getUntrustedMarkersStats(),
+            secretRedaction: manager.getSecretRedactionStats(),
             stream: streamHub.getStats(),
             ws: wsHub?.getStats() ?? {
               clients: 0,
@@ -192,6 +193,12 @@ export async function createAgentSocket(
             : body.untrusted_markers !== undefined
               ? Boolean(body.untrusted_markers)
               : undefined
+        const redactOpt =
+          body.redactSecrets !== undefined
+            ? (body.redactSecrets as boolean | Record<string, unknown>)
+            : body.redact_secrets !== undefined
+              ? Boolean(body.redact_secrets)
+              : undefined
         const res = await manager.renderAscii(tabId, {
           width: typeof body.width === 'number' ? body.width : undefined,
           height: typeof body.height === 'number' ? body.height : undefined,
@@ -208,6 +215,7 @@ export async function createAgentSocket(
           since: Boolean(body.since),
           settle: body.settle as boolean | Record<string, unknown> | undefined,
           ...(untrustedOpt !== undefined ? { untrustedMarkers: untrustedOpt } : {}),
+          ...(redactOpt !== undefined ? { redactSecrets: redactOpt } : {}),
           sessionId,
         })
         return {
@@ -223,6 +231,7 @@ export async function createAgentSocket(
                 ...(sessionId ? { sessionId } : {}),
                 ...(res.estimatedTokens !== undefined ? { estimatedTokens: res.estimatedTokens } : {}),
                 ...(res.tokenBudget ? { tokenBudget: res.tokenBudget } : {}),
+                ...(res.secretRedaction ? { secretRedaction: res.secretRedaction } : {}),
                 ...(res.untrustedMarkers ? { untrustedMarkers: res.untrustedMarkers } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
@@ -245,6 +254,12 @@ export async function createAgentSocket(
             : body.untrusted_markers !== undefined
               ? Boolean(body.untrusted_markers)
               : undefined
+        const redactOpt =
+          body.redactSecrets !== undefined
+            ? (body.redactSecrets as boolean | Record<string, unknown>)
+            : body.redact_secrets !== undefined
+              ? Boolean(body.redact_secrets)
+              : undefined
         const res = await manager.renderMarkdown(tabId, {
           showRefs: body.showRefs !== false,
           includeUrls: body.includeUrls !== false,
@@ -264,6 +279,7 @@ export async function createAgentSocket(
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           settle: body.settle as boolean | Record<string, unknown> | undefined,
           ...(untrustedOpt !== undefined ? { untrustedMarkers: untrustedOpt } : {}),
+          ...(redactOpt !== undefined ? { redactSecrets: redactOpt } : {}),
           sessionId,
         })
         return {
@@ -276,6 +292,7 @@ export async function createAgentSocket(
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
                 ...(sessionId ? { sessionId } : {}),
+                ...(res.secretRedaction ? { secretRedaction: res.secretRedaction } : {}),
                 ...(res.untrustedMarkers ? { untrustedMarkers: res.untrustedMarkers } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
@@ -306,6 +323,8 @@ export async function createAgentSocket(
             settle: body.settle,
             ...(body.untrustedMarkers !== undefined ? { untrustedMarkers: body.untrustedMarkers } : {}),
             ...(body.untrusted_markers !== undefined ? { untrustedMarkers: body.untrusted_markers } : {}),
+            ...(body.redactSecrets !== undefined ? { redactSecrets: body.redactSecrets } : {}),
+            ...(body.redact_secrets !== undefined ? { redactSecrets: body.redact_secrets } : {}),
           },
           { sessionId },
         )

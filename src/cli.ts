@@ -14,6 +14,7 @@ import type {
   EngineKind,
   OriginStorageSnapshot,
   PolicyProfileName,
+  SecretRedactionOptions,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
   TrackerBlockMode,
@@ -32,6 +33,7 @@ import {
 } from './agent/policy-profile.js'
 import { parseSsrfAllowHosts } from './agent/ssrf.js'
 import { parseUntrustedMarkersStyle } from './agent/untrusted-markers.js'
+import { parseSecretRedactionMode } from './agent/secret-redactor.js'
 import { BrowserManager } from './engine/manager.js'
 import {
   computeAuditStats,
@@ -89,7 +91,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -163,7 +165,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -185,6 +187,7 @@ const VALUE_FLAGS = new Set([
   '--density',
   '--max-tokens',
   '--untrusted-style',
+  '--redact-mode',
   '--mode',
   '--crop',
   '--ref',
@@ -383,6 +386,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     ? {
         enabled: true,
         ...(untrustedStyleFlag ? { style: untrustedStyleFlag } : {}),
+      }
+    : undefined
+  const envRedactSecrets =
+    process.env.TROY_REDACT_SECRETS === '1' ||
+    process.env.TROY_REDACT_SECRETS?.toLowerCase() === 'true'
+  const redactSecretsFlag = Boolean(flags['redact-secrets']) || envRedactSecrets
+  const redactModeFlag = parseSecretRedactionMode(flags['redact-mode'] ?? process.env.TROY_REDACT_MODE)
+  const redactSecretsOpts: SecretRedactionOptions | undefined = redactSecretsFlag
+    ? {
+        enabled: true,
+        ...(redactModeFlag ? { mode: redactModeFlag } : {}),
       }
     : undefined
   const rawPolicyFlag =
@@ -663,6 +677,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         audit: auditOpts,
         ssrf: ssrfOpts,
         untrustedMarkers: untrustedMarkersOpts,
+        redactSecrets: redactSecretsOpts,
         policy: policyProfileFlag,
         policyFile: policyFileFlag,
         emulation: cliEmulation,
@@ -803,6 +818,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
     }
@@ -848,6 +864,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
     })
@@ -896,6 +913,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
     })
@@ -921,6 +939,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       audit: auditOpts,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
     })
@@ -1399,6 +1418,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       emulation: cliEmulation,
       ssrf: ssrfOpts,
       untrustedMarkers: untrustedMarkersOpts,
+      redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
     })
@@ -1653,6 +1673,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         since: Boolean(flags.since),
         settle: Boolean(flags.settle),
         ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
+        ...(redactSecretsOpts ? { redactSecrets: redactSecretsOpts } : {}),
         asciiOnly: true,
       })
       break
@@ -1670,6 +1691,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         settle: Boolean(flags.settle),
         ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
+        ...(redactSecretsOpts ? { redactSecrets: redactSecretsOpts } : {}),
       })
       break
     case 'visual':
@@ -1703,6 +1725,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           showMediaSummary: Boolean(flags.media),
           settle: Boolean(flags.settle),
           ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
+          ...(redactSecretsOpts ? { redactSecrets: redactSecretsOpts } : {}),
         },
       })
       break
@@ -1737,6 +1760,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         args: {
           ...(args[0] ? { ref: args[0] } : {}),
           ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
+          ...(redactSecretsOpts ? { redactSecrets: redactSecretsOpts } : {}),
         },
       })
       break
@@ -1753,6 +1777,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         width: flags.width ? Number(flags.width) : undefined,
         settle: Boolean(flags.settle),
         ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
+        ...(redactSecretsOpts ? { redactSecrets: redactSecretsOpts } : {}),
       })
       break
     case 'click':

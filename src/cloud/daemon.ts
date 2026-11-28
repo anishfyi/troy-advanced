@@ -11,6 +11,7 @@ import type {
   EmulationOptions,
   EngineKind,
   PolicyProfileInput,
+  SecretRedactionOptions,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
   UntrustedMarkersOptions,
@@ -44,6 +45,7 @@ export interface DaemonOptions {
   audit?: AuditLogOptions
   ssrf?: SsrfProtectionOptions
   untrustedMarkers?: boolean | UntrustedMarkersOptions
+  redactSecrets?: boolean | SecretRedactionOptions
   policy?: PolicyProfileInput
   policyFile?: string
 }
@@ -63,6 +65,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     audit: opts.audit,
     ssrf: opts.ssrf,
     untrustedMarkers: opts.untrustedMarkers,
+    redactSecrets: opts.redactSecrets,
     policy: opts.policy,
     policyFile: opts.policyFile,
   })
@@ -134,6 +137,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       ...(manager.engine.remoteCdpUrl ? { remoteCdpUrl: manager.engine.remoteCdpUrl } : {}),
       blockPrivateNet: manager.ssrf.enabled,
       untrustedMarkers: manager.untrustedMarkers.enabled,
+      redactSecrets: manager.secretRedactor.enabled,
       policyProfile: manager.policy.profile,
       ...(manager.policy.resolved.sourceFile ? { policyFile: manager.policy.resolved.sourceFile } : {}),
       endpointFile,
@@ -212,6 +216,12 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
     args.push('--untrusted-markers')
     if (typeof opts.untrustedMarkers === 'object' && opts.untrustedMarkers.style) {
       args.push('--untrusted-style', opts.untrustedMarkers.style)
+    }
+  }
+  if (opts.redactSecrets === true || (typeof opts.redactSecrets === 'object' && opts.redactSecrets?.enabled)) {
+    args.push('--redact-secrets')
+    if (typeof opts.redactSecrets === 'object' && opts.redactSecrets.mode) {
+      args.push('--redact-mode', opts.redactSecrets.mode)
     }
   }
   if (typeof opts.policy === 'string') {
