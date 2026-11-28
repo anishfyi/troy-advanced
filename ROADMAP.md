@@ -89,7 +89,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M74: Prompt-injection sanitizer flag (`--untrusted-markers`) wrapping web page text in explicit untrusted delimiters for AI safety
 - [x] M75: Configurable policy profiles (`strict`, `standard`, `permissive`) via `policy.json`
 - [x] M76: Sensitive output redaction filter (automatically masks JWTs, AWS keys `AKIA...`, credit card numbers in `page_text` / `ascii` when `--redact-secrets` is on)
-- [ ] M77: Rate-limiting & body-size fuzz tests on Agent Socket HTTP server
+- [x] M77: Rate-limiting & body-size fuzz tests on Agent Socket HTTP server
 - [ ] M78: Read-only observer mode (`--readonly`) where all mutating tools (`click`, `fill`, `eval`, `navigate`) are deterministically refused
 - [ ] M79: Origin allowlist / denylist CLI flags (`--allow-origin`, `--deny-origin`) persisted in daemon config
 - [ ] M80: Comprehensive security regression suite testing XSS/scheme disguises, IMDS blocking, sensitive field blocking, and submit guards

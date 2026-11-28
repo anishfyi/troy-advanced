@@ -19,9 +19,28 @@ import { parseSseStreamOptions, SseStreamHub } from './sse-stream.js'
 import { WsBridgeHub } from './ws-bridge.js'
 import { validateAgentRequestHeaders } from './host-guard.js'
 import { validateAgentTokenRequest } from './auth.js'
+import {
+  AgentSocketRateLimiter,
+  buildRateLimitHeaders,
+  type RateLimitConfig,
+} from './rate-limit.js'
 
-const MAX_BODY = 128 * 1024
-const MAX_IMPORT_BODY = 2 * 1024 * 1024
+export const MAX_BODY = 128 * 1024
+export const MAX_IMPORT_BODY = 2 * 1024 * 1024
+export const MAX_URL_LENGTH = 8192
+
+const FORBIDDEN_JSON_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+export interface AgentSocketOptions {
+  host?: string
+  port?: number
+  token?: string
+  strictPort?: boolean
+  maxBodyBytes?: number
+  maxImportBodyBytes?: number
+  maxUrlLength?: number
+  rateLimit?: RateLimitConfig
+}
 
 export interface AgentSocketServer {
   port: number
@@ -30,13 +49,79 @@ export interface AgentSocketServer {
   close: () => Promise<void>
 }
 
+function parseContentLengthHeader(
+  req: Pick<http.IncomingMessage, 'headers' | 'rawHeaders'>,
+): { ok: true; length: number | null } | { ok: false; error: string } {
+  if (Array.isArray(req.rawHeaders)) {
+    let count = 0
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      if (req.rawHeaders[i]?.toLowerCase() === 'content-length') {
+        count++
+      }
+    }
+    if (count > 1) {
+      return { ok: false, error: 'duplicate content-length header' }
+    }
+  }
+
+  const raw = req.headers['content-length']
+  if (raw === undefined) return { ok: true, length: null }
+  if (Array.isArray(raw)) {
+    return { ok: false, error: 'duplicate content-length header' }
+  }
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) {
+    return { ok: false, error: 'invalid content-length header' }
+  }
+  const parsed = Number(trimmed)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    return { ok: false, error: 'invalid content-length header' }
+  }
+  return { ok: true, length: parsed }
+}
+
+function parseSafeJsonObject(
+  rawText: string,
+):
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; code: 'invalid_json' | 'invalid_json_object'; error: string } {
+  if (!rawText.trim()) {
+    return { ok: true, body: {} }
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawText, (key, value) => (FORBIDDEN_JSON_KEYS.has(key) ? undefined : value))
+  } catch {
+    return { ok: false, code: 'invalid_json', error: 'body must be JSON' }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, code: 'invalid_json_object', error: 'body must be a JSON object' }
+  }
+  return { ok: true, body: parsed as Record<string, unknown> }
+}
+
 export async function createAgentSocket(
   manager: BrowserManager,
-  opts: { host?: string; port?: number; token?: string; strictPort?: boolean } = {},
+  opts: AgentSocketOptions = {},
 ): Promise<AgentSocketServer> {
   const host = opts.host ?? '127.0.0.1'
   const token = opts.token ?? randomBytes(24).toString('hex')
   const strictPort = Boolean(opts.strictPort)
+  const maxBodyBytes =
+    typeof opts.maxBodyBytes === 'number' && Number.isFinite(opts.maxBodyBytes) && opts.maxBodyBytes > 0
+      ? Math.floor(opts.maxBodyBytes)
+      : MAX_BODY
+  const maxImportBodyBytes =
+    typeof opts.maxImportBodyBytes === 'number' &&
+    Number.isFinite(opts.maxImportBodyBytes) &&
+    opts.maxImportBodyBytes > 0
+      ? Math.floor(opts.maxImportBodyBytes)
+      : MAX_IMPORT_BODY
+  const maxUrlLength =
+    typeof opts.maxUrlLength === 'number' && Number.isFinite(opts.maxUrlLength) && opts.maxUrlLength > 0
+      ? Math.floor(opts.maxUrlLength)
+      : MAX_URL_LENGTH
+  const rateLimiter = new AgentSocketRateLimiter(opts.rateLimit)
   const streamHub = new SseStreamHub(manager)
   let wsHub: WsBridgeHub | null = null
   let boundPort = opts.port ?? 0
@@ -76,6 +161,7 @@ export async function createAgentSocket(
             ssrf: manager.getSsrfStats(),
             untrustedMarkers: manager.getUntrustedMarkersStats(),
             secretRedaction: manager.getSecretRedactionStats(),
+            rateLimit: rateLimiter.getStats(),
             stream: streamHub.getStats(),
             ws: wsHub?.getStats() ?? {
               clients: 0,
@@ -705,15 +791,32 @@ export async function createAgentSocket(
   }
 
   const server = http.createServer((req, res) => {
-    const respond = (status: number, payload: Record<string, unknown>) => {
+    let responded = false
+    const respond = (
+      status: number,
+      payload: Record<string, unknown>,
+      extraHeaders: Record<string, string> = {},
+    ) => {
+      if (responded || res.writableEnded || res.headersSent) return
+      responded = true
       const json = JSON.stringify(payload)
       res.writeHead(status, {
         'content-type': 'application/json; charset=utf-8',
         'content-length': Buffer.byteLength(json),
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
+        ...extraHeaders,
       })
       res.end(json)
+    }
+
+    const rawUrl = req.url ?? '/'
+    if (rawUrl.length > maxUrlLength) {
+      return respond(
+        414,
+        { ok: false, code: 'uri_too_long', error: `request URI exceeds ${maxUrlLength} bytes` },
+        { connection: 'close' },
+      )
     }
 
     const headerCheck = validateAgentRequestHeaders(req, {
@@ -727,9 +830,30 @@ export async function createAgentSocket(
         error: headerCheck.error ?? 'wrong host',
       })
     }
+
+    const remoteKey = req.socket?.remoteAddress || 'loopback'
+    const authGate = rateLimiter.checkAuthAllowed(remoteKey)
+    if (!authGate.allowed) {
+      return respond(
+        429,
+        {
+          ok: false,
+          code: authGate.reason ?? 'auth_rate_limit_exceeded',
+          error: 'too many failed authentication attempts',
+          retryAfterSeconds: authGate.retryAfterSeconds,
+        },
+        buildRateLimitHeaders(authGate),
+      )
+    }
+
     const authCheck = validateAgentTokenRequest(req, token)
     if (!authCheck.ok) {
-      return respond(401, { ok: false, error: authCheck.error ?? 'missing or invalid x-troy-agent token' })
+      const failureDecision = rateLimiter.recordAuthFailure(remoteKey)
+      return respond(
+        401,
+        { ok: false, error: authCheck.error ?? 'missing or invalid x-troy-agent token' },
+        failureDecision.allowed ? {} : buildRateLimitHeaders(failureDecision),
+      )
     }
 
     const parsedHeaderSession = parseSessionId(req.headers[SESSION_HEADER])
@@ -738,65 +862,133 @@ export async function createAgentSocket(
     }
     const headerSessionId = parsedHeaderSession.sessionId
 
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    const rateKey = headerSessionId ? `session:${headerSessionId}` : `ip:${remoteKey}`
+    const rateDecision = rateLimiter.consume(rateKey)
+    const rateHeaders = rateLimiter.config.enabled ? buildRateLimitHeaders(rateDecision) : {}
+    if (!rateDecision.allowed) {
+      return respond(
+        429,
+        {
+          ok: false,
+          code: rateDecision.reason ?? 'rate_limit_exceeded',
+          error: 'rate limit exceeded',
+          retryAfterSeconds: rateDecision.retryAfterSeconds,
+        },
+        rateHeaders,
+      )
+    }
+
+    let url: URL
+    try {
+      url = new URL(rawUrl, 'http://127.0.0.1')
+    } catch {
+      return respond(400, { ok: false, code: 'invalid_url', error: 'malformed request URL' }, rateHeaders)
+    }
 
     if (req.method === 'GET' && url.pathname === '/health') {
       handleRoute('/health', {}, headerSessionId)
-        .then((r) => respond(r.status, r.payload))
-        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
+        .then((r) => respond(r.status, r.payload, rateHeaders))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
       return
     }
 
     if (req.method === 'GET' && url.pathname === '/policy') {
       handleRoute('/policy', {}, headerSessionId)
-        .then((r) => respond(r.status, r.payload))
-        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
+        .then((r) => respond(r.status, r.payload, rateHeaders))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
       return
     }
 
     if (req.method === 'GET' && url.pathname === '/sessions') {
       handleRoute('/sessions', {}, headerSessionId)
-        .then((r) => respond(r.status, r.payload))
-        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
+        .then((r) => respond(r.status, r.payload, rateHeaders))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
       return
     }
 
     if (req.method === 'GET' && url.pathname === '/stream') {
       const parsed = parseSseStreamOptions(url.searchParams, headerSessionId)
       if (!parsed.ok) {
-        return respond(400, { ok: false, error: parsed.error })
+        return respond(400, { ok: false, error: parsed.error }, rateHeaders)
       }
       streamHub.attach(req, res, parsed.options)
       return
     }
 
     if (req.method !== 'POST') {
-      return respond(405, { ok: false, error: 'POST only' })
+      return respond(405, { ok: false, error: 'POST only' }, rateHeaders)
     }
 
     const maxBody =
-      url.pathname === '/cookies/import' || url.pathname === '/storage/import' ? MAX_IMPORT_BODY : MAX_BODY
+      url.pathname === '/cookies/import' || url.pathname === '/storage/import' ? maxImportBodyBytes : maxBodyBytes
+
+    const contentLengthCheck = parseContentLengthHeader(req)
+    if (!contentLengthCheck.ok) {
+      return respond(
+        400,
+        { ok: false, code: 'invalid_content_length', error: contentLengthCheck.error },
+        { ...rateHeaders, connection: 'close' },
+      )
+    }
+    if (contentLengthCheck.length !== null && contentLengthCheck.length > maxBody) {
+      req.pause()
+      return respond(
+        413,
+        {
+          ok: false,
+          code: 'body_too_large',
+          error: 'body too large',
+          maxBytes: maxBody,
+          receivedBytes: contentLengthCheck.length,
+        },
+        { ...rateHeaders, connection: 'close' },
+      )
+    }
+
     const chunks: Buffer[] = []
     let size = 0
+    let bodySettled = false
     req.on('data', (chunk: Buffer) => {
+      if (bodySettled) return
       size += chunk.length
       if (size > maxBody) {
-        req.destroy()
-        respond(413, { ok: false, error: 'body too large' })
+        bodySettled = true
+        chunks.length = 0
+        req.pause()
+        respond(
+          413,
+          {
+            ok: false,
+            code: 'body_too_large',
+            error: 'body too large',
+            maxBytes: maxBody,
+            receivedBytes: size,
+          },
+          { ...rateHeaders, connection: 'close' },
+        )
         return
       }
       chunks.push(chunk)
     })
+    req.on('aborted', () => {
+      bodySettled = true
+      chunks.length = 0
+    })
+    req.on('error', () => {
+      bodySettled = true
+      chunks.length = 0
+    })
     req.on('end', () => {
-      let body: Record<string, unknown>
-      try {
-        body = chunks.length ? (JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>) : {}
-      } catch {
-        return respond(400, { ok: false, error: 'body must be JSON' })
+      if (bodySettled) return
+      bodySettled = true
+      const rawText = chunks.length ? Buffer.concat(chunks).toString('utf8') : ''
+      const parsed = parseSafeJsonObject(rawText)
+      if (!parsed.ok) {
+        return respond(400, { ok: false, code: parsed.code, error: parsed.error }, rateHeaders)
       }
-      handleRoute(url.pathname, body, headerSessionId)
-        .then((r) => respond(r.status, r.payload))
-        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }))
+      handleRoute(url.pathname, parsed.body, headerSessionId)
+        .then((r) => respond(r.status, r.payload, rateHeaders))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
     })
   })
 
