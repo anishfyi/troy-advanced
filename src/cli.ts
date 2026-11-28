@@ -106,7 +106,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--public-metrics] [--no-health-probe] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   daemon logs  [--tail N | -n N] [--follow | -f] [--all] [--rotate] [--clear] [--log-file <path>] [--log-max-files N] [--json]
@@ -127,6 +127,8 @@ Daemon & Modes:
 
 Client Commands (talk to running daemon, or use --oneshot):
   status                                  Daemon health + memory stats
+  health [--json]                         Run HTTP health-check probes (/healthz, /readyz, /health)
+  metrics [--prometheus|--json|--ascii]   Fetch Prometheus /metrics or ASCII metrics dashboard (tabs, requests, RSS, uptime, tool latency)
   tabs                                    List open tabs
   open <url|query>                        Open tab; prints id (or ASCII with --ascii)
   ascii [--since] [--width N] [--height N] [--density compact|normal|wide] [--layout flow|spatial|auto] [--max-tokens N] [--crop x,y,w,h] [--ref eN]
@@ -1040,6 +1042,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       logFile: logFileFlag,
       logMaxBytes: logMaxBytesFlag,
       logMaxFiles: logMaxFilesFlag,
+      healthProbeUnauthenticated: flags['no-health-probe'] ? false : undefined,
+      metricsUnauthenticated: Boolean(flags['public-metrics']),
     }
 
     if (sub === 'run') {
@@ -1946,6 +1950,50 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const memory = await callDaemon(daemonEndpoint, '/memory')
       res = { ok: true, endpoint: live.endpoint.file, pid: live.endpoint.pid, health, memory }
       break
+    }
+    case 'health': {
+      const base = `http://127.0.0.1:${daemonEndpoint.agentPort}`
+      const [livezRes, readyzRes] = await Promise.all([
+        fetch(`${base}/healthz`),
+        fetch(`${base}/readyz`),
+      ])
+      const livez = (await livezRes.json().catch(() => ({ ok: false }))) as Record<string, unknown>
+      const readyz = (await readyzRes.json().catch(() => ({ ok: false }))) as Record<string, unknown>
+      const health = await callDaemon(daemonEndpoint, '/health')
+      const ok = livezRes.ok && readyzRes.ok && Boolean(health.ok)
+      res = {
+        ok,
+        endpoint: live.endpoint.file,
+        pid: live.endpoint.pid,
+        livez: { httpStatus: livezRes.status, ...livez },
+        readyz: { httpStatus: readyzRes.status, ...readyz },
+        health,
+      }
+      if (!ok) {
+        console.log(JSON.stringify(res, null, 2))
+        process.exit(1)
+      }
+      break
+    }
+    case 'metrics': {
+      const wantProm = Boolean(flags.prometheus || flags.prom)
+      const metricsRes = await callDaemon(daemonEndpoint, '/metrics', {
+        ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
+      })
+      if (!metricsRes.ok) {
+        res = metricsRes
+        break
+      }
+      if (wantProm) {
+        process.stdout.write(String(metricsRes.prometheus ?? ''))
+        return
+      }
+      if (flags.json) {
+        console.log(JSON.stringify(metricsRes.snapshot ?? metricsRes, null, 2))
+        return
+      }
+      console.log(String(metricsRes.ascii ?? ''))
+      return
     }
     case 'sessions': {
       if (args[0] === 'close') {

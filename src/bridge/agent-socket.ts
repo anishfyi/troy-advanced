@@ -26,6 +26,15 @@ import {
   buildRateLimitHeaders,
   type RateLimitConfig,
 } from './rate-limit.js'
+import {
+  AgentMetricsCollector,
+  PROMETHEUS_CONTENT_TYPE,
+  evaluateLivenessProbe,
+  evaluateReadinessProbe,
+  formatMetricsAscii,
+  type RuntimeMetricsSource,
+  type ToolOutcome,
+} from './metrics.js'
 
 export const MAX_BODY = 128 * 1024
 export const MAX_IMPORT_BODY = 2 * 1024 * 1024
@@ -42,12 +51,19 @@ export interface AgentSocketOptions {
   maxImportBodyBytes?: number
   maxUrlLength?: number
   rateLimit?: RateLimitConfig
+  /** Allow unauthenticated loopback GET/HEAD on /healthz, /livez, /readyz (default: true). */
+  healthProbeUnauthenticated?: boolean
+  /** Allow unauthenticated loopback GET on /metrics for Prometheus scrapers (default: false). */
+  metricsUnauthenticated?: boolean
+  /** Optional custom metrics collector instance. */
+  metrics?: AgentMetricsCollector
 }
 
 export interface AgentSocketServer {
   port: number
   token: string
   wsUrl: string
+  metrics: AgentMetricsCollector
   close: () => Promise<void>
 }
 
@@ -124,9 +140,71 @@ export async function createAgentSocket(
       ? Math.floor(opts.maxUrlLength)
       : MAX_URL_LENGTH
   const rateLimiter = new AgentSocketRateLimiter(opts.rateLimit)
+  const metrics = opts.metrics ?? new AgentMetricsCollector()
+  const healthProbeUnauthenticated = opts.healthProbeUnauthenticated !== false
+  const metricsUnauthenticated = Boolean(opts.metricsUnauthenticated)
   const streamHub = new SseStreamHub(manager)
   let wsHub: WsBridgeHub | null = null
   let boundPort = opts.port ?? 0
+  let closing = false
+
+  function classifyToolOutcome(result: Record<string, unknown> | null | undefined): ToolOutcome {
+    if (result?.ok === true) return 'ok'
+    const status = result?.status
+    if (
+      status === 'blocked' ||
+      status === 'boundary' ||
+      status === 'refused' ||
+      status === 'needs_confirmation' ||
+      status === 'needs_origin_grant'
+    ) {
+      return 'refused'
+    }
+    return 'error'
+  }
+
+  function buildRuntimeMetricsSource(): RuntimeMetricsSource {
+    const tabs = manager.listTabs()
+    const sessions = manager.listSessions()
+    const crashRecovery = manager.getCrashRecoveryStats()
+    const audit = manager.getAuditStats()
+    const rateStats = rateLimiter.getStats()
+    const sseStats = streamHub.getStats()
+    const wsStats = wsHub?.getStats()
+    const memStats = manager.memory?.stats()
+    const ownedTabIds = new Set<number>()
+    for (const s of sessions) {
+      for (const id of s.ownedTabIds) ownedTabIds.add(id)
+    }
+
+    let ready = !closing
+    let readyReason: string | undefined
+    if (closing) {
+      ready = false
+      readyReason = 'server_closing'
+    } else if (crashRecovery.status === 'failed' || crashRecovery.status === 'closed' || crashRecovery.status === 'crashed') {
+      ready = false
+      readyReason = crashRecovery.lastError || `engine_${crashRecovery.status}`
+    }
+
+    return {
+      version: '0.1.0',
+      engine: manager.engine.kind,
+      tabsTotal: tabs.length,
+      tabsOwned: ownedTabIds.size,
+      sessionsActive: sessions.length,
+      sseClients: sseStats.clients,
+      wsClients: wsStats?.clients ?? 0,
+      wsRequestsTotal: wsStats?.requestsHandled ?? 0,
+      crashRecoveriesTotal: crashRecovery.restartCount,
+      auditEventsTotal: audit.totalEntries,
+      auditRefusalsTotal: audit.refusals,
+      rateLimitBlockedTotal: rateStats.totalBlocked + rateStats.authBlocked,
+      memoryEntriesTotal: memStats ? memStats.pages + memStats.elements : 0,
+      ready,
+      ...(readyReason ? { readyReason } : {}),
+    }
+  }
 
   async function handleRoute(
     pathname: string,
@@ -182,10 +260,24 @@ export async function createAgentSocket(
     switch (pathname) {
       case '/health': {
         const remoteCdp = manager.engine.getRemoteCdpInfo ? manager.engine.getRemoteCdpInfo() : null
+        const runtimeSource = buildRuntimeMetricsSource()
+        const snap = metrics.getSnapshot(runtimeSource)
         return {
           status: 200,
           payload: {
             ok: true,
+            status: runtimeSource.ready ? 'ok' : 'degraded',
+            ...(runtimeSource.readyReason ? { readyReason: runtimeSource.readyReason } : {}),
+            uptimeSeconds: snap.uptimeSeconds,
+            memory: snap.memory,
+            metrics: {
+              requestsTotal: snap.requests.total,
+              requestsInFlight: snap.requests.inFlight,
+              toolCallsTotal: snap.tools.total,
+              toolErrorsTotal: snap.tools.error,
+              toolRefusalsTotal: snap.tools.refused,
+              avgToolLatencyMs: snap.tools.avgLatencyMs,
+            },
             engine: manager.engine.kind,
             cdpPort: manager.engine.cdpPort,
             ...(remoteCdp ? { remoteCdp } : {}),
@@ -213,6 +305,23 @@ export async function createAgentSocket(
               framesSkippedDuplicate: 0,
               eventsSent: 0,
             },
+          },
+        }
+      }
+      case '/metrics': {
+        const runtimeSource = buildRuntimeMetricsSource()
+        const snapshot = metrics.getSnapshot(runtimeSource)
+        const prometheus = metrics.renderPrometheus(runtimeSource)
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            contentType: PROMETHEUS_CONTENT_TYPE,
+            snapshot,
+            prometheus,
+            ascii: formatMetricsAscii(snapshot, {
+              width: typeof body.width === 'number' ? body.width : undefined,
+            }),
           },
         }
       }
@@ -482,6 +591,7 @@ export async function createAgentSocket(
       }
       case '/extract': {
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const toolStartMs = performance.now()
         const result = await manager.runTool(
           tabId,
           'page_extract',
@@ -502,6 +612,11 @@ export async function createAgentSocket(
           },
           { sessionId },
         )
+        metrics.recordToolCall({
+          tool: 'page_extract',
+          outcome: classifyToolOutcome(result),
+          durationMs: performance.now() - toolStartMs,
+        })
         return {
           status: 200,
           payload: sessionId ? { ...result, sessionId } : result,
@@ -511,7 +626,13 @@ export async function createAgentSocket(
         const name = String(body.name ?? '')
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
         const args = (typeof body.args === 'object' && body.args !== null ? body.args : {}) as Record<string, unknown>
+        const toolStartMs = performance.now()
         const result = await manager.runTool(tabId, name, args, { sessionId })
+        metrics.recordToolCall({
+          tool: name || 'unknown',
+          outcome: classifyToolOutcome(result),
+          durationMs: performance.now() - toolStartMs,
+        })
         return { status: 200, payload: result }
       }
       case '/recall': {
@@ -879,6 +1000,29 @@ export async function createAgentSocket(
   }
 
   const server = http.createServer((req, res) => {
+    const reqStartMs = performance.now()
+    const method = (req.method ?? 'GET').toUpperCase()
+    let metricRoute = '/other'
+    let metricRecorded = false
+    metrics.onHttpRequestStart()
+
+    const recordReqFinished = (status: number) => {
+      if (metricRecorded) return
+      metricRecorded = true
+      metrics.recordHttpRequest({
+        method,
+        route: metricRoute,
+        status,
+        durationMs: performance.now() - reqStartMs,
+      })
+    }
+
+    res.once('close', () => {
+      if (!metricRecorded) {
+        recordReqFinished(res.statusCode || 499)
+      }
+    })
+
     let responded = false
     const respond = (
       status: number,
@@ -895,7 +1039,35 @@ export async function createAgentSocket(
         'x-content-type-options': 'nosniff',
         ...extraHeaders,
       })
-      res.end(json)
+      if (method === 'HEAD') {
+        res.end()
+      } else {
+        res.end(json)
+      }
+      recordReqFinished(status)
+    }
+
+    const respondText = (
+      status: number,
+      text: string,
+      contentType: string,
+      extraHeaders: Record<string, string> = {},
+    ) => {
+      if (responded || res.writableEnded || res.headersSent) return
+      responded = true
+      res.writeHead(status, {
+        'content-type': contentType,
+        'content-length': Buffer.byteLength(text, 'utf8'),
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        ...extraHeaders,
+      })
+      if (method === 'HEAD') {
+        res.end()
+      } else {
+        res.end(text)
+      }
+      recordReqFinished(status)
     }
 
     const rawUrl = req.url ?? '/'
@@ -919,29 +1091,70 @@ export async function createAgentSocket(
       })
     }
 
+    let url: URL
+    try {
+      url = new URL(rawUrl, 'http://127.0.0.1')
+    } catch {
+      return respond(400, { ok: false, code: 'invalid_url', error: 'malformed request URL' })
+    }
+    metricRoute = url.pathname
+
+    const isHealthProbePath =
+      (method === 'GET' || method === 'HEAD') &&
+      (url.pathname === '/healthz' || url.pathname === '/livez' || url.pathname === '/readyz')
+    const isGetMetricsPath = (method === 'GET' || method === 'HEAD') && url.pathname === '/metrics'
+
     const remoteKey = req.socket?.remoteAddress || 'loopback'
-    const authGate = rateLimiter.checkAuthAllowed(remoteKey)
-    if (!authGate.allowed) {
-      return respond(
-        429,
-        {
-          ok: false,
-          code: authGate.reason ?? 'auth_rate_limit_exceeded',
-          error: 'too many failed authentication attempts',
-          retryAfterSeconds: authGate.retryAfterSeconds,
-        },
-        buildRateLimitHeaders(authGate),
-      )
+
+    if (isHealthProbePath && healthProbeUnauthenticated) {
+      const rateDecision = rateLimiter.consume(`ip:${remoteKey}`)
+      const rateHeaders = rateLimiter.config.enabled ? buildRateLimitHeaders(rateDecision) : {}
+      if (!rateDecision.allowed) {
+        return respond(
+          429,
+          {
+            ok: false,
+            code: rateDecision.reason ?? 'rate_limit_exceeded',
+            error: 'rate limit exceeded',
+            retryAfterSeconds: rateDecision.retryAfterSeconds,
+          },
+          rateHeaders,
+        )
+      }
+      if (url.pathname === '/readyz') {
+        const probe = evaluateReadinessProbe(buildRuntimeMetricsSource(), metrics.uptimeSeconds())
+        return respond(probe.status, probe.payload as unknown as Record<string, unknown>, rateHeaders)
+      }
+      const probe = evaluateLivenessProbe(metrics.uptimeSeconds())
+      return respond(probe.status, probe.payload as unknown as Record<string, unknown>, rateHeaders)
     }
 
-    const authCheck = validateAgentTokenRequest(req, token)
-    if (!authCheck.ok) {
-      const failureDecision = rateLimiter.recordAuthFailure(remoteKey)
-      return respond(
-        401,
-        { ok: false, error: authCheck.error ?? 'missing or invalid x-troy-agent token' },
-        failureDecision.allowed ? {} : buildRateLimitHeaders(failureDecision),
-      )
+    if (!(isGetMetricsPath && metricsUnauthenticated)) {
+      const authGate = rateLimiter.checkAuthAllowed(remoteKey)
+      if (!authGate.allowed) {
+        return respond(
+          429,
+          {
+            ok: false,
+            code: authGate.reason ?? 'auth_rate_limit_exceeded',
+            error: 'too many failed authentication attempts',
+            retryAfterSeconds: authGate.retryAfterSeconds,
+          },
+          buildRateLimitHeaders(authGate),
+        )
+      }
+
+      const authCheck = validateAgentTokenRequest(req, token, {
+        allowBearer: isGetMetricsPath,
+      })
+      if (!authCheck.ok) {
+        const failureDecision = rateLimiter.recordAuthFailure(remoteKey)
+        return respond(
+          401,
+          { ok: false, error: authCheck.error ?? 'missing or invalid x-troy-agent token' },
+          failureDecision.allowed ? {} : buildRateLimitHeaders(failureDecision),
+        )
+      }
     }
 
     const parsedHeaderSession = parseSessionId(req.headers[SESSION_HEADER])
@@ -966,11 +1179,24 @@ export async function createAgentSocket(
       )
     }
 
-    let url: URL
-    try {
-      url = new URL(rawUrl, 'http://127.0.0.1')
-    } catch {
-      return respond(400, { ok: false, code: 'invalid_url', error: 'malformed request URL' }, rateHeaders)
+    if (isHealthProbePath) {
+      if (url.pathname === '/readyz') {
+        const probe = evaluateReadinessProbe(buildRuntimeMetricsSource(), metrics.uptimeSeconds())
+        return respond(probe.status, probe.payload as unknown as Record<string, unknown>, rateHeaders)
+      }
+      const probe = evaluateLivenessProbe(metrics.uptimeSeconds())
+      return respond(probe.status, probe.payload as unknown as Record<string, unknown>, rateHeaders)
+    }
+
+    if (isGetMetricsPath) {
+      const format = (url.searchParams.get('format') ?? '').trim().toLowerCase()
+      const accept = String(req.headers.accept ?? '').toLowerCase()
+      const runtimeSource = buildRuntimeMetricsSource()
+      if (format === 'json' || (!format && accept.includes('application/json') && !accept.includes('text/plain'))) {
+        return respond(200, { ok: true, metrics: metrics.getSnapshot(runtimeSource) }, rateHeaders)
+      }
+      const text = metrics.renderPrometheus(runtimeSource)
+      return respondText(200, text, PROMETHEUS_CONTENT_TYPE, rateHeaders)
     }
 
     if (req.method === 'GET' && url.pathname === '/health') {
@@ -1116,7 +1342,9 @@ export async function createAgentSocket(
     port,
     token,
     wsUrl,
+    metrics,
     async close() {
+      closing = true
       wsHub?.close()
       streamHub.close()
       await new Promise<void>((resolve) => {

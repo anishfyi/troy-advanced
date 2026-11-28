@@ -38,6 +38,8 @@ export interface TokenValidationResult {
 export interface TokenValidationOptions {
   /** Optional query-string token fallback (used by WebSocket `/ws?token=...`). */
   queryToken?: string | null
+  /** Optional `Authorization: Bearer <token>` fallback (used by Prometheus `/metrics`). */
+  allowBearer?: boolean
 }
 
 /**
@@ -193,6 +195,46 @@ export function validateAgentTokenRequest(
       ok: false,
       code: 'token_mismatch',
       error: 'missing or invalid x-troy-agent token',
+    }
+  }
+
+  if (opts.allowBearer) {
+    if (Array.isArray(req.rawHeaders)) {
+      let authHeaderCount = 0
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        if (req.rawHeaders[i]?.toLowerCase() === 'authorization') {
+          authHeaderCount++
+        }
+      }
+      if (authHeaderCount > 1) {
+        return {
+          ok: false,
+          code: 'duplicate_token',
+          error: 'duplicate authorization header',
+        }
+      }
+    }
+    const rawAuth = req.headers.authorization
+    if (typeof rawAuth === 'string') {
+      const m = /^Bearer\s+(\S+)$/i.exec(rawAuth.trim())
+      if (m && m[1]) {
+        const bearerToken = m[1]
+        if (/[\x00-\x1f\x7f]/.test(bearerToken) || Buffer.byteLength(bearerToken, 'utf8') > MAX_TOKEN_BYTES) {
+          return {
+            ok: false,
+            code: 'invalid_token',
+            error: 'missing or invalid x-troy-agent token',
+          }
+        }
+        if (timingSafeTokenEqual(bearerToken, expectedToken)) {
+          return { ok: true }
+        }
+        return {
+          ok: false,
+          code: 'token_mismatch',
+          error: 'missing or invalid x-troy-agent token',
+        }
+      }
     }
   }
 

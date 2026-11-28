@@ -66,6 +66,8 @@ export interface DaemonOptions {
   logMaxBytes?: number
   logMaxFiles?: number
   logRotationIntervalMs?: number
+  healthProbeUnauthenticated?: boolean
+  metricsUnauthenticated?: boolean
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -108,7 +110,15 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     await manager.openTab(opts.initialUrl, { activate: true, bypassReadonly: true })
   }
 
-  const socket = await createAgentSocket(manager, { port: opts.port ?? 0 })
+  const socket = await createAgentSocket(manager, {
+    port: opts.port ?? 0,
+    ...(opts.healthProbeUnauthenticated !== undefined
+      ? { healthProbeUnauthenticated: opts.healthProbeUnauthenticated }
+      : {}),
+    ...(opts.metricsUnauthenticated !== undefined
+      ? { metricsUnauthenticated: opts.metricsUnauthenticated }
+      : {}),
+  })
   const endpointFile = opts.endpointFile || defaultEndpointPath()
   const compatFile = opts.compatTroy ? troyCompatEndpointPath() : null
 
@@ -260,6 +270,8 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   args.push('--log-file', logFile)
   if (opts.logMaxBytes !== undefined) args.push('--log-max-bytes', String(opts.logMaxBytes))
   if (opts.logMaxFiles !== undefined) args.push('--log-max-files', String(opts.logMaxFiles))
+  if (opts.healthProbeUnauthenticated === false) args.push('--no-health-probe')
+  if (opts.metricsUnauthenticated === true) args.push('--public-metrics')
   if (opts.engine) args.push('--engine', opts.engine)
   if (opts.port) args.push('--port', String(opts.port))
   if (opts.cdpPort) args.push('--cdp-port', String(opts.cdpPort))
