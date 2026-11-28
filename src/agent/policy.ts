@@ -4,6 +4,7 @@
 import type { ElementDescriptor, PolicyDecision, ResolvedPolicyProfile, SsrfProtectionOptions } from '../types.js'
 import { exactOrigin } from './omnibox.js'
 import { PolicyProfileGuard, compilePolicyPatterns } from './policy-profile.js'
+import { isMutatingTool } from './readonly.js'
 import { checkUrlSsrfSync } from './ssrf.js'
 
 export const SENSITIVE_PATTERNS = Object.freeze({
@@ -89,7 +90,19 @@ export function authorizeAction(request: {
   blockPrivateNet?: boolean
   ssrf?: SsrfProtectionOptions
   policy?: ResolvedPolicyProfile | PolicyProfileGuard
+  readonly?: boolean
 }): PolicyDecision {
+  if (request.readonly) {
+    const check = isMutatingTool(request.name)
+    if (check.mutating) {
+      return {
+        allowed: false,
+        status: 'blocked',
+        code: 'readonly',
+        reason: check.reason ?? `tool "${check.canonicalTool}" is refused in read-only observer mode (--readonly)`,
+      }
+    }
+  }
   const allowed = new Set(request.allowedOrigins)
   const guard =
     request.policy instanceof PolicyProfileGuard

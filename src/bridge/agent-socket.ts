@@ -140,6 +140,43 @@ export async function createAgentSocket(
       sessionId = parsedBodySession.sessionId
     }
 
+    if (
+      manager.readonlyGuard.enabled &&
+      pathname !== '/tool' &&
+      pathname !== '/open' &&
+      pathname !== '/close' &&
+      pathname !== '/grant-origin'
+    ) {
+      const roDecision = manager.readonlyGuard.checkEndpoint(pathname, body, {
+        tabId: body.tabId !== undefined && Number.isFinite(Number(body.tabId)) ? Number(body.tabId) : undefined,
+        sessionId,
+      })
+      if (!roDecision.allowed) {
+        manager.audit.record({
+          tsMs: Date.now(),
+          kind: 'refusal',
+          tool: pathname,
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: roDecision.status, code: roDecision.code, reason: roDecision.reason },
+          durationMs: 0,
+          args: body,
+          summary: pathname,
+          error: roDecision.reason,
+        })
+        return {
+          status: 200,
+          payload: {
+            ok: false,
+            status: roDecision.status,
+            code: roDecision.code,
+            error: roDecision.reason,
+          },
+        }
+      }
+    }
+
     switch (pathname) {
       case '/health': {
         const remoteCdp = manager.engine.getRemoteCdpInfo ? manager.engine.getRemoteCdpInfo() : null
@@ -158,6 +195,7 @@ export async function createAgentSocket(
             audit: manager.getAuditStats(),
             loopGuard: manager.getLoopGuardStats(),
             policy: manager.getPolicyStats(),
+            readonly: manager.getReadonlyStats(),
             ssrf: manager.getSsrfStats(),
             untrustedMarkers: manager.getUntrustedMarkersStats(),
             secretRedaction: manager.getSecretRedactionStats(),

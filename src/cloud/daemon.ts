@@ -11,6 +11,7 @@ import type {
   EmulationOptions,
   EngineKind,
   PolicyProfileInput,
+  ReadonlyModeOptions,
   SecretRedactionOptions,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
@@ -48,6 +49,7 @@ export interface DaemonOptions {
   redactSecrets?: boolean | SecretRedactionOptions
   policy?: PolicyProfileInput
   policyFile?: string
+  readonly?: boolean | ReadonlyModeOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -68,10 +70,11 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     redactSecrets: opts.redactSecrets,
     policy: opts.policy,
     policyFile: opts.policyFile,
+    readonly: opts.readonly,
   })
 
   if (opts.initialUrl) {
-    await manager.openTab(opts.initialUrl, { activate: true })
+    await manager.openTab(opts.initialUrl, { activate: true, bypassReadonly: true })
   }
 
   const socket = await createAgentSocket(manager, { port: opts.port ?? 0 })
@@ -138,6 +141,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       blockPrivateNet: manager.ssrf.enabled,
       untrustedMarkers: manager.untrustedMarkers.enabled,
       redactSecrets: manager.secretRedactor.enabled,
+      readonly: manager.readonlyGuard.enabled,
       policyProfile: manager.policy.profile,
       ...(manager.policy.resolved.sourceFile ? { policyFile: manager.policy.resolved.sourceFile } : {}),
       endpointFile,
@@ -231,6 +235,9 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   }
   if (opts.policyFile) {
     args.push('--policy-file', opts.policyFile)
+  }
+  if (opts.readonly === true || (typeof opts.readonly === 'object' && opts.readonly?.enabled)) {
+    args.push('--readonly')
   }
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport

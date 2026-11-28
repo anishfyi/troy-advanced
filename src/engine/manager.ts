@@ -43,6 +43,8 @@ import type {
   PixelAsciiOptions,
   PolicyProfileInput,
   PolicyProfileStats,
+  ReadonlyModeOptions,
+  ReadonlyModeStats,
   Rect,
   ResolvedPolicyProfile,
   SecretRedactionMetadata,
@@ -89,6 +91,7 @@ import { SessionRegistry } from '../agent/sessions.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { PolicyProfileGuard, resolvePolicyProfile } from '../agent/policy-profile.js'
+import { ReadonlyObserverGuard } from '../agent/readonly.js'
 import { SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
 import {
   UntrustedContentGuard,
@@ -202,6 +205,7 @@ export interface BrowserManagerOptions {
   policy?: PolicyProfileInput
   policyFile?: string
   autoLoadPolicyFile?: boolean
+  readonly?: boolean | ReadonlyModeOptions
 }
 
 export class BrowserManager {
@@ -214,6 +218,7 @@ export class BrowserManager {
   readonly untrustedMarkers: UntrustedContentGuard
   readonly secretRedactor: SecretRedactorGuard
   readonly policy: PolicyProfileGuard
+  readonly readonlyGuard: ReadonlyObserverGuard
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
@@ -235,6 +240,7 @@ export class BrowserManager {
     untrustedMarkers: UntrustedContentGuard,
     secretRedactor: SecretRedactorGuard,
     policy: PolicyProfileGuard,
+    readonlyGuard: ReadonlyObserverGuard,
   ) {
     this.engine = engine
     this.profileDir = profileDir
@@ -245,6 +251,7 @@ export class BrowserManager {
     this.untrustedMarkers = untrustedMarkers
     this.secretRedactor = secretRedactor
     this.policy = policy
+    this.readonlyGuard = readonlyGuard
     for (const origin of policy.resolved.allowedOrigins) {
       if (!policy.isOriginDenied(origin)) {
         this.allowedOrigins.add(origin)
@@ -398,6 +405,7 @@ export class BrowserManager {
           : undefined
     const untrustedMarkersGuard = new UntrustedContentGuard(untrustedMarkersOpts)
     const secretRedactorGuard = new SecretRedactorGuard(opts.redactSecrets)
+    const readonlyGuard = new ReadonlyObserverGuard(opts.readonly)
     return new BrowserManager(
       engine,
       profileDir,
@@ -408,7 +416,16 @@ export class BrowserManager {
       untrustedMarkersGuard,
       secretRedactorGuard,
       policyGuard,
+      readonlyGuard,
     )
+  }
+
+  get isReadonly(): boolean {
+    return this.readonlyGuard.enabled
+  }
+
+  getReadonlyStats(): ReadonlyModeStats {
+    return this.readonlyGuard.getStats()
   }
 
   getPolicyStats(): PolicyProfileStats {
@@ -691,10 +708,39 @@ export class BrowserManager {
 
   grantOrigin(
     originOrUrl: string,
-    opts: { sessionId?: string } = {},
-  ): { ok: boolean; origin?: string; sessionId?: string; error?: string } {
+    opts: { sessionId?: string; bypassReadonly?: boolean } = {},
+  ): { ok: boolean; origin?: string; sessionId?: string; status?: 'blocked'; code?: string; error?: string } {
     const startedAt = Date.now()
     const sessionId = opts.sessionId
+    if (this.readonlyGuard.enabled && !opts.bypassReadonly) {
+      const decision = this.readonlyGuard.checkTool('origin_grant', { origin: originOrUrl }, { sessionId })
+      if (!decision.allowed) {
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'origin_grant',
+          summary: originOrUrl || '(empty)',
+          ok: false,
+          durationMs,
+          error: decision.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'origin_grant',
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: decision.status, code: decision.code, reason: decision.reason },
+          durationMs,
+          args: { origin: originOrUrl },
+          summary: originOrUrl || '(empty)',
+          error: decision.reason,
+        })
+        return { ok: false, status: 'blocked', code: decision.code, error: decision.reason }
+      }
+    }
     const origin = normalizeOrigin(originOrUrl)
     if (!origin) {
       const durationMs = Date.now() - startedAt
@@ -823,10 +869,39 @@ export class BrowserManager {
 
   async openTab(
     inputUrl?: string,
-    opts: { activate?: boolean; ownedByBridge?: boolean; sessionId?: string } = {},
-  ): Promise<{ ok: boolean; id?: number; url?: string; title?: string; sessionId?: string; error?: string }> {
+    opts: { activate?: boolean; ownedByBridge?: boolean; sessionId?: string; bypassReadonly?: boolean } = {},
+  ): Promise<{ ok: boolean; id?: number; url?: string; title?: string; sessionId?: string; status?: 'blocked'; code?: string; error?: string }> {
     const startedAt = Date.now()
     const sessionId = opts.sessionId
+    if (this.readonlyGuard.enabled && !opts.bypassReadonly) {
+      const decision = this.readonlyGuard.checkTool('tab_open', { url: inputUrl }, { sessionId })
+      if (!decision.allowed) {
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'tab_open',
+          summary: inputUrl || '(blank)',
+          ok: false,
+          durationMs,
+          error: decision.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_open',
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: decision.status, code: decision.code, reason: decision.reason },
+          durationMs,
+          args: { url: inputUrl },
+          summary: inputUrl || '(blank)',
+          error: decision.reason,
+        })
+        return { ok: false, status: 'blocked', code: decision.code, error: decision.reason }
+      }
+    }
     let targetUrl: string | undefined
     if (inputUrl && inputUrl.trim()) {
       const resolved = resolveInput(inputUrl)
@@ -1076,10 +1151,39 @@ export class BrowserManager {
   async closeTab(
     tabId: number,
     requireOwned = false,
-    opts: { sessionId?: string } = {},
+    opts: { sessionId?: string; bypassReadonly?: boolean } = {},
   ): Promise<{ ok: boolean; status?: 'blocked'; code?: string; error?: string }> {
     const startedAt = Date.now()
     const sessionId = opts.sessionId
+    if (this.readonlyGuard.enabled && !opts.bypassReadonly) {
+      const decision = this.readonlyGuard.checkTool('tab_close', { tabId }, { tabId, sessionId })
+      if (!decision.allowed) {
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          tabId,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'tab_close',
+          summary: `tab=${tabId}`,
+          ok: false,
+          durationMs,
+          error: decision.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_close',
+          tabId,
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: decision.status, code: decision.code, reason: decision.reason },
+          durationMs,
+          error: decision.reason,
+        })
+        return { ok: false, status: 'blocked', code: decision.code, error: decision.reason }
+      }
+    }
     const session = this.tabs.get(tabId)
     if (!session) return { ok: false, error: `no tab ${tabId}` }
     const fromUrl = session.driver.getUrl()
@@ -1988,6 +2092,22 @@ export class BrowserManager {
     args: Record<string, unknown> = {},
     sessionId?: string,
   ): Promise<Record<string, unknown>> {
+    if (this.readonlyGuard.enabled) {
+      const preSession = this.resolveTabForSession(tabId, sessionId)
+      const readonlyDecision = this.readonlyGuard.checkTool(name, args, {
+        tabId: preSession.ok ? preSession.session.driver.id : tabId,
+        sessionId,
+        url: preSession.ok ? preSession.session.driver.getUrl() : undefined,
+      })
+      if (!readonlyDecision.allowed) {
+        return {
+          ok: false,
+          status: readonlyDecision.status,
+          code: readonlyDecision.code,
+          error: readonlyDecision.reason,
+        }
+      }
+    }
     if (this.policy.isToolBlocked(name)) {
       return {
         ok: false,

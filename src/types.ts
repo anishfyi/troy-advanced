@@ -1213,3 +1213,25 @@ export interface SecretRedactionStats {
   redactionsByCategory: Record<string, number>
   recentRedactions: SecretRedactionEvent[]
 }
+
+export interface ReadonlyModeOptions {
+  /** Enable read-only observer mode (--readonly), deterministically refusing all mutating tools. */
+  enabled?: boolean
+}
+
+export interface ReadonlyRefusalEvent {
+  ts: number
+  tool: string
+  reason: string
+  tabId?: number
+  sessionId?: string
+  url?: string
+}
+
+export interface ReadonlyModeStats {
+  enabled: boolean
+  mutatingTools: string[]
+  blockedCount: number
+  blockedByTool: Record<string, number>
+  recentBlocked: ReadonlyRefusalEvent[]
+}

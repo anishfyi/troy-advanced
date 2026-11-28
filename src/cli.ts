@@ -91,7 +91,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -165,7 +165,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --policy <strict|standard|permissive>  --policy-file <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -399,6 +399,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         ...(redactModeFlag ? { mode: redactModeFlag } : {}),
       }
     : undefined
+  const envReadonly =
+    process.env.TROY_READONLY === '1' ||
+    process.env.TROY_READONLY?.toLowerCase() === 'true'
+  const readonlyFlag = Boolean(flags.readonly) || envReadonly
   const rawPolicyFlag =
     typeof flags.policy === 'string' && flags.policy.trim()
       ? flags.policy.trim()
@@ -680,6 +684,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         redactSecrets: redactSecretsOpts,
         policy: policyProfileFlag,
         policyFile: policyFileFlag,
+        readonly: readonlyFlag || undefined,
         emulation: cliEmulation,
         memoryEnabled: false,
       })
@@ -821,6 +826,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
+      readonly: readonlyFlag || undefined,
     }
 
     if (sub === 'run') {
@@ -867,6 +873,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
+      readonly: readonlyFlag || undefined,
     })
     try {
       const inspectorTabFlag =
@@ -916,6 +923,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
+      readonly: readonlyFlag || undefined,
     })
     try {
       await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
@@ -942,6 +950,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
+      readonly: readonlyFlag || undefined,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1421,9 +1430,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       redactSecrets: redactSecretsOpts,
       policy: policyProfileFlag,
       policyFile: policyFileFlag,
+      readonly: readonlyFlag || undefined,
     })
     try {
-      const opened = await manager.openTab(positional[1], { activate: true })
+      const opened = await manager.openTab(positional[1], { activate: true, bypassReadonly: true })
       if (!opened.ok) {
         console.error(JSON.stringify(opened, null, 2))
         process.exit(1)
