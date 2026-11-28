@@ -100,6 +100,14 @@ import {
   rotateLogFile,
 } from './cloud/daemon-logs.js'
 import { formatDoctorAscii, runDoctorAsync } from './cloud/doctor.js'
+import {
+  buildEc2TunnelPlan,
+  discoverRemoteEndpoint,
+  establishEc2Tunnel,
+  formatEc2TunnelAscii,
+  writeTunneledEndpointFile,
+  type StrictHostKeyMode,
+} from './cloud/ec2-tunnel.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
   TOOL_SCHEMA_FORMATS,
@@ -138,6 +146,8 @@ Daemon & Modes:
   profile      <list|show|create|delete|export|import> [args] [--profiles-dir <dir>] [--json]
                                                          Manage isolated multi-profile directories (list, create/clone, delete, export/import)
   ec2 setup                                              Print EC2 systemd & SSH forwarding guide
+  ec2 tunnel   <user@host> [--local-port N] [--remote-port N] [--cdp] [--cdp-only] [--cdp-port N] [--remote-cdp-port N] [-i <key>] [--ssh-port N] [--jump <bastion>] [--discover] [--write-endpoint <file>] [--connect] [--background] [--json]
+                                                         Print or establish secure 127.0.0.1 SSH loopback forwarding to an EC2 host
 
 Client Commands (talk to running daemon, or use --oneshot):
   status                                  Daemon health + memory stats
@@ -284,6 +294,18 @@ const VALUE_FLAGS = new Set([
   '--description',
   '--tag',
   '--name',
+  '--local-port',
+  '--remote-port',
+  '--local-cdp-port',
+  '--ssh-port',
+  '--identity',
+  '--jump',
+  '--keepalive',
+  '--keepalive-count',
+  '--strict-host-key',
+  '--remote-endpoint',
+  '--write-endpoint',
+  '--ssh-bin',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -325,6 +347,10 @@ function parseArgv(argv: string[]) {
     }
     if (tok === '-H' && i + 1 < argv.length) {
       pushMulti('header', argv[++i]!)
+      continue
+    }
+    if (tok === '-i' && i + 1 < argv.length) {
+      flags.identity = argv[++i]!
       continue
     }
     if (tok === '-f') {
@@ -1202,8 +1228,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return
   }
 
-  if (cmd === 'ec2' && positional[1] === 'setup') {
-    console.log(`=== Troy Advanced EC2 Setup ===
+  if (cmd === 'ec2') {
+    const sub = positional[1] || 'setup'
+    if (sub === 'setup') {
+      console.log(`=== Troy Advanced EC2 Setup ===
 1. Bootstrap Chromium + Node on Ubuntu / Amazon Linux 2023:
    bash deploy/ec2-bootstrap.sh
 
@@ -1212,11 +1240,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
    sudo systemctl enable --now troy-advanced
 
 3. Tunnel the loopback Agent Socket securely from your laptop (optional):
-   AGENT_PORT=$(jq -r .agentPort ~/.config/troy-advanced/agent-endpoint.json)
-   ssh -L $AGENT_PORT:127.0.0.1:$AGENT_PORT ec2-user@<ec2-host>
+   troy-advanced ec2 tunnel ec2-user@<ec2-host> --discover --connect
 
 4. Or drive Chrome on another EC2 node over an SSH tunnel using --cdp-url:
-   ssh -f -N -L 19222:127.0.0.1:9222 ec2-user@<chrome-node>
+   troy-advanced ec2 tunnel ec2-user@<chrome-node> --cdp-only --connect --background
    troy-advanced daemon start --cdp-url http://127.0.0.1:19222
 
 5. Or run AI agents directly on the EC2 host over SSH/tmux:
@@ -1225,7 +1252,174 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
    troy-advanced ascii
    troy-advanced mcp       # Wire into Dexter / Claude Code / Codex MCP config
 `)
-    return
+      return
+    }
+
+    if (sub === 'tunnel') {
+      const target = positional[2]
+      if (!target) {
+        const msg =
+          'Usage: troy-advanced ec2 tunnel <user@host> [--local-port N] [--remote-port N] [--cdp] [--cdp-only] [--cdp-port N] [--remote-cdp-port N] [-i <key>] [--ssh-port N] [--jump <bastion>] [--discover] [--write-endpoint <file>] [--connect] [--background] [--json]'
+        console.error(flags.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : msg)
+        process.exit(1)
+      }
+
+      const parseOptInt = (val: string | boolean | undefined, label: string): number | undefined => {
+        if (val === undefined || val === false) return undefined
+        if (val === true) throw new Error(`${label} requires a numeric value`)
+        const n = Number(val)
+        if (!Number.isInteger(n)) throw new Error(`Invalid ${label} "${val}": must be an integer`)
+        return n
+      }
+
+      try {
+        const localPort = parseOptInt(flags['local-port'] ?? flags.port, '--local-port')
+        let remotePort = parseOptInt(flags['remote-port'], '--remote-port')
+        const localCdpPort = parseOptInt(flags['local-cdp-port'] ?? flags['cdp-port'], '--cdp-port')
+        let remoteCdpPort = parseOptInt(flags['remote-cdp-port'], '--remote-cdp-port')
+        const sshPort = parseOptInt(flags['ssh-port'], '--ssh-port')
+        const keepaliveSec = parseOptInt(flags.keepalive, '--keepalive')
+        const keepaliveCount = parseOptInt(flags['keepalive-count'], '--keepalive-count')
+        const timeoutMs = parseOptInt(flags.timeout, '--timeout')
+
+        const baseOpts = {
+          target,
+          localPort,
+          remotePort,
+          forwardCdp: Boolean(flags.cdp),
+          cdpOnly: Boolean(flags['cdp-only']),
+          localCdpPort,
+          remoteCdpPort,
+          sshPort,
+          identityFile: typeof flags.identity === 'string' ? flags.identity : undefined,
+          jumpHost: typeof flags.jump === 'string' ? flags.jump : undefined,
+          background: Boolean(flags.background),
+          batchMode: Boolean(flags.batch),
+          keepaliveSec,
+          keepaliveCount,
+          strictHostKey:
+            typeof flags['strict-host-key'] === 'string'
+              ? (flags['strict-host-key'] as StrictHostKeyMode)
+              : undefined,
+          remoteEndpointPath:
+            typeof flags['remote-endpoint'] === 'string' ? flags['remote-endpoint'] : undefined,
+          sshBinary: typeof flags['ssh-bin'] === 'string' ? flags['ssh-bin'] : undefined,
+        }
+
+        let plan = buildEc2TunnelPlan(baseOpts)
+        let discoveredEndpoint:
+          | Awaited<ReturnType<typeof discoverRemoteEndpoint>>['endpoint']
+          | undefined
+        let writtenEndpointFile: string | undefined
+
+        if (flags.discover) {
+          const disc = await discoverRemoteEndpoint(plan, { timeoutMs })
+          if (!disc.ok || !disc.endpoint) {
+            const out = { ok: false, error: disc.error || 'Failed to discover remote endpoint', stderr: disc.stderr }
+            console.error(flags.json ? JSON.stringify(out, null, 2) : `${out.error}${disc.stderr ? `\n${disc.stderr}` : ''}`)
+            process.exit(1)
+          }
+          discoveredEndpoint = disc.endpoint
+          if (remotePort === undefined) remotePort = disc.endpoint.agentPort
+          if (remoteCdpPort === undefined && disc.endpoint.port > 0) remoteCdpPort = disc.endpoint.port
+          plan = buildEc2TunnelPlan({
+            ...baseOpts,
+            remotePort,
+            remoteCdpPort,
+          })
+          if (flags['write-endpoint']) {
+            const agentFwd = plan.forwards.find((f) => f.label === 'agent')
+            const cdpFwd = plan.forwards.find((f) => f.label === 'cdp')
+            if (agentFwd) {
+              const outPath = typeof flags['write-endpoint'] === 'string' ? flags['write-endpoint'] : undefined
+              const written = writeTunneledEndpointFile(
+                disc.endpoint,
+                agentFwd.localPort,
+                outPath,
+                cdpFwd?.localPort,
+              )
+              writtenEndpointFile = written.file
+            }
+          }
+        }
+
+        const shouldConnect = Boolean(flags.connect || flags.exec || flags.start)
+        if (!shouldConnect) {
+          if (flags.json) {
+            console.log(
+              JSON.stringify(
+                {
+                  ...plan,
+                  connected: false,
+                  ...(discoveredEndpoint ? { discoveredEndpoint } : {}),
+                  ...(writtenEndpointFile ? { writtenEndpointFile } : {}),
+                },
+                null,
+                2,
+              ),
+            )
+          } else {
+            console.log(
+              formatEc2TunnelAscii(plan, {
+                discoveredEndpoint,
+                writtenEndpointFile,
+              }),
+            )
+          }
+          return
+        }
+
+        if (!flags.json && !plan.security.background) {
+          console.log(
+            formatEc2TunnelAscii(plan, {
+              discoveredEndpoint,
+              writtenEndpointFile,
+            }),
+          )
+          console.log('Establishing foreground SSH loopback tunnel (press Ctrl+C to close)...')
+        }
+
+        const result = await establishEc2Tunnel(plan, {
+          timeoutMs,
+          onStderr: !flags.json ? (chunk) => process.stderr.write(chunk) : undefined,
+          onStdout: !flags.json ? (chunk) => process.stdout.write(chunk) : undefined,
+        })
+
+        if (flags.json) {
+          console.log(
+            JSON.stringify(
+              {
+                ...plan,
+                connected: result.ok,
+                tunnel: result,
+                ...(discoveredEndpoint ? { discoveredEndpoint } : {}),
+                ...(writtenEndpointFile ? { writtenEndpointFile } : {}),
+              },
+              null,
+              2,
+            ),
+          )
+        } else if (plan.security.background || !result.ok) {
+          console.log(
+            formatEc2TunnelAscii(plan, {
+              discoveredEndpoint,
+              writtenEndpointFile,
+              connected: result,
+            }),
+          )
+        }
+
+        if (!result.ok) process.exit(1)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error(flags.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : msg)
+        process.exit(1)
+      }
+      return
+    }
+
+    console.error(`Unknown ec2 subcommand "${sub}". Usage: troy-advanced ec2 <setup|tunnel>`)
+    process.exit(1)
   }
 
   if (cmd === 'daemon') {
