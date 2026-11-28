@@ -102,7 +102,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Render Chromium PNG screenshot (or cropped region) as ASCII
   read [--since] [--ascii] [--visual] [--max-tokens N] [--crop x,y,w,h] [--ref eN] [--json]
                                           Read page structure or ASCII/JSON delta
-  find <query>                            Find interactive elements as eN refs
+  find <query> [--role button|input|link]  Smart fuzzy+synonym+ARIA find as eN refs
   extract [url] [--sections tables,forms,links,headings,metadata] [--max-items N] [--external|--internal] [--ascii]
                                           Extract structured tables, forms (with eN refs), links, headings, and JSON-LD/OpenGraph metadata
   click <ref> [--allow-submit]            Click element ref
@@ -1486,9 +1486,29 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     }
-    case 'find':
-      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_find', args: { query: args.join(' ') } })
+    case 'find': {
+      const findRoles: string[] = []
+      if (typeof flags.role === 'string') findRoles.push(flags.role)
+      if (flags.button) findRoles.push('button')
+      if (flags.input) findRoles.push('input')
+      if (flags.link) findRoles.push('link')
+      if (flags.select) findRoles.push('select')
+      if (flags.checkbox) findRoles.push('checkbox')
+      if (flags.radio) findRoles.push('radio')
+      res = await callDaemon(daemonEndpoint, '/tool', {
+        tabId,
+        name: 'page_find',
+        args: {
+          query: args.join(' '),
+          ...(findRoles.length > 0 ? { roles: findRoles } : {}),
+          ...(flags.limit ? { limit: Number(flags.limit) } : {}),
+          ...(flags['no-fuzzy'] ? { fuzzy: false } : {}),
+          ...(flags['no-synonyms'] ? { synonyms: false } : {}),
+          ...(flags['enabled-only'] ? { includeDisabled: false } : {}),
+        },
+      })
       break
+    }
     case 'text':
       res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_text', args: args[0] ? { ref: args[0] } : {} })
       break

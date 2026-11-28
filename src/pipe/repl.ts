@@ -228,7 +228,38 @@ export async function executePipeCommand(
       return { output: format(res) }
     }
     case 'find': {
-      const res = await manager.runTool(undefined, 'page_find', { query: argStr })
+      const tokens = tokenizePipeArgs(argStr)
+      const queryParts: string[] = []
+      const roles: string[] = []
+      let limit: number | undefined
+      let fuzzy = true
+      let synonyms = true
+      let includeDisabled = true
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i]!
+        if (tok === '--role' && tokens[i + 1] !== undefined) roles.push(tokens[++i]!)
+        else if (tok.startsWith('--role=')) roles.push(tok.slice('--role='.length))
+        else if (tok === '--button') roles.push('button')
+        else if (tok === '--input') roles.push('input')
+        else if (tok === '--link') roles.push('link')
+        else if (tok === '--select') roles.push('select')
+        else if (tok === '--checkbox') roles.push('checkbox')
+        else if (tok === '--radio') roles.push('radio')
+        else if (tok === '--limit' && tokens[i + 1] !== undefined) limit = Number(tokens[++i])
+        else if (tok.startsWith('--limit=')) limit = Number(tok.slice('--limit='.length))
+        else if (tok === '--no-fuzzy') fuzzy = false
+        else if (tok === '--no-synonyms') synonyms = false
+        else if (tok === '--enabled-only') includeDisabled = false
+        else queryParts.push(tok)
+      }
+      const res = await manager.runTool(undefined, 'page_find', {
+        query: queryParts.join(' '),
+        ...(roles.length > 0 ? { roles } : {}),
+        ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+        fuzzy,
+        synonyms,
+        includeDisabled,
+      })
       return { output: format(res) }
     }
     case 'extract': {

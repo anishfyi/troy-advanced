@@ -219,10 +219,30 @@ export const MCP_TOOLS = [
   },
   {
     name: 'troy_find',
-    description: 'Find interactive elements matching a query and return their eN refs.',
+    description:
+      'Smartly find interactive elements using fuzzy typo matching, UI synonym expansion, field-weighted scoring, and ARIA role filters (button, input, link, select, checkbox, radio, etc.).',
     inputSchema: {
       type: 'object',
-      properties: { query: { type: 'string' }, tabId: { type: 'number' } },
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search query (supports typos, synonyms like "sign in" -> "Log In", and inline role:button qualifiers; may be empty when filtering by role)',
+        },
+        role: {
+          type: 'string',
+          description: 'Filter by ARIA/element role: button, input, link, select, checkbox, radio, textbox, searchbox, combobox, tab, menuitem (or comma-separated list)',
+        },
+        roles: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Filter by multiple ARIA/element roles (OR semantics)',
+        },
+        limit: { type: 'number', description: 'Maximum matches to return (default 15, clamped 1..100)' },
+        fuzzy: { type: 'boolean', description: 'Enable Damerau-Levenshtein fuzzy typo matching (default true)' },
+        synonyms: { type: 'boolean', description: 'Enable UI synonym expansion (default true)' },
+        includeDisabled: { type: 'boolean', description: 'Include disabled elements in results (default true)' },
+        tabId: { type: 'number' },
+      },
       required: ['query'],
     },
   },
@@ -838,7 +858,15 @@ export async function handleMcpRequest(
         })
         break
       case 'troy_find':
-        result = await manager.runTool(tabId, 'page_find', { query: args.query })
+        result = await manager.runTool(tabId, 'page_find', {
+          query: args.query,
+          ...(args.role !== undefined ? { role: args.role } : {}),
+          ...(args.roles !== undefined ? { roles: args.roles } : {}),
+          ...(args.limit !== undefined ? { limit: args.limit } : {}),
+          ...(args.fuzzy !== undefined ? { fuzzy: args.fuzzy } : {}),
+          ...(args.synonyms !== undefined ? { synonyms: args.synonyms } : {}),
+          ...(args.includeDisabled !== undefined ? { includeDisabled: args.includeDisabled } : {}),
+        })
         break
       case 'troy_extract':
         result = await manager.runTool(tabId, 'page_extract', {

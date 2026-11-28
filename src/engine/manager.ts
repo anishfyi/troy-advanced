@@ -56,6 +56,7 @@ import {
   type RefContext,
   type RefRecoveryStrategy,
 } from '../agent/elements.js'
+import { findElements } from '../agent/find.js'
 import { PageMemory } from '../agent/memory.js'
 import {
   bindRecalledElements,
@@ -1600,26 +1601,34 @@ export class BrowserManager {
       }
 
       case 'page_find': {
-        const query = String(args.query ?? '').trim().toLowerCase()
         if (!session.lastSnapshot) {
           session.lastSnapshot = await this.takeIndexedSnapshot(session)
         }
-        const tokens = query.split(/\s+/).filter(Boolean)
-        const matches = session.elements
-          .list(ctx())
-          .map((entry) => {
-            const hay = `${entry.item.text} ${entry.item.label ?? ''} ${entry.item.ariaLabel ?? ''} ${entry.item.placeholder ?? ''} ${entry.item.name ?? ''} ${entry.item.role ?? ''} ${entry.item.href ?? ''}`.toLowerCase()
-            const score = tokens.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0)
-            return { item: entry.item, score }
-          })
-          .filter((x) => (tokens.length === 0 ? true : x.score > 0))
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 15)
-          .map(({ item }) => {
-            const { selector: _s, ...pub } = item
-            return pub
-          })
-        return { ok: true, query, count: matches.length, matches }
+        const registered = session.elements.list(ctx()).map((entry) => entry.item)
+        const combinedRoles: string[] = []
+        if (typeof args.role === 'string') combinedRoles.push(args.role)
+        else if (Array.isArray(args.role)) combinedRoles.push(...args.role.map(String))
+        if (Array.isArray(args.roles)) combinedRoles.push(...args.roles.map(String))
+
+        const result = findElements(registered, {
+          query: String(args.query ?? ''),
+          role: combinedRoles.length > 0 ? combinedRoles : undefined,
+          type: typeof args.type === 'string' ? args.type : undefined,
+          tag: typeof args.tag === 'string' ? args.tag : undefined,
+          enabledOnly: Boolean(args.enabledOnly) || args.includeDisabled === false,
+          fuzzy: args.fuzzy !== false,
+          synonyms: args.synonyms !== false,
+          limit: typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : undefined,
+          minScore: typeof args.minScore === 'number' && Number.isFinite(args.minScore) ? args.minScore : undefined,
+        })
+        return {
+          ok: true,
+          query: result.query,
+          count: result.matches.length,
+          totalCandidates: result.totalCandidates,
+          ...(result.appliedFilters ? { appliedFilters: result.appliedFilters } : {}),
+          matches: result.matches,
+        }
       }
 
       case 'page_recall': {
