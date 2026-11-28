@@ -54,6 +54,8 @@ const EPHEMERAL_ARG_KEYS = new Set([
   'maxTokens',
   'max_tokens',
   'ascii',
+  'tabId',
+  'sessionId',
 ])
 
 export interface LoopGuardConfig {

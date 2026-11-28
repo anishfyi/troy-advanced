@@ -80,7 +80,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M67: Deterministic `page_recall` auto-binding that verifies recalled selectors on the live DOM and issues immediate `eN` refs
 - [x] M68: Smart `page_find` fuzzy + synonym + ARIA role scoring (`button`, `input`, `link` filters)
 - [x] M69: Agent loop guard: detect repeated identical failing actions and return actionable recovery hints
-- [ ] M70: End-to-end integration test proving Dexter-style HTTP client + MCP client + Pipe client all interoperate cleanly
+- [x] M70: End-to-end integration test proving Dexter-style HTTP client + MCP client + Pipe client all interoperate cleanly
 
 ## Track 6: Security, Refusals & Sandboxing (Milestones 71–80)
 - [ ] M71: SSRF protection mode (`--block-private-net`) to optionally block AWS IMDS `169.254.169.254`, `10.0.0.0/8`, `127.0.0.1` on multi-tenant EC2 deployments

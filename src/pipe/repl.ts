@@ -66,7 +66,8 @@ export async function executePipeCommand(
     else if (cmd === 'close') res = await manager.closeTab(Number(req.tabId))
     else {
       const toolName = cmd.startsWith('page_') ? cmd : `page_${cmd}`
-      res = await manager.runTool(tabId, toolName, req)
+      const { cmd: _cmd, tabId: _tabId, ...toolArgs } = req
+      res = await manager.runTool(tabId, toolName, toolArgs)
     }
     return { output: JSON.stringify(res) }
   }
