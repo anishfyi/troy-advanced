@@ -845,3 +845,79 @@ export interface AuditStats {
   byTool: Record<string, number>
   byRefusalCode: Record<string, number>
 }
+
+export type LoopGuardMode = 'advisory' | 'block'
+
+export type LoopGuardSeverity = 'warning' | 'critical'
+
+export type LoopGuardCategory =
+  | 'origin_boundary'
+  | 'submit_guard'
+  | 'sensitive_field'
+  | 'blocked_scheme'
+  | 'session_isolation'
+  | 'stale_or_unknown_ref'
+  | 'wait_timeout'
+  | 'no_tab'
+  | 'interaction_failed'
+  | 'navigation_failed'
+  | 'unknown_tool'
+  | 'repeated_failure'
+
+export interface LoopGuardOptions {
+  /** Enable agent loop guard detection (default: true). */
+  enabled?: boolean
+  /**
+   * 'advisory': execute normally and attach `loopGuard` recovery hints once warnThreshold is reached (default).
+   * 'block': short-circuit identical failing actions once blockThreshold is reached with code 'loop_guard'.
+   */
+  mode?: LoopGuardMode
+  /** Number of identical failures before attaching recovery hints (default: 2). */
+  warnThreshold?: number
+  /** Number of identical failures before severity escalates to 'critical' and (in block mode) short-circuits (default: 4). */
+  blockThreshold?: number
+  /** Sliding window in milliseconds for counting repeated identical failures (default: 120_000). */
+  windowMs?: number
+  /** Max failure buckets kept per scope to bound memory (default: 32). */
+  maxEntriesPerScope?: number
+}
+
+export interface LoopGuardSuggestedAction {
+  tool?: string
+  endpoint?: string
+  action?: string
+  args?: Record<string, unknown>
+  reason?: string
+}
+
+export interface LoopGuardReport {
+  detected: boolean
+  blocked: boolean
+  severity: LoopGuardSeverity
+  repeatCount: number
+  warnThreshold: number
+  blockThreshold: number
+  category: LoopGuardCategory
+  tool: string
+  signature: string
+  hint: string
+  recoveryHints: string[]
+  suggestedAction?: LoopGuardSuggestedAction
+  firstSeenMs: number
+  lastSeenMs: number
+}
+
+export interface LoopGuardStats {
+  enabled: boolean
+  mode: LoopGuardMode
+  warnThreshold: number
+  blockThreshold: number
+  windowMs: number
+  activeScopes: number
+  trackedPatterns: number
+  warningsIssued: number
+  criticalDetected: number
+  actionsBlocked: number
+  byCategory: Record<string, number>
+  byTool: Record<string, number>
+}

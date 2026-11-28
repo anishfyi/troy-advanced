@@ -33,6 +33,9 @@ import type {
   EmulationProfile,
   EmulationUpdateMode,
   EngineKind,
+  LoopGuardCategory,
+  LoopGuardOptions,
+  LoopGuardStats,
   MarkdownRenderOptions,
   NetworkEntry,
   OriginStorageSnapshot,
@@ -65,6 +68,7 @@ import {
   type RecallAutoBindResult,
 } from '../agent/recall-bind.js'
 import { AuditLogger, extractRefusalInfo } from '../agent/audit.js'
+import { AgentLoopGuard, type LoopGuardConfig } from '../agent/loop-guard.js'
 import {
   extractStructuredData,
   formatExtractAscii,
@@ -167,6 +171,7 @@ export interface BrowserManagerOptions {
   cache?: ResponseCacheOptions
   cacheHooks?: ResponseCacheHooks
   audit?: AuditLogOptions
+  loopGuard?: LoopGuardOptions
 }
 
 export class BrowserManager {
@@ -174,6 +179,7 @@ export class BrowserManager {
   readonly profileDir: string
   readonly memory: PageMemory | null
   readonly audit: AuditLogger
+  readonly loopGuard: AgentLoopGuard
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
@@ -185,11 +191,18 @@ export class BrowserManager {
   private unsubscribeDownloads?: () => void
   private unsubscribeDialogs?: () => void
 
-  private constructor(engine: BrowserEngine, profileDir: string, memory: PageMemory | null, audit: AuditLogger) {
+  private constructor(
+    engine: BrowserEngine,
+    profileDir: string,
+    memory: PageMemory | null,
+    audit: AuditLogger,
+    loopGuard: AgentLoopGuard,
+  ) {
     this.engine = engine
     this.profileDir = profileDir
     this.memory = memory
     this.audit = audit
+    this.loopGuard = loopGuard
     if (engine.onCrashRecovery) {
       this.unsubscribeCrash = engine.onCrashRecovery((ev) => {
         if (ev.kind === 'chromium_recovered') {
@@ -303,7 +316,28 @@ export class BrowserManager {
       maxMemoryEntries: opts.audit?.maxMemoryEntries,
       redactArgs: opts.audit?.redactArgs,
     })
-    return new BrowserManager(engine, profileDir, memory, audit)
+    const loopGuard = new AgentLoopGuard(opts.loopGuard)
+    return new BrowserManager(engine, profileDir, memory, audit, loopGuard)
+  }
+
+  getLoopGuardStats(): LoopGuardStats {
+    return this.loopGuard.getStats()
+  }
+
+  getLoopGuardConfig(): LoopGuardConfig {
+    return this.loopGuard.getConfig()
+  }
+
+  setLoopGuardConfig(patch: LoopGuardOptions): LoopGuardConfig {
+    return this.loopGuard.setConfig(patch)
+  }
+
+  getLoopGuardPatterns(filter?: { sessionId?: string; tabId?: number }) {
+    return this.loopGuard.getActivePatterns(filter)
+  }
+
+  resetLoopGuard(filter?: { sessionId?: string; tabId?: number; category?: LoopGuardCategory }): number {
+    return this.loopGuard.reset(filter)
   }
 
   getAuditLog(opts?: AuditQueryOptions): AuditEntry[] {
@@ -443,6 +477,7 @@ export class BrowserManager {
       }
     }
     const del = this.sessions.delete(sessionId)
+    this.loopGuard.reset({ sessionId })
     this.emit({ type: 'session_closed', sessionId, closedTabIds })
     this.audit.record({
       tsMs: startedAt,
@@ -543,6 +578,7 @@ export class BrowserManager {
     } else {
       this.allowedOrigins.add(origin)
     }
+    this.loopGuard.reset({ sessionId, category: 'origin_boundary' })
     this.emit({ type: 'origin_granted', origin, ...(sessionId ? { sessionId } : {}) })
     const durationMs = Date.now() - startedAt
     this.recordActivity({
@@ -765,6 +801,7 @@ export class BrowserManager {
     await session.driver.close()
     this.tabs.delete(tabId)
     this.sessions.removeTab(tabId)
+    this.loopGuard.reset({ tabId })
     if (this.activeTabId === tabId) {
       const next = this.tabs.keys().next()
       this.activeTabId = next.done ? null : next.value
@@ -1292,18 +1329,117 @@ export class BrowserManager {
     const sessionBefore = beforeResolved.ok ? beforeResolved.session : null
     const resolvedTabId = sessionBefore?.driver.id ?? tabId
     const fromUrl = sessionBefore?.driver.getUrl()
+    const fromEpoch = sessionBefore?.driver.getEpoch()
     const summary = this.summarizeToolArgs(name, args)
+
+    const preBlocked = this.loopGuard.checkBeforeExecution({
+      tool: name,
+      args,
+      tabId: resolvedTabId,
+      sessionId,
+      url: fromUrl,
+      epoch: fromEpoch,
+      nowMs: startedAt,
+    })
+    if (preBlocked) {
+      const durationMs = Date.now() - startedAt
+      const error = `Agent loop guard blocked repeated failing "${name}" (${preBlocked.repeatCount}x): ${preBlocked.hint}`
+      const blockedRes: Record<string, unknown> = {
+        ok: false,
+        status: 'blocked',
+        code: 'loop_guard',
+        error,
+        loopGuard: preBlocked,
+      }
+      this.emit({
+        type: 'loop_detected',
+        blocked: true,
+        tool: name,
+        tabId: resolvedTabId,
+        ...(sessionId ? { sessionId } : {}),
+        loopGuard: preBlocked,
+      })
+      this.recordActivity({
+        ts: startedAt,
+        tabId: resolvedTabId,
+        ...(sessionId ? { sessionId } : {}),
+        tool: name,
+        summary,
+        ok: false,
+        durationMs,
+        url: fromUrl,
+        error,
+      })
+      this.audit.record({
+        tsMs: startedAt,
+        kind: 'tool_call',
+        tool: name,
+        tabId: resolvedTabId,
+        ...(sessionId ? { sessionId } : {}),
+        ok: false,
+        refused: true,
+        refusal: { status: 'blocked', code: 'loop_guard', reason: error },
+        durationMs,
+        args,
+        summary,
+        fromUrl,
+        toUrl: fromUrl,
+        urlChanged: false,
+        error,
+      })
+      return blockedRes
+    }
+
     try {
       const res = await this.runToolImpl(tabId, name, args, sessionId)
       const afterResolved = this.resolveTabForSession(tabId, sessionId)
       const sessionAfter = afterResolved.ok ? afterResolved.session : null
       const durationMs = Date.now() - startedAt
       const toUrl = typeof res.url === 'string' ? res.url : sessionAfter?.driver.getUrl()
+      const toEpoch = sessionAfter?.driver.getEpoch()
       const finalTabId = sessionAfter?.driver.id ?? resolvedTabId
       const ok = Boolean(res.ok)
       const error = !ok && typeof res.error === 'string' ? res.error : undefined
       const refusal = extractRefusalInfo(res)
       const urlChanged = Boolean(fromUrl && toUrl && fromUrl !== toUrl)
+
+      let finalRes = res
+      if (ok) {
+        this.loopGuard.recordSuccess({
+          tool: name,
+          args,
+          tabId: finalTabId,
+          sessionId,
+          url: toUrl,
+          epoch: toEpoch,
+          nowMs: Date.now(),
+        })
+      } else if (!(name === 'page_act' && res.loopGuard)) {
+        const loopReport = this.loopGuard.recordFailure({
+          tool: name,
+          args,
+          tabId: finalTabId,
+          sessionId,
+          url: toUrl ?? fromUrl,
+          epoch: toEpoch ?? fromEpoch,
+          error,
+          code: typeof res.code === 'string' ? res.code : undefined,
+          status: typeof res.status === 'string' ? res.status : undefined,
+          origin: typeof res.origin === 'string' ? res.origin : undefined,
+          nowMs: Date.now(),
+        })
+        if (loopReport) {
+          finalRes = { ...res, loopGuard: loopReport }
+          this.emit({
+            type: 'loop_detected',
+            blocked: false,
+            tool: name,
+            tabId: finalTabId,
+            ...(sessionId ? { sessionId } : {}),
+            loopGuard: loopReport,
+          })
+        }
+      }
 
       this.recordActivity({
         ts: startedAt,
@@ -1333,10 +1469,20 @@ export class BrowserManager {
         urlChanged,
         error,
       })
-      return res
+      return finalRes
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const durationMs = Date.now() - startedAt
+      this.loopGuard.recordFailure({
+        tool: name,
+        args,
+        tabId: resolvedTabId,
+        sessionId,
+        url: fromUrl,
+        epoch: fromEpoch,
+        error: message,
+        nowMs: Date.now(),
+      })
       this.recordActivity({
         ts: startedAt,
         tabId: resolvedTabId,
@@ -2341,7 +2487,15 @@ export class BrowserManager {
           )
           results.push({ op: step.op, ref: step.ref, ...stepRes })
           if (!stepRes.ok) {
-            return { ok: false, stoppedAt: results.length - 1, results, error: stepRes.error }
+            return {
+              ok: false,
+              stoppedAt: results.length - 1,
+              results,
+              error: stepRes.error,
+              ...(stepRes.code ? { code: stepRes.code } : {}),
+              ...(stepRes.status ? { status: stepRes.status } : {}),
+              ...(stepRes.loopGuard ? { loopGuard: stepRes.loopGuard } : {}),
+            }
           }
           if (session.driver.getUrl() !== startUrl) {
             return { ok: true, navigated: true, url: session.driver.getUrl(), results }

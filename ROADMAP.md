@@ -79,7 +79,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M66: WebSocket bridge endpoint (`/ws`) on Agent Socket for ultra-low-latency bidirectional AI control
 - [x] M67: Deterministic `page_recall` auto-binding that verifies recalled selectors on the live DOM and issues immediate `eN` refs
 - [x] M68: Smart `page_find` fuzzy + synonym + ARIA role scoring (`button`, `input`, `link` filters)
-- [ ] M69: Agent loop guard: detect repeated identical failing actions and return actionable recovery hints
+- [x] M69: Agent loop guard: detect repeated identical failing actions and return actionable recovery hints
 - [ ] M70: End-to-end integration test proving Dexter-style HTTP client + MCP client + Pipe client all interoperate cleanly
 
 ## Track 6: Security, Refusals & Sandboxing (Milestones 71–80)

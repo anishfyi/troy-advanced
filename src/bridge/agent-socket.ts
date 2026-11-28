@@ -9,6 +9,7 @@ import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnap
 import { formatDialogsAscii, parseDialogMode, parseDialogType } from '../engine/dialogs.js'
 import { formatDownloadsAscii, parseDownloadMode } from '../engine/downloads.js'
 import { formatAuditAscii, parseAuditEventKind } from '../agent/audit.js'
+import { formatLoopGuardAscii, parseLoopGuardMode } from '../agent/loop-guard.js'
 import { formatSessionsAscii, parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
@@ -64,6 +65,7 @@ export async function createAgentSocket(
             downloads: manager.getDownloadStats(),
             dialogs: manager.getDialogStats(),
             audit: manager.getAuditStats(),
+            loopGuard: manager.getLoopGuardStats(),
             stream: streamHub.getStats(),
             ws: wsHub?.getStats() ?? {
               clients: 0,
@@ -578,6 +580,61 @@ export async function createAgentSocket(
             ascii: formatAuditAscii(entries, stats, {
               width: typeof body.width === 'number' ? body.width : undefined,
             }),
+          },
+        }
+      }
+      case '/loop-guard': {
+        if (body.reset) {
+          const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+          const cleared = manager.resetLoopGuard({
+            ...(sessionId ? { sessionId } : {}),
+            ...(Number.isFinite(tabId) ? { tabId } : {}),
+          })
+          const stats = manager.getLoopGuardStats()
+          return {
+            status: 200,
+            payload: {
+              ok: true,
+              cleared,
+              stats,
+              patterns: manager.getLoopGuardPatterns({
+                ...(sessionId ? { sessionId } : {}),
+                ...(Number.isFinite(tabId) ? { tabId } : {}),
+              }),
+              ascii: formatLoopGuardAscii(stats, []),
+            },
+          }
+        }
+        const mode = parseLoopGuardMode(body.mode)
+        const hasConfigPatch =
+          typeof body.enabled === 'boolean' ||
+          Boolean(mode) ||
+          typeof body.warnThreshold === 'number' ||
+          typeof body.blockThreshold === 'number' ||
+          typeof body.windowMs === 'number'
+        if (hasConfigPatch) {
+          manager.setLoopGuardConfig({
+            ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+            ...(mode ? { mode } : {}),
+            ...(typeof body.warnThreshold === 'number' ? { warnThreshold: body.warnThreshold } : {}),
+            ...(typeof body.blockThreshold === 'number' ? { blockThreshold: body.blockThreshold } : {}),
+            ...(typeof body.windowMs === 'number' ? { windowMs: body.windowMs } : {}),
+          })
+        }
+        const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const stats = manager.getLoopGuardStats()
+        const patterns = manager.getLoopGuardPatterns({
+          ...(sessionId ? { sessionId } : {}),
+          ...(Number.isFinite(tabId) ? { tabId } : {}),
+        })
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            config: manager.getLoopGuardConfig(),
+            stats,
+            patterns,
+            ascii: formatLoopGuardAscii(stats, patterns),
           },
         }
       }
