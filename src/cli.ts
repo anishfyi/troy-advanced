@@ -71,6 +71,18 @@ import {
   writeStorageFile,
 } from './engine/storage.js'
 import { readLiveEndpoint } from './bridge/endpoint.js'
+import {
+  createProfile,
+  defaultProfileDir as getDefaultProfileDir,
+  deleteProfile,
+  exportProfile,
+  formatProfileDetailAscii,
+  formatProfilesAscii,
+  getProfile,
+  importProfile,
+  listProfiles,
+  resolveProfileFlag,
+} from './cloud/profiles.js'
 import { runDaemonForeground, startDaemonDetached, stopDaemon } from './cloud/daemon.js'
 import {
   defaultDaemonConfigPath,
@@ -123,6 +135,8 @@ Daemon & Modes:
                                                          Streaming stdin/stdout AI REPL
   doctor       [--json] [--no-imds] [--imds-timeout <ms>] [--imds-endpoint <url>]
                                                          EC2 (IMDSv2) / Linux / Chrome environment check
+  profile      <list|show|create|delete|export|import> [args] [--profiles-dir <dir>] [--json]
+                                                         Manage isolated multi-profile directories (list, create/clone, delete, export/import)
   ec2 setup                                              Print EC2 systemd & SSH forwarding guide
 
 Client Commands (talk to running daemon, or use --oneshot):
@@ -265,6 +279,11 @@ const VALUE_FLAGS = new Set([
   '--log-file',
   '--log-max-bytes',
   '--log-max-files',
+  '--profiles-dir',
+  '--from',
+  '--description',
+  '--tag',
+  '--name',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -274,14 +293,19 @@ const REPEATABLE_FLAGS = new Set([
   '--ssrf-allow-host',
   '--allow-origin',
   '--deny-origin',
+  '--tag',
 ])
 
-async function readStdinUtf8(): Promise<string> {
+async function readStdinBuffer(): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of process.stdin) {
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk)
   }
-  return Buffer.concat(chunks).toString('utf8')
+  return Buffer.concat(chunks)
+}
+
+async function readStdinUtf8(): Promise<string> {
+  return (await readStdinBuffer()).toString('utf8')
 }
 
 function parseArgv(argv: string[]) {
@@ -477,6 +501,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       : process.env.TROY_POLICY_FILE?.trim()
         ? path.resolve(process.env.TROY_POLICY_FILE.trim())
         : undefined
+  const profilesDirFlag =
+    typeof flags['profiles-dir'] === 'string' && flags['profiles-dir'].trim()
+      ? path.resolve(flags['profiles-dir'].trim())
+      : undefined
+  const resolvedProfileFlag =
+    typeof flags.profile === 'string' && flags.profile.trim()
+      ? resolveProfileFlag(flags.profile, { profilesDir: profilesDirFlag })
+      : undefined
   const daemonConfigFileFlag =
     typeof flags['daemon-config'] === 'string' && flags['daemon-config'].trim()
       ? path.resolve(flags['daemon-config'].trim())
@@ -569,12 +601,210 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return
   }
 
+  if (cmd === 'profile') {
+    const sub = (positional[1] || 'list').toLowerCase()
+    const profileOpts = { profilesDir: profilesDirFlag }
+
+    if (sub === 'list' || sub === 'ls') {
+      const profiles = listProfiles(profileOpts)
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: true, count: profiles.length, profiles }, null, 2))
+      } else {
+        console.log(
+          formatProfilesAscii(profiles, {
+            width: flags.width !== undefined ? Number(flags.width) : undefined,
+          }),
+        )
+      }
+      return
+    }
+
+    if (sub === 'show' || sub === 'info') {
+      const name = positional[2]
+      if (!name) {
+        console.error('Usage: troy-advanced profile show <name> [--profiles-dir <dir>] [--json]')
+        process.exit(1)
+      }
+      const profile = getProfile(name, profileOpts)
+      if (!profile) {
+        const payload = { ok: false, name, error: `Profile "${name}" not found` }
+        console.error(flags.json ? JSON.stringify(payload, null, 2) : payload.error)
+        process.exit(1)
+      }
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: true, profile }, null, 2))
+      } else {
+        console.log(formatProfileDetailAscii(profile))
+      }
+      return
+    }
+
+    if (sub === 'create') {
+      const name = positional[2]
+      if (!name) {
+        console.error(
+          'Usage: troy-advanced profile create <name> [--from <src>] [--description <text>] [--engine auto|chromium|lite] [--policy strict|standard|permissive] [--tag <tag>] [--profiles-dir <dir>] [--json]',
+        )
+        process.exit(1)
+      }
+      const rawEngine = typeof flags.engine === 'string' ? flags.engine : undefined
+      const profileEngine: EngineKind | undefined =
+        rawEngine === 'auto' || rawEngine === 'chromium' || rawEngine === 'lite' ? rawEngine : undefined
+      const res = createProfile(name, {
+        ...profileOpts,
+        description: typeof flags.description === 'string' ? flags.description : undefined,
+        engine: profileEngine,
+        policy: policyProfileFlag,
+        tags: multiFlags.tag,
+        from: typeof flags.from === 'string' ? flags.from : undefined,
+      })
+      if (!res.ok || !res.profile) {
+        console.error(flags.json ? JSON.stringify(res, null, 2) : res.error || 'Failed to create profile')
+        process.exit(1)
+      }
+      if (flags.json) {
+        console.log(JSON.stringify(res, null, 2))
+      } else {
+        const cloneNote = res.clonedFrom ? ` (cloned from "${res.clonedFrom}", ${res.copiedFiles ?? 0} files)` : ''
+        console.log(`Created profile "${res.profile.name}"${cloneNote} at ${res.profile.dir}`)
+        console.log(formatProfileDetailAscii(res.profile))
+      }
+      return
+    }
+
+    if (sub === 'delete' || sub === 'rm' || sub === 'remove') {
+      const name = positional[2]
+      if (!name) {
+        console.error('Usage: troy-advanced profile delete <name> [--force] [--profiles-dir <dir>] [--json]')
+        process.exit(1)
+      }
+      const res = deleteProfile(name, {
+        ...profileOpts,
+        force: Boolean(flags.force),
+      })
+      if (!res.ok) {
+        console.error(flags.json ? JSON.stringify(res, null, 2) : res.error || 'Failed to delete profile')
+        process.exit(1)
+      }
+      if (flags.json) {
+        console.log(JSON.stringify(res, null, 2))
+      } else {
+        console.log(
+          `Deleted profile "${res.name}" (${res.removedFiles ?? 0} files, ${res.freedBytes ?? 0} bytes freed)`,
+        )
+      }
+      return
+    }
+
+    if (sub === 'export') {
+      const name = positional[2]
+      if (!name) {
+        console.error(
+          'Usage: troy-advanced profile export <name> [file|-] [--encrypt] [--passphrase <pass>] [--gzip] [--include-cache] [--exclude-chrome-data] [--exclude-audit] [--profiles-dir <dir>] [--json]',
+        )
+        process.exit(1)
+      }
+      const outArg = typeof flags.out === 'string' ? flags.out : positional[3]
+      const passphrase =
+        typeof flags.passphrase === 'string'
+          ? flags.passphrase
+          : flags.encrypt
+            ? process.env.TROY_PROFILE_PASSPHRASE
+            : undefined
+      if (flags.encrypt && !passphrase) {
+        const errPayload = {
+          ok: false,
+          error: '--encrypt requires --passphrase <pass> or TROY_PROFILE_PASSPHRASE env var',
+        }
+        console.error(flags.json ? JSON.stringify(errPayload, null, 2) : errPayload.error)
+        process.exit(1)
+      }
+
+      const toStdout = !outArg || outArg === '-'
+      const res = exportProfile(name, {
+        ...profileOpts,
+        outFile: toStdout ? undefined : outArg,
+        encrypt: Boolean(flags.encrypt || passphrase),
+        passphrase,
+        gzip: flags.gzip ? true : undefined,
+        includeCache: Boolean(flags['include-cache']),
+        excludeChromeData: Boolean(flags['exclude-chrome-data']),
+        excludeAudit: Boolean(flags['exclude-audit']),
+      })
+      if (!res.ok || !res.data) {
+        console.error(flags.json ? JSON.stringify(res, null, 2) : res.error || 'Failed to export profile')
+        process.exit(1)
+      }
+      if (toStdout) {
+        process.stdout.write(res.data)
+      } else if (flags.json) {
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              name: res.name,
+              outFile: res.outFile,
+              encrypted: res.encrypted,
+              compressed: res.compressed,
+              totalFiles: res.totalFiles,
+              totalBytes: res.totalBytes,
+              outputBytes: res.outputBytes,
+              manifestSha256: res.manifestSha256,
+            },
+            null,
+            2,
+          ),
+        )
+      } else {
+        console.log(
+          `Exported profile "${res.name}" to ${res.outFile} (${res.totalFiles} files, ${res.outputBytes} bytes, encrypted=${res.encrypted}, compressed=${res.compressed}, sha256=${res.manifestSha256?.slice(0, 12)})`,
+        )
+      }
+      return
+    }
+
+    if (sub === 'import') {
+      const inArg = typeof flags.in === 'string' ? flags.in : positional[2]
+      if (!inArg) {
+        console.error(
+          'Usage: troy-advanced profile import <file|-> [--name <target>] [--passphrase <pass>] [--overwrite] [--force] [--profiles-dir <dir>] [--json]',
+        )
+        process.exit(1)
+      }
+      const passphrase =
+        typeof flags.passphrase === 'string' ? flags.passphrase : process.env.TROY_PROFILE_PASSPHRASE
+      const source: string | Buffer = inArg === '-' ? await readStdinBuffer() : inArg
+      const res = importProfile(source, {
+        ...profileOpts,
+        name: typeof flags.name === 'string' ? flags.name : undefined,
+        passphrase,
+        overwrite: Boolean(flags.overwrite || flags.force),
+        force: Boolean(flags.force),
+      })
+      if (!res.ok || !res.profile) {
+        console.error(flags.json ? JSON.stringify(res, null, 2) : res.error || 'Failed to import profile')
+        process.exit(1)
+      }
+      if (flags.json) {
+        console.log(JSON.stringify(res, null, 2))
+      } else {
+        console.log(
+          `Imported profile "${res.profile.name}" (${res.importedFiles ?? 0} files, ${res.importedBytes ?? 0} bytes, encrypted=${Boolean(res.encrypted)}, overwritten=${Boolean(res.overwritten)})`,
+        )
+        console.log(formatProfileDetailAscii(res.profile))
+      }
+      return
+    }
+
+    console.error(
+      'Usage: troy-advanced profile <list|show|create|delete|export|import> [args] [--profiles-dir <dir>] [--json]',
+    )
+    process.exit(1)
+  }
+
   if (cmd === 'policy') {
     const sub = positional[1] ?? 'show'
-    const defaultProfileDir =
-      typeof flags.profile === 'string' && flags.profile.trim()
-        ? path.resolve(flags.profile.trim())
-        : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'troy-advanced', 'profile')
+    const defaultProfileDir = resolvedProfileFlag ?? getDefaultProfileDir()
     const explicitFile =
       typeof flags.file === 'string' && flags.file.trim()
         ? path.resolve(flags.file.trim())
@@ -722,7 +952,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
     const configFile = defaultDaemonConfigPath({
       configFile: explicitConfig,
-      profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
+      profileDir: resolvedProfileFlag,
       endpointFile: endpointFlag,
     })
 
@@ -864,7 +1094,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     } else {
       const manager = await BrowserManager.create({
         engine,
-        profileDir: typeof flags.profile === 'string' ? path.resolve(flags.profile) : undefined,
+        profileDir: resolvedProfileFlag,
         remoteCdpPort: remoteCdpPortFlag,
         cdpUrl: cdpUrlFlag,
         trackerBlocking,
@@ -1020,7 +1250,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       cdpPort: flags['cdp-port'] ? Number(flags['cdp-port']) : undefined,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
-      profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
+      profileDir: resolvedProfileFlag,
       endpointFile: endpointFlag,
       compatTroy: Boolean(flags['compat-troy']),
       initialUrl: typeof flags.url === 'string' ? flags.url : undefined,
@@ -1176,7 +1406,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (cmd === 'browse') {
     const manager = await BrowserManager.create({
       engine,
-      profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
+      profileDir: resolvedProfileFlag,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
       trackerBlocking,
@@ -1229,7 +1459,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     const framing = parseMcpFramingMode(rawFraming)
     const manager = await BrowserManager.create({
       engine,
-      profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
+      profileDir: resolvedProfileFlag,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
       trackerBlocking,
@@ -1259,7 +1489,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (cmd === 'pipe') {
     const manager = await BrowserManager.create({
       engine,
-      profileDir: typeof flags.profile === 'string' ? flags.profile : undefined,
+      profileDir: resolvedProfileFlag,
       remoteCdpPort: remoteCdpPortFlag,
       cdpUrl: cdpUrlFlag,
       trackerBlocking,
@@ -1293,7 +1523,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       process.exit(1)
     }
 
-    const explicitProfile = typeof flags.profile === 'string' ? flags.profile : undefined
+    const explicitProfile = resolvedProfileFlag
     const useDaemon = !explicitProfile && !flags.oneshot
     const live = useDaemon ? readLiveEndpoint(endpointFlag) : null
     const domainFilter = typeof flags.domain === 'string' ? flags.domain : undefined
@@ -1475,7 +1705,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       process.exit(1)
     }
 
-    const explicitProfile = typeof flags.profile === 'string' ? flags.profile : undefined
+    const explicitProfile = resolvedProfileFlag
     const useDaemon = !explicitProfile && !flags.oneshot
     const live = useDaemon ? readLiveEndpoint(endpointFlag) : null
     const originFilter = typeof flags.origin === 'string' ? flags.origin : undefined

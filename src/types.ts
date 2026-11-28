@@ -1260,3 +1260,74 @@ export interface OriginRulesSummary {
 }
 
 export type OriginRuleAction = 'list' | 'allow' | 'deny' | 'unallow' | 'undeny' | 'clear'
+
+export interface ProfileMetadata {
+  version: 1
+  name: string
+  description?: string
+  createdAt: string
+  updatedAt: string
+  engine?: EngineKind
+  policy?: PolicyProfileName
+  tags?: string[]
+}
+
+export interface ProfileSummary {
+  name: string
+  dir: string
+  isDefault: boolean
+  description?: string
+  createdAt?: string
+  updatedAt?: string
+  engine?: EngineKind
+  policy?: PolicyProfileName
+  tags?: string[]
+  fileCount: number
+  sizeBytes: number
+  hasCookies: boolean
+  hasMemory: boolean
+  hasPolicy: boolean
+  hasDaemonConfig: boolean
+  hasChromeData: boolean
+  hasAuditLog: boolean
+  daemonRunning: boolean
+}
+
+export interface ProfileExportFileEntry {
+  /** POSIX relative path inside the profile directory. */
+  path: string
+  /** File permission mode bits (masked to 0o777). */
+  mode: number
+  /** Base64-encoded file contents. */
+  contentBase64: string
+  /** Original byte length. */
+  sizeBytes: number
+  /** SHA-256 hex digest of raw bytes. */
+  sha256: string
+}
+
+export interface ProfileExportBundle {
+  format: 'troy-advanced-profile-bundle'
+  version: 1
+  profileName: string
+  exportedAt: string
+  metadata?: ProfileMetadata
+  files: ProfileExportFileEntry[]
+  totalFiles: number
+  totalBytes: number
+  /** SHA-256 hex digest over sorted file path + sha256 manifest. */
+  manifestSha256: string
+}
+
+export interface EncryptedProfileBundle {
+  format: 'troy-advanced-profile-bundle-encrypted'
+  version: 1
+  algorithm: 'aes-256-gcm'
+  kdf: 'scrypt'
+  kdfParams: { N: number; r: number; p: number; keyLen: number }
+  salt: string
+  iv: string
+  tag: string
+  ciphertext: string
+}
+
