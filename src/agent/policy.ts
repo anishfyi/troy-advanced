@@ -1,8 +1,9 @@
 // Deterministic autonomy policy modeled directly on Troy's refusal rules.
 // The AI agent can request an action; only this deterministic code authorizes it.
 
-import type { ElementDescriptor, PolicyDecision } from '../types.js'
+import type { ElementDescriptor, PolicyDecision, SsrfProtectionOptions } from '../types.js'
 import { exactOrigin } from './omnibox.js'
+import { checkUrlSsrfSync } from './ssrf.js'
 
 export const SENSITIVE_PATTERNS = Object.freeze({
   secret:
@@ -65,8 +66,12 @@ export function authorizeAction(request: {
   currentUrl?: string
   allowSubmit?: boolean
   allowedOrigins: Iterable<string>
+  blockPrivateNet?: boolean
+  ssrf?: SsrfProtectionOptions
 }): PolicyDecision {
   const allowed = new Set(request.allowedOrigins)
+  const ssrfOpts: SsrfProtectionOptions | undefined =
+    request.ssrf ?? (request.blockPrivateNet ? { enabled: true } : undefined)
 
   if (request.name === 'page_navigate') {
     const origin = exactOrigin(request.targetUrl)
@@ -76,6 +81,18 @@ export function authorizeAction(request: {
         status: 'blocked',
         code: 'scheme',
         reason: 'the agent may navigate only to HTTP or HTTPS pages',
+      }
+    }
+    if (ssrfOpts?.enabled && request.targetUrl) {
+      const ssrf = checkUrlSsrfSync(request.targetUrl, ssrfOpts)
+      if (ssrf.blocked && ssrf.reason) {
+        return {
+          allowed: false,
+          status: 'blocked',
+          code: 'ssrf',
+          reason: ssrf.reason,
+          origin,
+        }
       }
     }
     if (!allowed.has(origin)) {
@@ -119,6 +136,18 @@ export function authorizeAction(request: {
   }
 
   if (item.href) {
+    if (ssrfOpts?.enabled) {
+      const ssrf = checkUrlSsrfSync(item.href, ssrfOpts)
+      if (ssrf.blocked && ssrf.reason) {
+        return {
+          allowed: false,
+          status: 'blocked',
+          code: 'ssrf',
+          reason: ssrf.reason,
+          origin: exactOrigin(item.href) ?? undefined,
+        }
+      }
+    }
     const origin = exactOrigin(item.href)
     if (origin && !allowed.has(origin)) {
       return {

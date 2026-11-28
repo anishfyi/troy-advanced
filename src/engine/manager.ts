@@ -44,6 +44,8 @@ import type {
   Rect,
   SettleOptions,
   SettleResult,
+  SsrfProtectionOptions,
+  SsrfProtectionStats,
   StorageClearOptions,
   StorageClearResult,
   StorageExportOptions,
@@ -77,6 +79,7 @@ import {
 import { SessionRegistry } from '../agent/sessions.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
+import { SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
 import {
   estimateTokens,
@@ -172,6 +175,7 @@ export interface BrowserManagerOptions {
   cacheHooks?: ResponseCacheHooks
   audit?: AuditLogOptions
   loopGuard?: LoopGuardOptions
+  ssrf?: SsrfProtectionOptions
 }
 
 export class BrowserManager {
@@ -180,6 +184,7 @@ export class BrowserManager {
   readonly memory: PageMemory | null
   readonly audit: AuditLogger
   readonly loopGuard: AgentLoopGuard
+  readonly ssrf: SsrfGuard
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
@@ -197,12 +202,14 @@ export class BrowserManager {
     memory: PageMemory | null,
     audit: AuditLogger,
     loopGuard: AgentLoopGuard,
+    ssrf: SsrfGuard,
   ) {
     this.engine = engine
     this.profileDir = profileDir
     this.memory = memory
     this.audit = audit
     this.loopGuard = loopGuard
+    this.ssrf = ssrf
     if (engine.onCrashRecovery) {
       this.unsubscribeCrash = engine.onCrashRecovery((ev) => {
         if (ev.kind === 'chromium_recovered') {
@@ -233,6 +240,7 @@ export class BrowserManager {
       ...opts.downloads,
       quarantineDir: opts.downloads?.quarantineDir || path.join(profileDir, 'quarantine'),
     }
+    const ssrfGuard = new SsrfGuard(opts.ssrf)
 
     let engine: BrowserEngine
     const requested = opts.engine ?? 'auto'
@@ -248,6 +256,7 @@ export class BrowserManager {
         robotsRetryHooks: opts.robotsRetryHooks,
         cache: opts.cache,
         cacheHooks: opts.cacheHooks,
+        ssrfGuard,
       })
     } else if (requested === 'chromium' || opts.cdpUrl) {
       // Explicit --engine chromium or explicit --cdp-url must fail loudly if unreachable
@@ -263,6 +272,7 @@ export class BrowserManager {
         crashRecovery: opts.crashRecovery,
         downloads: downloadsOpts,
         dialogs: opts.dialogs,
+        ssrfGuard,
       })
     } else {
       // Auto: prefer Chromium if installed and launchable, gracefully fall back to Lite on minimal EC2/containers
@@ -278,6 +288,7 @@ export class BrowserManager {
             crashRecovery: opts.crashRecovery,
             downloads: downloadsOpts,
             dialogs: opts.dialogs,
+            ssrfGuard,
           })
         } catch {
           engine = new LiteBrowserEngine({
@@ -291,6 +302,7 @@ export class BrowserManager {
             robotsRetryHooks: opts.robotsRetryHooks,
             cache: opts.cache,
             cacheHooks: opts.cacheHooks,
+            ssrfGuard,
           })
         }
       } else {
@@ -305,6 +317,7 @@ export class BrowserManager {
           robotsRetryHooks: opts.robotsRetryHooks,
           cache: opts.cache,
           cacheHooks: opts.cacheHooks,
+          ssrfGuard,
         })
       }
     }
@@ -317,7 +330,11 @@ export class BrowserManager {
       redactArgs: opts.audit?.redactArgs,
     })
     const loopGuard = new AgentLoopGuard(opts.loopGuard)
-    return new BrowserManager(engine, profileDir, memory, audit, loopGuard)
+    return new BrowserManager(engine, profileDir, memory, audit, loopGuard, ssrfGuard)
+  }
+
+  getSsrfStats(): SsrfProtectionStats {
+    return this.ssrf.getStats()
   }
 
   getLoopGuardStats(): LoopGuardStats {
@@ -573,6 +590,40 @@ export class BrowserManager {
       })
       return { ok: false, error: 'grant needs an http(s) origin' }
     }
+    if (this.ssrf.enabled) {
+      const ssrfRes = this.ssrf.checkSync(origin)
+      if (ssrfRes.blocked && ssrfRes.reason) {
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'origin_grant',
+          summary: origin,
+          ok: false,
+          durationMs,
+          error: ssrfRes.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'origin_grant',
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'ssrf', reason: ssrfRes.reason },
+          durationMs,
+          args: { origin: originOrUrl },
+          summary: origin,
+          error: ssrfRes.reason,
+        })
+        return { ok: false, status: 'blocked', code: 'ssrf', error: ssrfRes.reason } as {
+          ok: boolean
+          origin?: string
+          sessionId?: string
+          error?: string
+        }
+      }
+    }
     if (sessionId) {
       this.sessions.grantOrigin(sessionId, origin)
     } else {
@@ -642,6 +693,41 @@ export class BrowserManager {
         return { ok: false, error }
       }
       targetUrl = resolved.url
+      if (this.ssrf.enabled) {
+        const ssrfRes = await this.ssrf.checkAsync(targetUrl)
+        if (ssrfRes.blocked && ssrfRes.reason) {
+          const durationMs = Date.now() - startedAt
+          this.recordActivity({
+            ts: startedAt,
+            ...(sessionId ? { sessionId } : {}),
+            tool: 'tab_open',
+            summary: targetUrl,
+            ok: false,
+            durationMs,
+            error: ssrfRes.reason,
+          })
+          this.audit.record({
+            tsMs: startedAt,
+            kind: 'refusal',
+            tool: 'tab_open',
+            ...(sessionId ? { sessionId } : {}),
+            ok: false,
+            refused: true,
+            refusal: { status: 'blocked', code: 'ssrf', reason: ssrfRes.reason },
+            durationMs,
+            args: { url: inputUrl },
+            summary: targetUrl,
+            error: ssrfRes.reason,
+          })
+          return {
+            ok: false,
+            status: 'blocked',
+            code: 'ssrf',
+            category: ssrfRes.category,
+            error: ssrfRes.reason,
+          } as { ok: boolean; id?: number; url?: string; title?: string; sessionId?: string; error?: string }
+        }
+      }
       const origin = exactOrigin(targetUrl)
       if (origin) {
         if (sessionId) {
@@ -652,7 +738,44 @@ export class BrowserManager {
       }
     }
 
-    const driver = await this.engine.createTab(targetUrl)
+    let driver: TabDriver
+    try {
+      driver = await this.engine.createTab(targetUrl)
+    } catch (err) {
+      if (isSsrfBlockedError(err)) {
+        const durationMs = Date.now() - startedAt
+        this.recordActivity({
+          ts: startedAt,
+          ...(sessionId ? { sessionId } : {}),
+          tool: 'tab_open',
+          summary: targetUrl ?? inputUrl ?? '',
+          ok: false,
+          durationMs,
+          error: err.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: 'tab_open',
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'ssrf', reason: err.reason },
+          durationMs,
+          args: { url: inputUrl },
+          summary: targetUrl ?? inputUrl ?? '',
+          error: err.reason,
+        })
+        return {
+          ok: false,
+          status: 'blocked',
+          code: 'ssrf',
+          category: err.category,
+          error: err.reason,
+        } as { ok: boolean; id?: number; url?: string; title?: string; sessionId?: string; error?: string }
+      }
+      throw err
+    }
     const session: TabSession = {
       driver,
       elements: new ElementRegistry(),
@@ -1473,6 +1596,52 @@ export class BrowserManager {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const durationMs = Date.now() - startedAt
+      if (isSsrfBlockedError(err)) {
+        this.loopGuard.recordFailure({
+          tool: name,
+          args,
+          tabId: resolvedTabId,
+          sessionId,
+          url: fromUrl,
+          epoch: fromEpoch,
+          error: err.reason,
+          code: 'ssrf',
+          status: 'blocked',
+          nowMs: Date.now(),
+        })
+        this.recordActivity({
+          ts: startedAt,
+          tabId: resolvedTabId,
+          ...(sessionId ? { sessionId } : {}),
+          tool: name,
+          summary,
+          ok: false,
+          durationMs,
+          error: err.reason,
+        })
+        this.audit.record({
+          tsMs: startedAt,
+          kind: 'refusal',
+          tool: name,
+          tabId: resolvedTabId,
+          ...(sessionId ? { sessionId } : {}),
+          ok: false,
+          refused: true,
+          refusal: { status: 'blocked', code: 'ssrf', reason: err.reason },
+          durationMs,
+          args,
+          summary,
+          fromUrl,
+          error: err.reason,
+        })
+        return {
+          ok: false,
+          status: 'blocked',
+          code: 'ssrf',
+          category: err.category,
+          error: err.reason,
+        }
+      }
       this.loopGuard.recordFailure({
         tool: name,
         args,
@@ -1868,9 +2037,22 @@ export class BrowserManager {
           name: 'page_navigate',
           targetUrl: resolved.url,
           allowedOrigins,
+          ssrf: this.ssrf.getOptions(),
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
+        }
+        if (this.ssrf.enabled) {
+          const ssrfRes = await this.ssrf.checkAsync(resolved.url)
+          if (ssrfRes.blocked && ssrfRes.reason) {
+            return {
+              ok: false,
+              status: 'blocked',
+              code: 'ssrf',
+              category: ssrfRes.category,
+              error: ssrfRes.reason,
+            }
+          }
         }
         const fromUrl = session.driver.getUrl()
         const nav = await session.driver.navigate(resolved.url)
@@ -1889,6 +2071,7 @@ export class BrowserManager {
           item: resolved.item,
           allowSubmit: Boolean(args.allowSubmit),
           allowedOrigins,
+          ssrf: this.ssrf.getOptions(),
         })
         if (!decision.allowed) {
           return { ok: false, ...decision, error: decision.reason }
@@ -1915,6 +2098,7 @@ export class BrowserManager {
               item: domRec.item,
               allowSubmit: Boolean(args.allowSubmit),
               allowedOrigins,
+              ssrf: this.ssrf.getOptions(),
             })
             if (!reDecision.allowed) {
               return { ok: false, ...reDecision, error: reDecision.reason }

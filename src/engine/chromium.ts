@@ -82,6 +82,7 @@ import { normalizeStorageArea, normalizeStorageMap, normalizeStorageOrigin } fro
 import { DOM_SETTLE_PROBE_SCRIPT, NetworkIdleTracker, waitForPageSettle } from './settle.js'
 import { SHADOW_DOM_QUERY_HELPER } from './shadow-dom.js'
 import { CdpTrackerBlocker } from './tracker-blocker.js'
+import type { SsrfGuard } from '../agent/ssrf.js'
 import type { BrowserEngine, TabDriver } from './types.js'
 import { describeWaitCondition, matchesText, matchesUrlPattern, pollUntil } from './wait.js'
 
@@ -632,6 +633,7 @@ export class ChromiumTab implements TabDriver {
   private recoveryHost?: ChromiumTabRecoveryHost
   private downloads?: DownloadQuarantineManager
   private dialogs?: DialogManager
+  private ssrfGuard?: SsrfGuard
 
   constructor(
     id: number,
@@ -643,6 +645,7 @@ export class ChromiumTab implements TabDriver {
     recoveryHost?: ChromiumTabRecoveryHost,
     downloads?: DownloadQuarantineManager,
     dialogs?: DialogManager,
+    ssrfGuard?: SsrfGuard,
   ) {
     this.id = id
     this.targetId = targetId
@@ -652,21 +655,34 @@ export class ChromiumTab implements TabDriver {
     this.recoveryHost = recoveryHost
     this.downloads = downloads
     this.dialogs = dialogs
+    this.ssrfGuard = ssrfGuard
     this.emulation = initialEmulation ? cloneEmulationProfile(initialEmulation) : defaultEmulationProfile()
     this.trackerBlocker = this.createTrackerBlocker(cdp)
     this.bindCdpListeners()
   }
 
   private createTrackerBlocker(cdp: CdpConnection): CdpTrackerBlocker {
-    return new CdpTrackerBlocker(cdp, this.trackerBlocking, {
-      onBlocked: (ev) => {
-        this.blockedByFetch.set(ev.url, ev.reason)
-        if (this.blockedByFetch.size > 200) {
-          const first = this.blockedByFetch.keys().next().value
-          if (first !== undefined) this.blockedByFetch.delete(first)
-        }
+    return new CdpTrackerBlocker(
+      cdp,
+      this.trackerBlocking,
+      {
+        onBlocked: (ev) => {
+          this.blockedByFetch.set(ev.url, ev.reason)
+          if (this.blockedByFetch.size > 200) {
+            const first = this.blockedByFetch.keys().next().value
+            if (first !== undefined) this.blockedByFetch.delete(first)
+          }
+        },
+        onSsrfBlocked: (ev) => {
+          this.blockedByFetch.set(ev.url, `ssrf:${ev.category}`)
+          if (this.blockedByFetch.size > 200) {
+            const first = this.blockedByFetch.keys().next().value
+            if (first !== undefined) this.blockedByFetch.delete(first)
+          }
+        },
       },
-    })
+      this.ssrfGuard,
+    )
   }
 
   private runWithRecovery<T>(fn: () => Promise<T>): Promise<T> {
@@ -1493,6 +1509,9 @@ export class ChromiumTab implements TabDriver {
   }
 
   private async navigateDirect(url: string): Promise<{ url: string; title: string }> {
+    if (this.ssrfGuard?.enabled) {
+      await this.ssrfGuard.assertAllowed(url)
+    }
     this.loading = true
     const loadPromise = new Promise<void>((resolve) => {
       let done = false
@@ -2397,6 +2416,7 @@ export interface ChromiumLaunchOptions {
   crashRecovery?: CrashRecoveryOptions
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
+  ssrfGuard?: SsrfGuard
 }
 
 export class ChromiumBrowserEngine implements BrowserEngine {
@@ -2414,6 +2434,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
   private recoveryOpts: Required<CrashRecoveryOptions>
   private downloads: DownloadQuarantineManager
   private dialogs: DialogManager
+  private ssrfGuard?: SsrfGuard
   private closing = false
   private status: CrashRecoveryStatus = 'healthy'
   private restartCount = 0
@@ -2442,6 +2463,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
     crashRecovery?: CrashRecoveryOptions
     downloads?: DownloadPolicyOptions
     dialogs?: DialogPolicyOptions
+    ssrfGuard?: SsrfGuard
   }) {
     this._cdpPort = cfg.cdpPort
     this.preferredCdpPort = cfg.preferredCdpPort
@@ -2458,6 +2480,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       : path.join(os.tmpdir(), `troy-advanced-quarantine-${process.pid}`)
     this.downloads = new DownloadQuarantineManager(cfg.downloads, defaultQuarantineDir)
     this.dialogs = new DialogManager(cfg.dialogs)
+    this.ssrfGuard = cfg.ssrfGuard
     if (this.proc) {
       this.attachProcessExitHandler(this.proc)
     }
@@ -2666,6 +2689,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         crashRecovery: { ...opts.crashRecovery, enabled: false },
         downloads: opts.downloads,
         dialogs: opts.dialogs,
+        ssrfGuard: opts.ssrfGuard,
       })
     }
 
@@ -2681,6 +2705,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         crashRecovery: { ...opts.crashRecovery, enabled: false },
         downloads: opts.downloads,
         dialogs: opts.dialogs,
+        ssrfGuard: opts.ssrfGuard,
       })
     }
 
@@ -2710,6 +2735,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
       crashRecovery: opts.crashRecovery,
       downloads: opts.downloads,
       dialogs: opts.dialogs,
+      ssrfGuard: opts.ssrfGuard,
     })
   }
 
@@ -2993,6 +3019,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
           },
           this.downloads,
           this.dialogs,
+          this.ssrfGuard,
         )
         await created.init()
         this.liveTabs.add(created)
@@ -3016,6 +3043,7 @@ export class ChromiumBrowserEngine implements BrowserEngine {
         },
         this.downloads,
         this.dialogs,
+        this.ssrfGuard,
       )
       await created.init()
       this.liveTabs.add(created)

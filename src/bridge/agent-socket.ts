@@ -66,6 +66,7 @@ export async function createAgentSocket(
             dialogs: manager.getDialogStats(),
             audit: manager.getAuditStats(),
             loopGuard: manager.getLoopGuardStats(),
+            ssrf: manager.getSsrfStats(),
             stream: streamHub.getStats(),
             ws: wsHub?.getStats() ?? {
               clients: 0,

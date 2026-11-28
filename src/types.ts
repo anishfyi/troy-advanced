@@ -921,3 +921,65 @@ export interface LoopGuardStats {
   byCategory: Record<string, number>
   byTool: Record<string, number>
 }
+
+export type SsrfBlockCategory =
+  | 'imds'
+  | 'loopback'
+  | 'private-ipv4'
+  | 'link-local'
+  | 'cgnat'
+  | 'unspecified'
+  | 'multicast-reserved'
+  | 'ipv6-private'
+  | 'ipv6-mapped-ipv4'
+  | 'metadata-host'
+  | 'dns-rebinding'
+  | 'custom-blocked'
+
+export interface SsrfDnsRecord {
+  address: string
+  family: 4 | 6
+}
+
+export interface SsrfProtectionOptions {
+  /** Block private networks, loopback, link-local, and cloud IMDS endpoints (e.g. --block-private-net). */
+  enabled?: boolean
+  /** Resolve hostnames via DNS and block if any resolved IP is private/IMDS/loopback (default: true when enabled). */
+  resolveDns?: boolean
+  /** Explicit allowlist of hostnames or origins that bypass private-net blocking. */
+  allowHosts?: string[]
+  /** Additional hostnames to block. */
+  extraBlockedHosts?: string[]
+  /** Optional custom DNS resolver hook (primarily for deterministic testing). */
+  dnsLookup?: (hostname: string) => Promise<SsrfDnsRecord[]>
+}
+
+export interface SsrfCheckResult {
+  allowed: boolean
+  blocked: boolean
+  url?: string
+  hostname?: string
+  ip?: string
+  category?: SsrfBlockCategory
+  reason?: string
+}
+
+export interface SsrfBlockedEntry {
+  ts: number
+  url: string
+  hostname?: string
+  ip?: string
+  category: SsrfBlockCategory
+  reason: string
+}
+
+export interface SsrfProtectionStats {
+  enabled: boolean
+  resolveDns: boolean
+  allowHosts: string[]
+  extraBlockedHosts: string[]
+  checkedCount: number
+  blockedCount: number
+  blockedByCategory: Record<string, number>
+  recentBlocked: SsrfBlockedEntry[]
+}

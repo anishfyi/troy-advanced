@@ -45,6 +45,7 @@ import type {
 } from '../types.js'
 import { humanizeFormName } from '../ascii/layout.js'
 import { isTrackerHost } from '../agent/omnibox.js'
+import { SsrfBlockedError, SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
 import { CookieJar } from './cookie-jar.js'
 import { DialogManager } from './dialogs.js'
 import {
@@ -1531,6 +1532,7 @@ class LiteTab implements TabDriver {
   private maxMetaRefreshDelaySeconds: number
   private robotsRetry: RobotsRetryController
   private responseCache: ResponseCache
+  private ssrfGuard?: SsrfGuard
 
   constructor(
     id: number,
@@ -1542,6 +1544,7 @@ class LiteTab implements TabDriver {
     maxMetaRefreshDelaySeconds = 5,
     robotsRetry?: RobotsRetryController,
     responseCache?: ResponseCache,
+    ssrfGuard?: SsrfGuard,
   ) {
     this.id = id
     this.cookieJar = cookieJar
@@ -1552,6 +1555,7 @@ class LiteTab implements TabDriver {
     this.maxMetaRefreshDelaySeconds = maxMetaRefreshDelaySeconds
     this.robotsRetry = robotsRetry ?? new RobotsRetryController()
     this.responseCache = responseCache ?? new ResponseCache()
+    this.ssrfGuard = ssrfGuard
   }
 
   getEmulation(): EmulationProfile {
@@ -1637,6 +1641,9 @@ class LiteTab implements TabDriver {
         cachedEntryHit = null
         finalCacheStatus = 'bypass'
         finalFromCache = false
+        if (this.ssrfGuard?.enabled) {
+          await this.ssrfGuard.assertAllowed(currentUrl)
+        }
         if (isTrackerHost(currentUrl)) {
           throw new Error(`Blocked tracker host: ${currentUrl}`)
         }
@@ -2018,14 +2025,19 @@ class LiteTab implements TabDriver {
       return { url: this.url, title: this.title }
     } catch (err) {
       const isRobotsBlocked = err instanceof RobotsDisallowedError
+      const isSsrfBlocked = isSsrfBlockedError(err)
       this.networkRecorder.record({
-        url: isRobotsBlocked ? err.url : targetUrl,
+        url: isRobotsBlocked ? err.url : isSsrfBlocked && err.url ? err.url : targetUrl,
         method: init?.method ?? 'GET',
         ok: false,
         durationMs: Date.now() - started,
         ts: Date.now(),
         ...(totalRetriesForPage > 0 ? { retries: totalRetriesForPage } : {}),
-        ...(isRobotsBlocked ? { blocked: true, blockedReason: 'robots.txt' } : {}),
+        ...(isRobotsBlocked
+          ? { blocked: true, blockedReason: 'robots.txt' }
+          : isSsrfBlocked
+            ? { blocked: true, blockedReason: `ssrf:${err.category}` }
+            : {}),
         error: String((err as Error)?.message ?? err),
         requestHeaders: requestHeadersMap,
         requestBody: requestBodyStr,
@@ -2874,6 +2886,8 @@ export interface LiteEngineOptions {
   cache?: ResponseCacheOptions
   /** Optional clock hook for deterministic cache testing. */
   cacheHooks?: ResponseCacheHooks
+  /** Optional SSRF protection guard (`--block-private-net`). */
+  ssrfGuard?: SsrfGuard
 }
 
 export class LiteBrowserEngine implements BrowserEngine {
@@ -2888,6 +2902,7 @@ export class LiteBrowserEngine implements BrowserEngine {
   private maxMetaRefreshDelaySeconds: number
   private robotsRetry: RobotsRetryController
   private responseCache: ResponseCache
+  private ssrfGuard?: SsrfGuard
 
   constructor(opts: LiteEngineOptions = {}) {
     this.defaultEmulation = resolveEmulationProfile(opts.emulation)
@@ -2914,6 +2929,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       hooks: opts.robotsRetryHooks,
     })
     this.responseCache = new ResponseCache(opts.cache, opts.cacheHooks)
+    this.ssrfGuard = opts.ssrfGuard
   }
 
   getCachePolicy(): ResolvedResponseCachePolicy {
@@ -3056,6 +3072,7 @@ export class LiteBrowserEngine implements BrowserEngine {
       this.maxMetaRefreshDelaySeconds,
       this.robotsRetry,
       this.responseCache,
+      this.ssrfGuard,
     )
     if (initialUrl) {
       await tab.navigate(initialUrl)

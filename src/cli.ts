@@ -12,9 +12,11 @@ import type {
   EmulationOptions,
   EngineKind,
   OriginStorageSnapshot,
+  SsrfProtectionOptions,
   TrackerBlockingOptions,
   TrackerBlockMode,
 } from './types.js'
+import { parseSsrfAllowHosts } from './agent/ssrf.js'
 import { BrowserManager } from './engine/manager.js'
 import {
   computeAuditStats,
@@ -72,7 +74,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--block-private-net] [--ssrf-allow-host <host>] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -208,9 +210,10 @@ const VALUE_FLAGS = new Set([
   '--poll-ms',
   '--heartbeat-ms',
   '--max-frames',
+  '--ssrf-allow-host',
 ])
 
-const REPEATABLE_FLAGS = new Set(['--header', '--remove-header', '--var'])
+const REPEATABLE_FLAGS = new Set(['--header', '--remove-header', '--var', '--ssrf-allow-host'])
 
 async function readStdinUtf8(): Promise<string> {
   const chunks: Buffer[] = []
@@ -340,6 +343,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
             : {}),
         }
       : undefined
+  const envBlockPrivateNet =
+    process.env.TROY_BLOCK_PRIVATE_NET === '1' ||
+    process.env.TROY_BLOCK_PRIVATE_NET?.toLowerCase() === 'true'
+  const blockPrivateNetFlag = Boolean(flags['block-private-net']) || envBlockPrivateNet
+  const ssrfAllowHosts = parseSsrfAllowHosts(multiFlags['ssrf-allow-host'] ?? [])
+  const ssrfOpts: SsrfProtectionOptions | undefined = blockPrivateNetFlag
+    ? {
+        enabled: true,
+        ...(ssrfAllowHosts.length > 0 ? { allowHosts: ssrfAllowHosts } : {}),
+      }
+    : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -467,6 +481,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         downloads: downloadsOpts,
         dialogs: dialogsOpts,
         audit: auditOpts,
+        ssrf: ssrfOpts,
         emulation: cliEmulation,
         memoryEnabled: false,
       })
@@ -603,6 +618,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
       audit: auditOpts,
+      ssrf: ssrfOpts,
     }
 
     if (sub === 'run') {
@@ -644,6 +660,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
       audit: auditOpts,
+      ssrf: ssrfOpts,
     })
     try {
       const inspectorTabFlag =
@@ -688,6 +705,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
       audit: auditOpts,
+      ssrf: ssrfOpts,
     })
     try {
       await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
@@ -709,6 +727,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       downloads: downloadsOpts,
       dialogs: dialogsOpts,
       audit: auditOpts,
+      ssrf: ssrfOpts,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1183,6 +1202,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       cdpUrl: cdpUrlFlag,
       trackerBlocking,
       emulation: cliEmulation,
+      ssrf: ssrfOpts,
     })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })

@@ -10,6 +10,7 @@ import type {
   DownloadPolicyOptions,
   EmulationOptions,
   EngineKind,
+  SsrfProtectionOptions,
   TrackerBlockingOptions,
 } from '../types.js'
 import { BrowserManager } from '../engine/manager.js'
@@ -39,6 +40,7 @@ export interface DaemonOptions {
   downloads?: DownloadPolicyOptions
   dialogs?: DialogPolicyOptions
   audit?: AuditLogOptions
+  ssrf?: SsrfProtectionOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -54,6 +56,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     downloads: opts.downloads,
     dialogs: opts.dialogs,
     audit: opts.audit,
+    ssrf: opts.ssrf,
   })
 
   if (opts.initialUrl) {
@@ -121,6 +124,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       agentWsEndpoint: socket.wsUrl,
       cdpPort: manager.engine.cdpPort,
       ...(manager.engine.remoteCdpUrl ? { remoteCdpUrl: manager.engine.remoteCdpUrl } : {}),
+      blockPrivateNet: manager.ssrf.enabled,
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
     }),
@@ -184,6 +188,14 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   }
   if (opts.audit?.filePath) {
     args.push('--audit-file', opts.audit.filePath)
+  }
+  if (opts.ssrf?.enabled) {
+    args.push('--block-private-net')
+    if (opts.ssrf.allowHosts && opts.ssrf.allowHosts.length > 0) {
+      for (const h of opts.ssrf.allowHosts) {
+        args.push('--ssrf-allow-host', h)
+      }
+    }
   }
   if (opts.emulation?.viewport) {
     const vp = opts.emulation.viewport

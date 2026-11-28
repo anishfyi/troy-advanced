@@ -83,7 +83,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M70: End-to-end integration test proving Dexter-style HTTP client + MCP client + Pipe client all interoperate cleanly
 
 ## Track 6: Security, Refusals & Sandboxing (Milestones 71–80)
-- [ ] M71: SSRF protection mode (`--block-private-net`) to optionally block AWS IMDS `169.254.169.254`, `10.0.0.0/8`, `127.0.0.1` on multi-tenant EC2 deployments
+- [x] M71: SSRF protection mode (`--block-private-net`) to optionally block AWS IMDS `169.254.169.254`, `10.0.0.0/8`, `127.0.0.1` on multi-tenant EC2 deployments
 - [ ] M72: Strict DNS rebinding & Host header validation tests on Agent Socket
 - [ ] M73: Timing-safe token comparison (`crypto.timingSafeEqual`) on `x-troy-agent` header
 - [ ] M74: Prompt-injection sanitizer flag (`--untrusted-markers`) wrapping web page text in explicit untrusted delimiters for AI safety

@@ -2,7 +2,8 @@
 // backed by the single-source-of-truth tracker list in `src/agent/omnibox.ts`.
 
 import { buildCdpTrackerUrlPatterns, isTrackerOrBeaconUrl } from '../agent/omnibox.js'
-import type { BlockedTrackerStats, TrackerBlockingOptions, TrackerBlockMode } from '../types.js'
+import type { SsrfGuard } from '../agent/ssrf.js'
+import type { BlockedTrackerStats, SsrfBlockCategory, TrackerBlockingOptions, TrackerBlockMode } from '../types.js'
 
 export interface CdpLike {
   on(method: string, handler: (params: Record<string, unknown>) => void): () => void
@@ -21,8 +22,18 @@ export interface BlockedRequestEvent {
   matched?: string
 }
 
+export interface SsrfBlockedRequestEvent {
+  url: string
+  method: string
+  resourceType?: string
+  category: SsrfBlockCategory
+  reason: string
+  ip?: string
+}
+
 export interface CdpTrackerBlockerCallbacks {
   onBlocked?: (event: BlockedRequestEvent) => void
+  onSsrfBlocked?: (event: SsrfBlockedRequestEvent) => void
 }
 
 function hostKeyFor(rawUrl: string): string {
@@ -41,6 +52,7 @@ export class CdpTrackerBlocker {
   private readonly extraBlockedUrlPatterns: readonly string[]
   private readonly includeBeacons: boolean
   private readonly callbacks: CdpTrackerBlockerCallbacks
+  private readonly ssrfGuard?: SsrfGuard
 
   private effectiveMode: TrackerBlockMode = 'off'
   private patterns: string[] = []
@@ -49,7 +61,12 @@ export class CdpTrackerBlocker {
   private blockedByHost = new Map<string, number>()
   private offPaused: (() => void) | null = null
 
-  constructor(cdp: CdpLike, opts: TrackerBlockingOptions = {}, callbacks: CdpTrackerBlockerCallbacks = {}) {
+  constructor(
+    cdp: CdpLike,
+    opts: TrackerBlockingOptions = {},
+    callbacks: CdpTrackerBlockerCallbacks = {},
+    ssrfGuard?: SsrfGuard,
+  ) {
     this.cdp = cdp
     const requestedMode: TrackerBlockMode = opts.enabled === false ? 'off' : (opts.mode ?? 'fetch')
     this.enabled = requestedMode !== 'off'
@@ -58,26 +75,31 @@ export class CdpTrackerBlocker {
     this.extraBlockedUrlPatterns = opts.extraBlockedUrlPatterns ?? []
     this.includeBeacons = opts.includeBeacons !== false
     this.callbacks = callbacks
+    this.ssrfGuard = ssrfGuard
   }
 
   async enable(): Promise<void> {
-    if (!this.enabled || this.mode === 'off') {
+    const ssrfActive = Boolean(this.ssrfGuard?.enabled)
+    if ((!this.enabled || this.mode === 'off') && !ssrfActive) {
       this.effectiveMode = 'off'
       return
     }
 
-    this.patterns = buildCdpTrackerUrlPatterns({
-      extraHosts: this.extraBlockedHosts,
-      extraUrlPatterns: this.extraBlockedUrlPatterns,
-      includeBeacons: this.includeBeacons,
-    })
+    this.patterns =
+      this.enabled && this.mode !== 'off'
+        ? buildCdpTrackerUrlPatterns({
+            extraHosts: this.extraBlockedHosts,
+            extraUrlPatterns: this.extraBlockedUrlPatterns,
+            includeBeacons: this.includeBeacons,
+          })
+        : []
 
-    if (this.patterns.length === 0) {
+    if (this.patterns.length === 0 && !ssrfActive) {
       this.effectiveMode = 'off'
       return
     }
 
-    if (this.mode === 'network') {
+    if (this.mode === 'network' && !ssrfActive) {
       await this.cdp.send('Network.setBlockedURLs', { urls: this.patterns })
       this.effectiveMode = 'network'
       return
@@ -88,15 +110,19 @@ export class CdpTrackerBlocker {
       void this.handleRequestPaused(params)
     })
 
-    try {
-      await this.cdp.send('Fetch.enable', {
-        patterns: this.patterns.map((urlPattern) => ({
+    const fetchPatterns = ssrfActive
+      ? [{ urlPattern: '*', requestStage: 'Request' }]
+      : this.patterns.map((urlPattern) => ({
           urlPattern,
           requestStage: 'Request',
-        })),
+        }))
+
+    try {
+      await this.cdp.send('Fetch.enable', {
+        patterns: fetchPatterns,
       })
 
-      if (this.mode === 'both') {
+      if (this.mode === 'both' && this.patterns.length > 0) {
         await this.cdp.send('Network.setBlockedURLs', { urls: this.patterns })
         this.effectiveMode = 'both'
       } else {
@@ -106,8 +132,12 @@ export class CdpTrackerBlocker {
       // Graceful fallback to Network.setBlockedURLs if Fetch domain is unavailable on this target.
       this.offPaused?.()
       this.offPaused = null
-      await this.cdp.send('Network.setBlockedURLs', { urls: this.patterns })
-      this.effectiveMode = 'network'
+      if (this.patterns.length > 0) {
+        await this.cdp.send('Network.setBlockedURLs', { urls: this.patterns })
+        this.effectiveMode = 'network'
+      } else {
+        this.effectiveMode = 'off'
+      }
     }
   }
 
@@ -119,26 +149,49 @@ export class CdpTrackerBlocker {
     const method = String(req.method ?? 'GET')
     const resourceType = params.resourceType ? String(params.resourceType) : undefined
 
-    const match = this.matchUrl(url)
-    if (match.blocked && match.reason) {
-      this.recordBlock(url)
-      this.callbacks.onBlocked?.({
-        url,
-        method,
-        resourceType,
-        reason: match.reason,
-        matched: match.matched,
-      })
-      await this.cdp
-        .send('Fetch.failRequest', {
-          requestId,
-          errorReason: 'BlockedByClient',
+    if (this.ssrfGuard?.enabled) {
+      const ssrf = await this.ssrfGuard.checkAsync(url)
+      if (ssrf.blocked && ssrf.category && ssrf.reason) {
+        this.callbacks.onSsrfBlocked?.({
+          url,
+          method,
+          resourceType,
+          category: ssrf.category,
+          reason: ssrf.reason,
+          ip: ssrf.ip,
         })
-        .catch(() => {})
-      return
+        await this.cdp
+          .send('Fetch.failRequest', {
+            requestId,
+            errorReason: 'BlockedByClient',
+          })
+          .catch(() => {})
+        return
+      }
     }
 
-    // False-positive wildcard match (e.g., tracker host appeared in query string, not hostname): continue cleanly.
+    if (this.enabled && this.mode !== 'off') {
+      const match = this.matchUrl(url)
+      if (match.blocked && match.reason) {
+        this.recordBlock(url)
+        this.callbacks.onBlocked?.({
+          url,
+          method,
+          resourceType,
+          reason: match.reason,
+          matched: match.matched,
+        })
+        await this.cdp
+          .send('Fetch.failRequest', {
+            requestId,
+            errorReason: 'BlockedByClient',
+          })
+          .catch(() => {})
+        return
+      }
+    }
+
+    // Continue allowed requests cleanly.
     this.continuedCount += 1
     await this.cdp.send('Fetch.continueRequest', { requestId }).catch(() => {})
   }
