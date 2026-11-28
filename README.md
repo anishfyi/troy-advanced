@@ -80,7 +80,7 @@ docker run --rm -it troy-advanced ascii https://example.com
 
 ## Architecture
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture specification and ASCII system diagrams.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture specification and ASCII system diagrams, and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the Agent Socket, SSE, WebSocket, MCP, and Pipe REPL wire protocol contracts.
 
 - `src/engine/chromium.ts` + `src/engine/cdp-client.ts`: Zero-Playwright raw CDP WebSocket engine on Node 22+ native `WebSocket` with EC2-hardened Chrome flags and persistent profile directories.
 - `src/engine/lite.ts`: Built-in pure-Node HTML/DOM + CookieJar + Form engine for ultra-minimal EC2 instances (`t4g.nano`) or offline tests without Chrome.
