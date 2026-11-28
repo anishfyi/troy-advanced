@@ -983,3 +983,80 @@ export interface SsrfProtectionStats {
   blockedByCategory: Record<string, number>
   recentBlocked: SsrfBlockedEntry[]
 }
+
+export type UntrustedMarkersStyle = 'banner' | 'xml'
+
+export type PromptInjectionCategory =
+  | 'delimiter-breakout'
+  | 'control-token'
+  | 'invisible-smuggling'
+  | 'instruction-override'
+  | 'role-impersonation'
+  | 'exfiltration-cue'
+
+export type PromptInjectionRiskLevel = 'none' | 'low' | 'medium' | 'high'
+
+export interface PromptInjectionSignal {
+  category: PromptInjectionCategory
+  pattern: string
+  excerpt: string
+  count: number
+}
+
+export interface UntrustedMarkersOptions {
+  /** Wrap web page text/ASCII/Markdown in explicit untrusted delimiters (--untrusted-markers). */
+  enabled?: boolean
+  /** Delimiter format: 'banner' (default, strict 7-bit ASCII) or 'xml'. */
+  style?: UntrustedMarkersStyle
+  /** Include the one-line AI safety notice inside the opening delimiter (default: true). */
+  includeNotice?: boolean
+  /** Neutralize chat-template control tokens (<|im_start|>, [INST], </system>, etc.) inside untrusted text (default: true). */
+  neutralizeControlTokens?: boolean
+  /** Strip invisible Unicode tag/bidi/zero-width smuggling characters (default: true). */
+  stripInvisibleChars?: boolean
+  /** Optional fixed boundary token (for deterministic testing). If omitted, a random per-wrap nonce is generated. */
+  boundary?: string
+}
+
+export interface UntrustedWrapMetadata {
+  wrapped: boolean
+  style: UntrustedMarkersStyle
+  boundary: string
+  source: string
+  kind: string
+  riskLevel: PromptInjectionRiskLevel
+  escapedDelimiters: number
+  neutralizedControlTokens: number
+  strippedInvisibleChars: number
+  signals: PromptInjectionSignal[]
+}
+
+export interface UntrustedWrapResult {
+  text: string
+  meta: UntrustedWrapMetadata
+}
+
+export interface UntrustedDetectionEntry {
+  ts: number
+  source: string
+  kind: string
+  riskLevel: PromptInjectionRiskLevel
+  escapedDelimiters: number
+  neutralizedControlTokens: number
+  strippedInvisibleChars: number
+  categories: PromptInjectionCategory[]
+}
+
+export interface UntrustedMarkersStats {
+  enabled: boolean
+  style: UntrustedMarkersStyle
+  includeNotice: boolean
+  neutralizeControlTokens: boolean
+  stripInvisibleChars: boolean
+  wrappedCount: number
+  delimiterBreakoutsNeutralized: number
+  controlTokensNeutralized: number
+  invisibleCharsStripped: number
+  suspiciousPagesDetected: number
+  recentDetections: UntrustedDetectionEntry[]
+}

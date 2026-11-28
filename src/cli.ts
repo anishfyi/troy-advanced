@@ -15,8 +15,10 @@ import type {
   SsrfProtectionOptions,
   TrackerBlockingOptions,
   TrackerBlockMode,
+  UntrustedMarkersOptions,
 } from './types.js'
 import { parseSsrfAllowHosts } from './agent/ssrf.js'
+import { parseUntrustedMarkersStyle } from './agent/untrusted-markers.js'
 import { BrowserManager } from './engine/manager.js'
 import {
   computeAuditStats,
@@ -74,7 +76,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--block-private-net] [--ssrf-allow-host <host>] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -146,7 +148,7 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --json  --ascii  --width <n>
 `
 
 const VALUE_FLAGS = new Set([
@@ -165,6 +167,7 @@ const VALUE_FLAGS = new Set([
   '--layout',
   '--density',
   '--max-tokens',
+  '--untrusted-style',
   '--mode',
   '--crop',
   '--ref',
@@ -354,6 +357,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         ...(ssrfAllowHosts.length > 0 ? { allowHosts: ssrfAllowHosts } : {}),
       }
     : undefined
+  const envUntrustedMarkers =
+    process.env.TROY_UNTRUSTED_MARKERS === '1' ||
+    process.env.TROY_UNTRUSTED_MARKERS?.toLowerCase() === 'true'
+  const untrustedMarkersFlag = Boolean(flags['untrusted-markers']) || envUntrustedMarkers
+  const untrustedStyleFlag = parseUntrustedMarkersStyle(flags['untrusted-style'] ?? process.env.TROY_UNTRUSTED_STYLE)
+  const untrustedMarkersOpts: UntrustedMarkersOptions | undefined = untrustedMarkersFlag
+    ? {
+        enabled: true,
+        ...(untrustedStyleFlag ? { style: untrustedStyleFlag } : {}),
+      }
+    : undefined
   const rawHeaderArgs = multiFlags.header ?? []
   const cliUserAgent =
     typeof flags['user-agent'] === 'string'
@@ -482,6 +496,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         dialogs: dialogsOpts,
         audit: auditOpts,
         ssrf: ssrfOpts,
+        untrustedMarkers: untrustedMarkersOpts,
         emulation: cliEmulation,
         memoryEnabled: false,
       })
@@ -619,6 +634,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       dialogs: dialogsOpts,
       audit: auditOpts,
       ssrf: ssrfOpts,
+      untrustedMarkers: untrustedMarkersOpts,
     }
 
     if (sub === 'run') {
@@ -661,6 +677,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       dialogs: dialogsOpts,
       audit: auditOpts,
       ssrf: ssrfOpts,
+      untrustedMarkers: untrustedMarkersOpts,
     })
     try {
       const inspectorTabFlag =
@@ -706,6 +723,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       dialogs: dialogsOpts,
       audit: auditOpts,
       ssrf: ssrfOpts,
+      untrustedMarkers: untrustedMarkersOpts,
     })
     try {
       await runMcpStdioServer(manager, process.stdin, process.stdout, { framing })
@@ -728,6 +746,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       dialogs: dialogsOpts,
       audit: auditOpts,
       ssrf: ssrfOpts,
+      untrustedMarkers: untrustedMarkersOpts,
     })
     try {
       await runPipeRepl(manager, { jsonMode: Boolean(flags.json) })
@@ -1203,6 +1222,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       trackerBlocking,
       emulation: cliEmulation,
       ssrf: ssrfOpts,
+      untrustedMarkers: untrustedMarkersOpts,
     })
     try {
       const opened = await manager.openTab(positional[1], { activate: true })
@@ -1454,6 +1474,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         showMediaSummary: Boolean(flags.media),
         since: Boolean(flags.since),
         settle: Boolean(flags.settle),
+        ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
         asciiOnly: true,
       })
       break
@@ -1470,6 +1491,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         crop: typeof flags.crop === 'string' ? flags.crop : undefined,
         ref: typeof flags.ref === 'string' ? flags.ref : undefined,
         settle: Boolean(flags.settle),
+        ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
       })
       break
     case 'visual':
@@ -1502,6 +1524,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           ref: typeof flags.ref === 'string' ? flags.ref : undefined,
           showMediaSummary: Boolean(flags.media),
           settle: Boolean(flags.settle),
+          ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
         },
       })
       break
@@ -1530,7 +1553,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'text':
-      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_text', args: args[0] ? { ref: args[0] } : {} })
+      res = await callDaemon(daemonEndpoint, '/tool', {
+        tabId,
+        name: 'page_text',
+        args: {
+          ...(args[0] ? { ref: args[0] } : {}),
+          ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
+        },
+      })
       break
     case 'extract':
       res = await callDaemon(daemonEndpoint, '/extract', {
@@ -1544,6 +1574,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         ascii: Boolean(flags.ascii),
         width: flags.width ? Number(flags.width) : undefined,
         settle: Boolean(flags.settle),
+        ...(untrustedMarkersOpts ? { untrustedMarkers: untrustedMarkersOpts } : {}),
       })
       break
     case 'click':

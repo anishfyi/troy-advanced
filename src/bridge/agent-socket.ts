@@ -72,6 +72,7 @@ export async function createAgentSocket(
             audit: manager.getAuditStats(),
             loopGuard: manager.getLoopGuardStats(),
             ssrf: manager.getSsrfStats(),
+            untrustedMarkers: manager.getUntrustedMarkersStats(),
             stream: streamHub.getStats(),
             ws: wsHub?.getStats() ?? {
               clients: 0,
@@ -168,6 +169,12 @@ export async function createAgentSocket(
           body.layout === 'spatial' || body.layout === 'auto' || body.layout === 'flow' ? body.layout : undefined
         const densityOpt = parseAsciiDensity(body.density)
         const maxTokensOpt = parseMaxTokens(body.maxTokens ?? body.max_tokens)
+        const untrustedOpt =
+          body.untrustedMarkers !== undefined
+            ? (body.untrustedMarkers as boolean | Record<string, unknown>)
+            : body.untrusted_markers !== undefined
+              ? Boolean(body.untrusted_markers)
+              : undefined
         const res = await manager.renderAscii(tabId, {
           width: typeof body.width === 'number' ? body.width : undefined,
           height: typeof body.height === 'number' ? body.height : undefined,
@@ -183,6 +190,7 @@ export async function createAgentSocket(
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           since: Boolean(body.since),
           settle: body.settle as boolean | Record<string, unknown> | undefined,
+          ...(untrustedOpt !== undefined ? { untrustedMarkers: untrustedOpt } : {}),
           sessionId,
         })
         return {
@@ -198,6 +206,7 @@ export async function createAgentSocket(
                 ...(sessionId ? { sessionId } : {}),
                 ...(res.estimatedTokens !== undefined ? { estimatedTokens: res.estimatedTokens } : {}),
                 ...(res.tokenBudget ? { tokenBudget: res.tokenBudget } : {}),
+                ...(res.untrustedMarkers ? { untrustedMarkers: res.untrustedMarkers } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),
@@ -213,6 +222,12 @@ export async function createAgentSocket(
       }
       case '/markdown': {
         const tabId = body.tabId !== undefined ? Number(body.tabId) : undefined
+        const untrustedOpt =
+          body.untrustedMarkers !== undefined
+            ? (body.untrustedMarkers as boolean | Record<string, unknown>)
+            : body.untrusted_markers !== undefined
+              ? Boolean(body.untrusted_markers)
+              : undefined
         const res = await manager.renderMarkdown(tabId, {
           showRefs: body.showRefs !== false,
           includeUrls: body.includeUrls !== false,
@@ -231,6 +246,7 @@ export async function createAgentSocket(
           crop: body.crop as string | { x: number; y: number; width: number; height: number } | undefined,
           ref: typeof body.ref === 'string' ? body.ref : undefined,
           settle: body.settle as boolean | Record<string, unknown> | undefined,
+          ...(untrustedOpt !== undefined ? { untrustedMarkers: untrustedOpt } : {}),
           sessionId,
         })
         return {
@@ -243,6 +259,7 @@ export async function createAgentSocket(
                 title: res.snapshot?.title,
                 refs: res.snapshot?.elements.length,
                 ...(sessionId ? { sessionId } : {}),
+                ...(res.untrustedMarkers ? { untrustedMarkers: res.untrustedMarkers } : {}),
                 ...(res.settle ? { settle: res.settle } : {}),
                 ...(res.crop ? { crop: res.crop } : {}),
                 ...(res.cropRef ? { cropRef: res.cropRef } : {}),
@@ -270,6 +287,8 @@ export async function createAgentSocket(
             ascii: Boolean(body.ascii),
             width: typeof body.width === 'number' ? body.width : undefined,
             settle: body.settle,
+            ...(body.untrustedMarkers !== undefined ? { untrustedMarkers: body.untrustedMarkers } : {}),
+            ...(body.untrusted_markers !== undefined ? { untrustedMarkers: body.untrusted_markers } : {}),
           },
           { sessionId },
         )

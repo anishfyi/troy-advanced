@@ -54,6 +54,9 @@ import type {
   TabSummary,
   TokenBudgetReport,
   TrackerBlockingOptions,
+  UntrustedMarkersOptions,
+  UntrustedMarkersStats,
+  UntrustedWrapMetadata,
 } from '../types.js'
 import {
   ElementRegistry,
@@ -80,6 +83,12 @@ import { SessionRegistry } from '../agent/sessions.js'
 import { exactOrigin, normalizeOrigin, resolveInput } from '../agent/omnibox.js'
 import { authorizeAction } from '../agent/policy.js'
 import { SsrfGuard, isSsrfBlockedError } from '../agent/ssrf.js'
+import {
+  UntrustedContentGuard,
+  estimateUntrustedWrapperTokenOverhead,
+  parseUntrustedMarkersBoolean,
+  parseUntrustedMarkersStyle,
+} from '../agent/untrusted-markers.js'
 import { computePageDelta, type PageDelta } from '../agent/delta.js'
 import {
   estimateTokens,
@@ -176,6 +185,7 @@ export interface BrowserManagerOptions {
   audit?: AuditLogOptions
   loopGuard?: LoopGuardOptions
   ssrf?: SsrfProtectionOptions
+  untrustedMarkers?: boolean | UntrustedMarkersOptions
 }
 
 export class BrowserManager {
@@ -185,6 +195,7 @@ export class BrowserManager {
   readonly audit: AuditLogger
   readonly loopGuard: AgentLoopGuard
   readonly ssrf: SsrfGuard
+  readonly untrustedMarkers: UntrustedContentGuard
   private tabs = new Map<number, TabSession>()
   private activeTabId: number | null = null
   private allowedOrigins = new Set<string>()
@@ -203,6 +214,7 @@ export class BrowserManager {
     audit: AuditLogger,
     loopGuard: AgentLoopGuard,
     ssrf: SsrfGuard,
+    untrustedMarkers: UntrustedContentGuard,
   ) {
     this.engine = engine
     this.profileDir = profileDir
@@ -210,6 +222,7 @@ export class BrowserManager {
     this.audit = audit
     this.loopGuard = loopGuard
     this.ssrf = ssrf
+    this.untrustedMarkers = untrustedMarkers
     if (engine.onCrashRecovery) {
       this.unsubscribeCrash = engine.onCrashRecovery((ev) => {
         if (ev.kind === 'chromium_recovered') {
@@ -330,11 +343,35 @@ export class BrowserManager {
       redactArgs: opts.audit?.redactArgs,
     })
     const loopGuard = new AgentLoopGuard(opts.loopGuard)
-    return new BrowserManager(engine, profileDir, memory, audit, loopGuard, ssrfGuard)
+    const untrustedMarkersGuard = new UntrustedContentGuard(opts.untrustedMarkers)
+    return new BrowserManager(engine, profileDir, memory, audit, loopGuard, ssrfGuard, untrustedMarkersGuard)
   }
 
   getSsrfStats(): SsrfProtectionStats {
     return this.ssrf.getStats()
+  }
+
+  getUntrustedMarkersStats(): UntrustedMarkersStats {
+    return this.untrustedMarkers.getStats()
+  }
+
+  private resolveUntrustedOverride(
+    rawFlag: unknown,
+    rawStyle?: unknown,
+  ): boolean | UntrustedMarkersOptions | undefined {
+    const style = parseUntrustedMarkersStyle(rawStyle)
+    if (rawFlag && typeof rawFlag === 'object' && !Array.isArray(rawFlag)) {
+      const obj = rawFlag as UntrustedMarkersOptions
+      return style ? { ...obj, style } : obj
+    }
+    const parsedBool = parseUntrustedMarkersBoolean(rawFlag)
+    if (parsedBool === undefined) {
+      return style ? { enabled: this.untrustedMarkers.enabled, style } : undefined
+    }
+    if (style) {
+      return { enabled: parsedBool, style }
+    }
+    return parsedBool
   }
 
   getLoopGuardStats(): LoopGuardStats {
@@ -1243,6 +1280,7 @@ export class BrowserManager {
       ref?: string
       settle?: boolean | SettleOptions
       sessionId?: string
+      untrustedMarkers?: boolean | UntrustedMarkersOptions
     } = {},
   ): Promise<{
     ok: boolean
@@ -1262,6 +1300,7 @@ export class BrowserManager {
     focusedLineIndex?: number
     estimatedTokens?: number
     tokenBudget?: TokenBudgetReport
+    untrustedMarkers?: UntrustedWrapMetadata
     status?: 'blocked'
     code?: string
     error?: string
@@ -1284,6 +1323,12 @@ export class BrowserManager {
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
     const maxTokens = parseMaxTokens(opts.maxTokens)
+    const wrapUntrusted = this.untrustedMarkers.shouldWrap(opts.untrustedMarkers)
+    const innerMaxTokens =
+      maxTokens && wrapUntrusted && maxTokens > 64
+        ? Math.max(32, maxTokens - estimateUntrustedWrapperTokenOverhead(this.untrustedMarkers.includeNotice))
+        : maxTokens
+
     if (opts.since && prev) {
       const delta = computePageDelta(prev, snap)
       let ascii = renderDeltaAscii(delta, {
@@ -1294,8 +1339,8 @@ export class BrowserManager {
         density: opts.density,
       })
       let tokenBudget: TokenBudgetReport | undefined
-      if (maxTokens) {
-        const trimmed = trimAsciiToTokenBudget(ascii, maxTokens, {
+      if (innerMaxTokens) {
+        const trimmed = trimAsciiToTokenBudget(ascii, innerMaxTokens, {
           preserveRefs: true,
           preserveHeadings: true,
           asciiOnly: opts.asciiOnly !== false,
@@ -1304,7 +1349,17 @@ export class BrowserManager {
         ascii = trimmed.text
         tokenBudget = trimmed.report
       }
-      const estimatedTokens = tokenBudget ? tokenBudget.finalTokens : estimateTokens(ascii).tokens
+      let untrustedMeta: UntrustedWrapMetadata | undefined
+      if (wrapUntrusted) {
+        const wrapped = this.untrustedMarkers.wrap(ascii, {
+          source: snap.url,
+          kind: 'page_ascii_delta',
+          override: opts.untrustedMarkers,
+        })
+        ascii = wrapped.text
+        untrustedMeta = wrapped.meta
+      }
+      const estimatedTokens = estimateTokens(ascii).tokens
       return {
         ok: true,
         mode: 'delta',
@@ -1313,25 +1368,47 @@ export class BrowserManager {
         delta,
         estimatedTokens,
         ...(tokenBudget ? { tokenBudget } : {}),
+        ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
         ...(settleRes ? { settle: settleRes } : {}),
       }
     }
-    const { crop: _rawCrop, ref: _rawRef, since: _since, settle: _settle, sessionId: _sessionId, ...renderOpts } = opts
+    const {
+      crop: _rawCrop,
+      ref: _rawRef,
+      since: _since,
+      settle: _settle,
+      sessionId: _sessionId,
+      untrustedMarkers: _untrustedMarkers,
+      ...renderOpts
+    } = opts
     const rendered = renderPageAsciiWithMetrics(snap, {
       ...renderOpts,
-      maxTokens,
+      maxTokens: innerMaxTokens,
       crop: cropRes.crop,
       cropLabel: cropRes.cropRef ?? opts.cropLabel,
       tabs: this.listTabs({ sessionId: opts.sessionId }),
       activeTabId: (opts.sessionId ? this.sessions.getActiveTabId(opts.sessionId) : this.activeTabId) ?? snap.tabId,
     })
-    const estimatedTokens = rendered.tokenBudget
-      ? rendered.tokenBudget.finalTokens
-      : estimateTokens(rendered.ascii).tokens
+    let finalAscii = rendered.ascii
+    let untrustedMeta: UntrustedWrapMetadata | undefined
+    if (wrapUntrusted) {
+      const wrapped = this.untrustedMarkers.wrap(finalAscii, {
+        source: snap.url,
+        kind: 'page_ascii',
+        override: opts.untrustedMarkers,
+      })
+      finalAscii = wrapped.text
+      untrustedMeta = wrapped.meta
+    }
+    const estimatedTokens = untrustedMeta
+      ? estimateTokens(finalAscii).tokens
+      : rendered.tokenBudget
+        ? rendered.tokenBudget.finalTokens
+        : estimateTokens(finalAscii).tokens
     return {
       ok: true,
       mode: 'full',
-      ascii: rendered.ascii,
+      ascii: finalAscii,
       snapshot: snap,
       scroll: {
         offset: rendered.scrollOffset,
@@ -1341,6 +1418,7 @@ export class BrowserManager {
       },
       estimatedTokens,
       ...(rendered.tokenBudget ? { tokenBudget: rendered.tokenBudget } : {}),
+      ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
       ...(rendered.focusedLineIndex !== undefined ? { focusedLineIndex: rendered.focusedLineIndex } : {}),
       ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
@@ -1355,6 +1433,7 @@ export class BrowserManager {
       ref?: string
       settle?: boolean | SettleOptions
       sessionId?: string
+      untrustedMarkers?: boolean | UntrustedMarkersOptions
     } = {},
   ): Promise<{
     ok: boolean
@@ -1363,6 +1442,7 @@ export class BrowserManager {
     settle?: SettleResult
     crop?: Rect
     cropRef?: string
+    untrustedMarkers?: UntrustedWrapMetadata
     status?: 'blocked'
     code?: string
     error?: string
@@ -1383,16 +1463,34 @@ export class BrowserManager {
     if ('error' in cropRes) return { ok: false, error: cropRes.error }
     const snap = await this.takeIndexedSnapshot(session)
     session.lastSnapshot = snap
-    const { crop: _rawCrop, ref: _rawRef, settle: _settle, sessionId: _sessionId, ...renderOpts } = opts
-    const markdown = renderPageMarkdown(snap, {
+    const {
+      crop: _rawCrop,
+      ref: _rawRef,
+      settle: _settle,
+      sessionId: _sessionId,
+      untrustedMarkers: _untrustedMarkers,
+      ...renderOpts
+    } = opts
+    let markdown = renderPageMarkdown(snap, {
       ...renderOpts,
       crop: cropRes.crop,
       cropLabel: cropRes.cropRef ?? opts.cropLabel,
     })
+    let untrustedMeta: UntrustedWrapMetadata | undefined
+    if (this.untrustedMarkers.shouldWrap(opts.untrustedMarkers)) {
+      const wrapped = this.untrustedMarkers.wrap(markdown, {
+        source: snap.url,
+        kind: 'page_markdown',
+        override: opts.untrustedMarkers,
+      })
+      markdown = wrapped.text
+      untrustedMeta = wrapped.meta
+    }
     return {
       ok: true,
       markdown,
       snapshot: snap,
+      ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
       ...(settleRes ? { settle: settleRes } : {}),
       ...(cropRes.crop ? { crop: cropRes.crop } : {}),
       ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
@@ -1754,6 +1852,11 @@ export class BrowserManager {
     this.refreshOrigins()
     const allowedOrigins = this.getAllowedOrigins(sessionId)
     const ctx = () => ({ tabId: session.driver.id, url: session.driver.getUrl(), epoch: session.driver.getEpoch() })
+    const untrustedOverride = this.resolveUntrustedOverride(
+      args.untrustedMarkers ?? args.untrusted_markers,
+      args.untrustedStyle ?? args.untrusted_style,
+    )
+    const wrapUntrusted = this.untrustedMarkers.shouldWrap(untrustedOverride)
 
     switch (name) {
       case 'page_read':
@@ -1770,6 +1873,10 @@ export class BrowserManager {
         session.lastSnapshot = snap
 
         const maxTokens = parseMaxTokens(args.maxTokens ?? args.max_tokens)
+        const innerMaxTokens =
+          maxTokens && wrapUntrusted && maxTokens > 64
+            ? Math.max(32, maxTokens - estimateUntrustedWrapperTokenOverhead(this.untrustedMarkers.includeNotice))
+            : maxTokens
 
         if (args.since && prev) {
           const delta = computePageDelta(prev, snap)
@@ -1781,8 +1888,8 @@ export class BrowserManager {
             density: parseAsciiDensity(args.density),
           })
           let tokenBudget: TokenBudgetReport | undefined
-          if (maxTokens) {
-            const trimmed = trimAsciiToTokenBudget(ascii, maxTokens, {
+          if (innerMaxTokens) {
+            const trimmed = trimAsciiToTokenBudget(ascii, innerMaxTokens, {
               preserveRefs: true,
               preserveHeadings: true,
               asciiOnly: args.asciiOnly !== false,
@@ -1791,7 +1898,21 @@ export class BrowserManager {
             ascii = trimmed.text
             tokenBudget = trimmed.report
           }
-          const estimatedTokens = tokenBudget ? tokenBudget.finalTokens : estimateTokens(ascii).tokens
+          let untrustedMeta: UntrustedWrapMetadata | undefined
+          if (wrapUntrusted) {
+            const wrapped = this.untrustedMarkers.wrap(ascii, {
+              source: snap.url,
+              kind: 'page_ascii_delta',
+              override: untrustedOverride,
+            })
+            ascii = wrapped.text
+            untrustedMeta = wrapped.meta
+          }
+          const estimatedTokens = untrustedMeta
+            ? estimateTokens(ascii).tokens
+            : tokenBudget
+              ? tokenBudget.finalTokens
+              : estimateTokens(ascii).tokens
           return capPayload({
             ok: true,
             mode: 'delta',
@@ -1799,6 +1920,7 @@ export class BrowserManager {
             ascii,
             estimatedTokens,
             ...(tokenBudget ? { tokenBudget } : {}),
+            ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
             ...(settleRes ? { settle: settleRes } : {}),
             ...(name === 'page_read_ascii' ? { content: ascii } : {}),
           })
@@ -1816,15 +1938,14 @@ export class BrowserManager {
           showMediaSummary: Boolean(args.showMediaSummary),
           layout: layoutOpt,
           density: densityOpt,
-          maxTokens,
+          maxTokens: innerMaxTokens,
           crop: cropRes.crop,
           cropLabel: cropRes.cropRef,
           tabs: this.listTabs({ sessionId }),
           activeTabId: (sessionId ? this.sessions.getActiveTabId(sessionId) : this.activeTabId) ?? snap.tabId,
         })
-        const ascii = renderedAscii.ascii
+        let ascii = renderedAscii.ascii
         const tokenBudget = renderedAscii.tokenBudget
-        const estimatedTokens = tokenBudget ? tokenBudget.finalTokens : estimateTokens(ascii).tokens
 
         let pixelAscii: string | undefined
         if (name === 'page_read_visual') {
@@ -1847,6 +1968,42 @@ export class BrowserManager {
           }
         }
 
+        let contentText: string
+        let untrustedMeta: UntrustedWrapMetadata | undefined
+        if (wrapUntrusted) {
+          const wrappedAscii = this.untrustedMarkers.wrap(ascii, {
+            source: snap.url,
+            kind: 'page_ascii',
+            override: untrustedOverride,
+          })
+          ascii = wrappedAscii.text
+          untrustedMeta = wrappedAscii.meta
+          if (name === 'page_read_ascii') {
+            contentText = ascii
+          } else {
+            const wrappedContent = this.untrustedMarkers.wrap(snap.text, {
+              source: snap.url,
+              kind: 'page_text',
+              override: untrustedOverride,
+            })
+            contentText = wrappedContent.text
+          }
+          if (pixelAscii) {
+            pixelAscii = this.untrustedMarkers.wrap(pixelAscii, {
+              source: snap.url,
+              kind: 'page_visual',
+              override: untrustedOverride,
+            }).text
+          }
+        } else {
+          contentText = name === 'page_read_ascii' ? ascii : snap.text
+        }
+        const estimatedTokens = untrustedMeta
+          ? estimateTokens(ascii).tokens
+          : tokenBudget
+            ? tokenBudget.finalTokens
+            : estimateTokens(ascii).tokens
+
         const media = extractMediaSummary(snap)
         const mediaSummaryAscii = media.length > 0 ? renderMediaSummaryAscii(snap) : undefined
 
@@ -1862,13 +2019,14 @@ export class BrowserManager {
           ascii,
           estimatedTokens,
           ...(tokenBudget ? { tokenBudget } : {}),
+          ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
           compactRefs: renderCompactRefsAscii(snap),
           ...(media.length > 0 ? { media, mediaSummaryAscii } : {}),
           ...(pixelAscii ? { pixelAscii } : {}),
           ...(settleRes ? { settle: settleRes } : {}),
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
           ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
-          content: name === 'page_read_ascii' ? ascii : snap.text,
+          content: contentText,
         })
       }
 
@@ -1879,7 +2037,7 @@ export class BrowserManager {
         if ('error' in cropRes) return { ok: false, error: cropRes.error }
         const snap = await this.takeIndexedSnapshot(session)
         session.lastSnapshot = snap
-        const markdown = renderPageMarkdown(snap, {
+        let markdown = renderPageMarkdown(snap, {
           showRefs: args.showRefs !== false,
           includeUrls: args.includeUrls !== false,
           asciiOnly: Boolean(args.asciiOnly),
@@ -1899,6 +2057,16 @@ export class BrowserManager {
           crop: cropRes.crop,
           cropLabel: cropRes.cropRef,
         })
+        let untrustedMeta: UntrustedWrapMetadata | undefined
+        if (wrapUntrusted) {
+          const wrapped = this.untrustedMarkers.wrap(markdown, {
+            source: snap.url,
+            kind: 'page_markdown',
+            override: untrustedOverride,
+          })
+          markdown = wrapped.text
+          untrustedMeta = wrapped.meta
+        }
         return capPayload({
           ok: true,
           tabId: snap.tabId,
@@ -1909,6 +2077,7 @@ export class BrowserManager {
           elementCount: snap.elements.length,
           markdown,
           content: markdown,
+          ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
           ...(settleRes ? { settle: settleRes } : {}),
           ...(cropRes.crop ? { crop: cropRes.crop } : {}),
           ...(cropRes.cropRef ? { cropRef: cropRes.cropRef } : {}),
@@ -1965,11 +2134,32 @@ export class BrowserManager {
         if (args.ref) {
           const resolved = session.elements.resolve(args.ref, ctx())
           if ('error' in resolved) return { ok: false, error: resolved.error }
+          let textOut = resolved.item.text
+          let valueOut = resolved.item.value
+          let untrustedMeta: UntrustedWrapMetadata | undefined
+          if (wrapUntrusted) {
+            const sourceUrl = session.driver.getUrl()
+            const wrappedText = this.untrustedMarkers.wrap(textOut ?? '', {
+              source: sourceUrl,
+              kind: 'element_text',
+              override: untrustedOverride,
+            })
+            textOut = wrappedText.text
+            untrustedMeta = wrappedText.meta
+            if (typeof valueOut === 'string' && valueOut.length > 0) {
+              valueOut = this.untrustedMarkers.wrap(valueOut, {
+                source: sourceUrl,
+                kind: 'element_value',
+                override: untrustedOverride,
+              }).text
+            }
+          }
           return {
             ok: true,
             ref: args.ref,
-            text: resolved.item.text,
-            value: resolved.item.value,
+            text: textOut,
+            value: valueOut,
+            ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
             ...(resolved.recovered
               ? {
                   recovered: true,
@@ -1980,7 +2170,24 @@ export class BrowserManager {
           }
         }
         const snap = await session.driver.snapshot()
-        return capPayload({ ok: true, url: snap.url, title: snap.title, content: snap.text })
+        let contentOut = snap.text
+        let untrustedMeta: UntrustedWrapMetadata | undefined
+        if (wrapUntrusted) {
+          const wrapped = this.untrustedMarkers.wrap(snap.text, {
+            source: snap.url,
+            kind: 'page_text',
+            override: untrustedOverride,
+          })
+          contentOut = wrapped.text
+          untrustedMeta = wrapped.meta
+        }
+        return capPayload({
+          ok: true,
+          url: snap.url,
+          title: snap.title,
+          content: contentOut,
+          ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
+        })
       }
 
       case 'page_extract': {
@@ -2014,15 +2221,26 @@ export class BrowserManager {
         })
 
         const includeAscii = Boolean(args.ascii)
-        const ascii = includeAscii
+        let ascii = includeAscii
           ? formatExtractAscii(extracted, {
               width: typeof args.width === 'number' ? args.width : undefined,
             })
           : undefined
+        let untrustedMeta: UntrustedWrapMetadata | undefined
+        if (ascii && wrapUntrusted) {
+          const wrapped = this.untrustedMarkers.wrap(ascii, {
+            source: snap.url,
+            kind: 'page_extract',
+            override: untrustedOverride,
+          })
+          ascii = wrapped.text
+          untrustedMeta = wrapped.meta
+        }
 
         return capPayload({
           ...extracted,
           ...(ascii ? { ascii } : {}),
+          ...(untrustedMeta ? { untrustedMarkers: untrustedMeta } : {}),
           ...(settleRes ? { settle: settleRes } : {}),
         })
       }

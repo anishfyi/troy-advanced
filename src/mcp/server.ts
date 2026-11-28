@@ -179,6 +179,7 @@ export const MCP_TOOLS = [
         showMediaSummary: { type: 'boolean', description: 'Append Image/Canvas extraction summary with dimensions, bounding boxes, and <canvas> ASCII previews' },
         maxTokens: { type: 'number', description: 'Optional LLM token budget (e.g. 500, 2000); progressively compacts and trims ASCII output to fit <= maxTokens while preserving [eN] refs' },
         since: { type: 'boolean', description: 'Return only structural delta since previous read' },
+        untrustedMarkers: { type: 'boolean', description: 'Wrap web page content in explicit untrusted delimiters with prompt-injection sanitization' },
       },
     },
   },
@@ -196,6 +197,7 @@ export const MCP_TOOLS = [
         asciiOnly: { type: 'boolean', description: 'Sanitize output to strict 7-bit ASCII (default false)' },
         crop: { type: 'string', description: 'Region crop in viewport pixels: "x,y,w,h"' },
         ref: { type: 'string', description: 'Element ref (e.g. "e5") whose bounding box to zoom into' },
+        untrustedMarkers: { type: 'boolean', description: 'Wrap web page content in explicit untrusted delimiters with prompt-injection sanitization' },
       },
     },
   },
@@ -266,6 +268,7 @@ export const MCP_TOOLS = [
         internalLinksOnly: { type: 'boolean', description: 'Return only internal links (same origin as page)' },
         ascii: { type: 'boolean', description: 'Also include a formatted strict 7-bit ASCII summary' },
         settle: { type: 'boolean', description: 'Wait for network idle and DOM mutations to settle before extracting' },
+        untrustedMarkers: { type: 'boolean', description: 'Wrap ASCII extract summary in explicit untrusted delimiters with prompt-injection sanitization' },
       },
     },
   },
@@ -830,6 +833,7 @@ export async function handleMcpRequest(
           showMediaSummary: args.showMediaSummary,
           since: args.since,
           settle: args.settle,
+          ...(args.untrustedMarkers !== undefined ? { untrustedMarkers: args.untrustedMarkers } : {}),
           asciiOnly: true,
         })
         break
@@ -843,6 +847,7 @@ export async function handleMcpRequest(
           crop: args.crop,
           ref: args.ref,
           settle: args.settle,
+          ...(args.untrustedMarkers !== undefined ? { untrustedMarkers: args.untrustedMarkers } : {}),
         })
         break
       case 'troy_screenshot_ascii':
@@ -878,6 +883,7 @@ export async function handleMcpRequest(
           internalLinksOnly: args.internalLinksOnly,
           ascii: args.ascii,
           settle: args.settle,
+          ...(args.untrustedMarkers !== undefined ? { untrustedMarkers: args.untrustedMarkers } : {}),
         })
         break
       case 'troy_click':

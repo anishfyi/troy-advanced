@@ -119,12 +119,15 @@ export async function executePipeCommand(
       let ref: string | undefined
       let since = false
       let showMediaSummary = false
+      let untrustedMarkers = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
         if (tok === '--since') {
           since = true
         } else if (tok === '--media') {
           showMediaSummary = true
+        } else if (tok === '--untrusted-markers') {
+          untrustedMarkers = true
         } else if (tok === '--density' && rest[i + 1]) {
           density = rest[++i]
         } else if (tok.startsWith('--density=')) {
@@ -155,6 +158,7 @@ export async function executePipeCommand(
         ref,
         since,
         showMediaSummary,
+        ...(untrustedMarkers ? { untrustedMarkers: true } : {}),
         asciiOnly: true,
       })
       return { output: format(res) }
@@ -168,6 +172,7 @@ export async function executePipeCommand(
       let includeUrls = true
       let crop: string | undefined
       let ref: string | undefined
+      let untrustedMarkers = false
       for (let i = 0; i < rest.length; i++) {
         const tok = rest[i]!
         if (tok === '--frontmatter') includeFrontmatter = true
@@ -175,6 +180,7 @@ export async function executePipeCommand(
         else if (tok === '--ascii') asciiOnly = true
         else if (tok === '--no-refs') showRefs = false
         else if (tok === '--no-urls') includeUrls = false
+        else if (tok === '--untrusted-markers') untrustedMarkers = true
         else if (tok === '--crop' && rest[i + 1]) crop = rest[++i]
         else if (tok.startsWith('--crop=')) crop = tok.slice('--crop='.length)
         else if (tok === '--ref' && rest[i + 1]) ref = rest[++i]
@@ -188,6 +194,7 @@ export async function executePipeCommand(
         includeUrls,
         crop,
         ref,
+        ...(untrustedMarkers ? { untrustedMarkers: true } : {}),
       })
       return { output: format(res) }
     }
@@ -225,7 +232,11 @@ export async function executePipeCommand(
     }
     case 'read': {
       const since = rest.includes('--since')
-      const res = await manager.runTool(undefined, 'page_read', { since })
+      const untrustedMarkers = rest.includes('--untrusted-markers')
+      const res = await manager.runTool(undefined, 'page_read', {
+        since,
+        ...(untrustedMarkers ? { untrustedMarkers: true } : {}),
+      })
       return { output: format(res) }
     }
     case 'find': {

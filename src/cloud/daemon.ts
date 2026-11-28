@@ -12,6 +12,7 @@ import type {
   EngineKind,
   SsrfProtectionOptions,
   TrackerBlockingOptions,
+  UntrustedMarkersOptions,
 } from '../types.js'
 import { BrowserManager } from '../engine/manager.js'
 import { createAgentSocket } from '../bridge/agent-socket.js'
@@ -41,6 +42,7 @@ export interface DaemonOptions {
   dialogs?: DialogPolicyOptions
   audit?: AuditLogOptions
   ssrf?: SsrfProtectionOptions
+  untrustedMarkers?: boolean | UntrustedMarkersOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -57,6 +59,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     dialogs: opts.dialogs,
     audit: opts.audit,
     ssrf: opts.ssrf,
+    untrustedMarkers: opts.untrustedMarkers,
   })
 
   if (opts.initialUrl) {
@@ -125,6 +128,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       cdpPort: manager.engine.cdpPort,
       ...(manager.engine.remoteCdpUrl ? { remoteCdpUrl: manager.engine.remoteCdpUrl } : {}),
       blockPrivateNet: manager.ssrf.enabled,
+      untrustedMarkers: manager.untrustedMarkers.enabled,
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
     }),
@@ -195,6 +199,12 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
       for (const h of opts.ssrf.allowHosts) {
         args.push('--ssrf-allow-host', h)
       }
+    }
+  }
+  if (opts.untrustedMarkers === true || (typeof opts.untrustedMarkers === 'object' && opts.untrustedMarkers?.enabled)) {
+    args.push('--untrusted-markers')
+    if (typeof opts.untrustedMarkers === 'object' && opts.untrustedMarkers.style) {
+      args.push('--untrusted-style', opts.untrustedMarkers.style)
     }
   }
   if (opts.emulation?.viewport) {
