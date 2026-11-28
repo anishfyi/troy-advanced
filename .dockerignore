@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.gitignore
+.troy-cron
+.trove
+test
+*.log
+.env
+.env.*
+!deploy/.env.example

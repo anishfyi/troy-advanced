@@ -100,7 +100,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M83: Health-check HTTP probe + Prometheus-compatible `/metrics` endpoint (tabs, requests, memory RSS, uptime, tool latency)
 - [x] M84: Multi-profile management (`troy-advanced profile list|create|delete|export|import`)
 - [x] M85: SSH tunnel helper command (`troy-advanced ec2 tunnel <user@host>`) printing and optionally establishing secure loopback forwarding
-- [ ] M86: `docker-compose.yml` for one-command EC2 deployment with persistent profile volume and healthcheck
+- [x] M86: `docker-compose.yml` for one-command EC2 deployment with persistent profile volume and healthcheck
 - [ ] M87: GitHub Actions CI workflow (`.github/workflows/ci.yml`) running typecheck, build, unit tests, and headless Chrome E2E on Ubuntu Linux
 - [ ] M88: Graceful memory watchdog in daemon: auto-evict idle background tabs or trigger GC hint if RSS exceeds `--max-rss-mb`
 - [ ] M89: Proxy support (`--proxy http://...` / `socks5://...`, `HTTP_PROXY`/`HTTPS_PROXY`) for both Chromium and Lite engines

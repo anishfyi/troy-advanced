@@ -108,6 +108,10 @@ import {
   writeTunneledEndpointFile,
   type StrictHostKeyMode,
 } from './cloud/ec2-tunnel.js'
+import {
+  renderDockerComposeYaml,
+  validateDockerComposeFile,
+} from './cloud/docker-compose.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
   TOOL_SCHEMA_FORMATS,
@@ -145,7 +149,9 @@ Daemon & Modes:
                                                          EC2 (IMDSv2) / Linux / Chrome environment check
   profile      <list|show|create|delete|export|import> [args] [--profiles-dir <dir>] [--json]
                                                          Manage isolated multi-profile directories (list, create/clone, delete, export/import)
-  ec2 setup                                              Print EC2 systemd & SSH forwarding guide
+  ec2 setup                                              Print EC2 Docker Compose, systemd & SSH forwarding guide
+  ec2 compose  [--port N] [--engine auto|chromium|lite] [--policy strict|standard|permissive] [--shm-size 1gb] [--volume <name>] [--bind-dir <dir>] [--memory <limit>] [--cpus N] [--readonly] [--public-metrics] [--write <file>] [--validate <file>] [--json]
+                                                         Generate or validate a hardened EC2 docker-compose.yml manifest
   ec2 tunnel   <user@host> [--local-port N] [--remote-port N] [--cdp] [--cdp-only] [--cdp-port N] [--remote-cdp-port N] [-i <key>] [--ssh-port N] [--jump <bastion>] [--discover] [--write-endpoint <file>] [--connect] [--background] [--json]
                                                          Print or establish secure 127.0.0.1 SSH loopback forwarding to an EC2 host
 
@@ -306,6 +312,15 @@ const VALUE_FLAGS = new Set([
   '--remote-endpoint',
   '--write-endpoint',
   '--ssh-bin',
+  '--shm-size',
+  '--volume',
+  '--bind-dir',
+  '--memory',
+  '--cpus',
+  '--write',
+  '--validate',
+  '--image',
+  '--tz',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -1232,10 +1247,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     const sub = positional[1] || 'setup'
     if (sub === 'setup') {
       console.log(`=== Troy Advanced EC2 Setup ===
-1. Bootstrap Chromium + Node on Ubuntu / Amazon Linux 2023:
-   bash deploy/ec2-bootstrap.sh
+1. One-command Docker Compose deployment (persistent profile volume + /readyz healthcheck):
+   docker compose up -d
+   docker compose ps
+   curl -s http://127.0.0.1:9333/readyz
 
-2. Install persistent systemd daemon:
+2. Or bootstrap Chromium + Node natively on Ubuntu / Amazon Linux 2023:
+   bash deploy/ec2-bootstrap.sh
    sudo cp deploy/troy-advanced.service /etc/systemd/system/
    sudo systemctl enable --now troy-advanced
 
@@ -1252,6 +1270,84 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
    troy-advanced ascii
    troy-advanced mcp       # Wire into Dexter / Claude Code / Codex MCP config
 `)
+      return
+    }
+
+    if (sub === 'compose') {
+      try {
+        const validateTarget =
+          typeof flags.validate === 'string' && flags.validate.trim()
+            ? path.resolve(flags.validate.trim())
+            : flags.validate === true
+              ? path.resolve('docker-compose.yml')
+              : undefined
+
+        if (validateTarget) {
+          const result = validateDockerComposeFile(validateTarget)
+          if (flags.json) {
+            console.log(JSON.stringify({ file: validateTarget, ...result }, null, 2))
+          } else {
+            console.log(`Docker Compose validation (${validateTarget}): ${result.ok ? 'PASS' : 'FAIL'}`)
+            for (const err of result.errors) {
+              console.log(`  [ERROR] ${err.code}: ${err.message}`)
+            }
+            for (const warn of result.warnings) {
+              console.log(`  [WARN]  ${warn.code}: ${warn.message}`)
+            }
+          }
+          if (!result.ok) process.exit(1)
+          return
+        }
+
+        const portFlag =
+          typeof flags.port === 'string' && flags.port.trim() ? Number(flags.port.trim()) : undefined
+        const yaml = renderDockerComposeYaml({
+          port: portFlag,
+          engine,
+          policy: policyProfileFlag ?? 'standard',
+          shmSize: typeof flags['shm-size'] === 'string' ? flags['shm-size'].trim() : undefined,
+          volumeName: typeof flags.volume === 'string' ? flags.volume.trim() : undefined,
+          bindHostDir: typeof flags['bind-dir'] === 'string' ? flags['bind-dir'].trim() : undefined,
+          image: typeof flags.image === 'string' ? flags.image.trim() : undefined,
+          memoryLimit: typeof flags.memory === 'string' ? flags.memory.trim() : undefined,
+          cpus: typeof flags.cpus === 'string' ? flags.cpus.trim() : undefined,
+          timezone: typeof flags.tz === 'string' ? flags.tz.trim() : undefined,
+          readonly: Boolean(flags.readonly),
+          publicMetrics: Boolean(flags['public-metrics']),
+          untrustedMarkers: Boolean(flags['untrusted-markers']),
+          redactSecrets: Boolean(flags['redact-secrets']),
+          allowOrigins: allowOriginsFlag,
+          denyOrigins: denyOriginsFlag,
+          compatTroy: flags['no-compat-troy'] ? false : true,
+          blockPrivateNet: flags['no-block-private-net'] ? false : true,
+        })
+
+        const writeTarget =
+          typeof flags.write === 'string' && flags.write.trim()
+            ? path.resolve(flags.write.trim())
+            : undefined
+
+        if (writeTarget) {
+          fs.mkdirSync(path.dirname(writeTarget), { recursive: true })
+          fs.writeFileSync(writeTarget, yaml, 'utf8')
+          if (flags.json) {
+            console.log(JSON.stringify({ ok: true, file: writeTarget, bytes: Buffer.byteLength(yaml, 'utf8') }, null, 2))
+          } else {
+            console.log(`Wrote hardened EC2 docker-compose manifest to ${writeTarget}`)
+          }
+          return
+        }
+
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, yaml }, null, 2))
+        } else {
+          process.stdout.write(yaml)
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error(flags.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : msg)
+        process.exit(1)
+      }
       return
     }
 
@@ -1418,7 +1514,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       return
     }
 
-    console.error(`Unknown ec2 subcommand "${sub}". Usage: troy-advanced ec2 <setup|tunnel>`)
+    console.error(`Unknown ec2 subcommand "${sub}". Usage: troy-advanced ec2 <setup|compose|tunnel>`)
     process.exit(1)
   }
 
