@@ -68,6 +68,7 @@ import type {
   UntrustedMarkersOptions,
   UntrustedMarkersStats,
   UntrustedWrapMetadata,
+  WatchdogTabInfo,
 } from '../types.js'
 import {
   ElementRegistry,
@@ -186,6 +187,8 @@ interface TabSession {
   lastSnapshot: PageSnapshot | null
   ownedByBridge: boolean
   ownerSession?: string
+  createdAt: number
+  lastActiveAt: number
 }
 
 export interface BrowserManagerOptions {
@@ -1275,12 +1278,15 @@ export class BrowserManager {
       }
       throw err
     }
+    const now = Date.now()
     const session: TabSession = {
       driver,
       elements: new ElementRegistry(),
       lastSnapshot: null,
       ownedByBridge: opts.ownedByBridge ?? true,
       ...(sessionId ? { ownerSession: sessionId } : {}),
+      createdAt: now,
+      lastActiveAt: now,
     }
     this.tabs.set(driver.id, session)
     if (sessionId) {
@@ -1364,10 +1370,14 @@ export class BrowserManager {
         return { ok: false, status: 'blocked', code: 'session_isolation', error }
       }
       this.sessions.setActiveTabId(sessionId, tabId)
+      const tabSession = this.tabs.get(tabId)
+      if (tabSession) tabSession.lastActiveAt = Date.now()
       this.emit({ type: 'tab_activated', tabId, sessionId })
       return { ok: true }
     }
     this.activeTabId = tabId
+    const tabSession = this.tabs.get(tabId)
+    if (tabSession) tabSession.lastActiveAt = Date.now()
     this.emit({ type: 'tab_activated', tabId })
     return { ok: true }
   }
@@ -1482,11 +1492,96 @@ export class BrowserManager {
     return first.done ? null : first.value
   }
 
+  getWatchdogTabInfo(): WatchdogTabInfo[] {
+    const activeSessionTabs = new Set<number>()
+    for (const summary of this.sessions.list()) {
+      if (summary.activeTabId !== null) activeSessionTabs.add(summary.activeTabId)
+    }
+    return [...this.tabs.values()].map((s) => ({
+      id: s.driver.id,
+      url: s.driver.getUrl(),
+      title: s.driver.getTitle(),
+      active: s.driver.id === this.activeTabId || activeSessionTabs.has(s.driver.id),
+      ...(s.ownerSession ? { ownerSession: s.ownerSession } : {}),
+      createdAt: s.createdAt,
+      lastActiveAt: s.lastActiveAt,
+    }))
+  }
+
+  clearIdleTabCaches(): number {
+    const activeSessionTabs = new Set<number>()
+    for (const summary of this.sessions.list()) {
+      if (summary.activeTabId !== null) activeSessionTabs.add(summary.activeTabId)
+    }
+    let cleared = 0
+    for (const s of this.tabs.values()) {
+      const isActive = s.driver.id === this.activeTabId || activeSessionTabs.has(s.driver.id)
+      if (!isActive && s.lastSnapshot !== null) {
+        s.lastSnapshot = null
+        cleared += 1
+      }
+    }
+    return cleared
+  }
+
+  async evictIdleTab(tabId: number, reason: string): Promise<boolean> {
+    const startedAt = Date.now()
+    const session = this.tabs.get(tabId)
+    if (!session) return false
+    const fromUrl = session.driver.getUrl()
+    const ownerSession = session.ownerSession
+    try {
+      await session.driver.close()
+    } catch {
+      // Proceed with cleanup even if driver close throws
+    }
+    this.tabs.delete(tabId)
+    this.sessions.removeTab(tabId)
+    this.loopGuard.reset({ tabId })
+    if (this.activeTabId === tabId) {
+      const next = this.tabs.keys().next()
+      this.activeTabId = next.done ? null : next.value
+    }
+    const durationMs = Date.now() - startedAt
+    this.emit({
+      type: 'tab_evicted',
+      tabId,
+      reason,
+      ...(ownerSession ? { sessionId: ownerSession } : {}),
+    })
+    this.recordActivity({
+      ts: startedAt,
+      tabId,
+      ...(ownerSession ? { sessionId: ownerSession } : {}),
+      tool: 'memory_watchdog_evict',
+      summary: `evicted idle tab=${tabId} (${reason})`,
+      ok: true,
+      durationMs,
+    })
+    this.audit.record({
+      tsMs: startedAt,
+      kind: 'tab_action',
+      tool: 'memory_watchdog_evict',
+      tabId,
+      ...(ownerSession ? { sessionId: ownerSession } : {}),
+      ok: true,
+      refused: false,
+      durationMs,
+      fromUrl,
+      summary: reason,
+    })
+    return true
+  }
+
   private resolveSession(tabId?: number): TabSession | null {
-    if (tabId !== undefined) return this.tabs.get(tabId) ?? null
-    if (this.activeTabId !== null) return this.tabs.get(this.activeTabId) ?? null
-    const first = this.tabs.values().next()
-    return first.done ? null : first.value
+    const session =
+      tabId !== undefined
+        ? (this.tabs.get(tabId) ?? null)
+        : this.activeTabId !== null
+          ? (this.tabs.get(this.activeTabId) ?? null)
+          : (this.tabs.values().next().value ?? null)
+    if (session) session.lastActiveAt = Date.now()
+    return session
   }
 
   private resolveTabForSession(
@@ -1513,12 +1608,16 @@ export class BrowserManager {
             : `tab ${tabId} is not owned by session "${sessionId}"`,
         }
       }
+      s.lastActiveAt = Date.now()
       return { ok: true, session: s }
     }
     const activeId = this.sessions.getActiveTabId(sessionId)
     if (activeId !== null) {
       const s = this.tabs.get(activeId)
-      if (s) return { ok: true, session: s }
+      if (s) {
+        s.lastActiveAt = Date.now()
+        return { ok: true, session: s }
+      }
     }
     return { ok: false, error: `no open tab in session "${sessionId}"` }
   }

@@ -10,6 +10,7 @@ import type {
   DownloadPolicyOptions,
   EmulationOptions,
   EngineKind,
+  MemoryWatchdogOptions,
   PolicyProfileInput,
   ReadonlyModeOptions,
   SecretRedactionOptions,
@@ -36,6 +37,10 @@ import {
   defaultDaemonLogPath,
   rotateIfNeeded,
 } from './daemon-logs.js'
+import {
+  createBrowserMemoryWatchdog,
+  parseMaxRssMb,
+} from './memory-watchdog.js'
 
 export interface DaemonOptions {
   engine?: EngineKind
@@ -68,6 +73,10 @@ export interface DaemonOptions {
   logRotationIntervalMs?: number
   healthProbeUnauthenticated?: boolean
   metricsUnauthenticated?: boolean
+  maxRssMb?: number
+  watchdogIntervalMs?: number
+  watchdogIdleTtlMs?: number
+  memoryWatchdog?: MemoryWatchdogOptions
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -110,8 +119,29 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     await manager.openTab(opts.initialUrl, { activate: true, bypassReadonly: true })
   }
 
+  const resolvedMaxRssMb =
+    opts.maxRssMb ??
+    opts.memoryWatchdog?.maxRssMb ??
+    parseMaxRssMb(process.env.TROY_ADVANCED_MAX_RSS_MB)
+
+  const memoryWatchdog = createBrowserMemoryWatchdog(
+    manager,
+    {
+      ...opts.memoryWatchdog,
+      ...(resolvedMaxRssMb !== undefined ? { maxRssMb: resolvedMaxRssMb } : {}),
+      ...(opts.watchdogIntervalMs !== undefined ? { checkIntervalMs: opts.watchdogIntervalMs } : {}),
+      ...(opts.watchdogIdleTtlMs !== undefined ? { idleTabTtlMs: opts.watchdogIdleTtlMs } : {}),
+    },
+    {
+      onEvent: (event) => {
+        console.log(JSON.stringify({ ok: true, ...event }))
+      },
+    },
+  )
+
   const socket = await createAgentSocket(manager, {
     port: opts.port ?? 0,
+    memoryWatchdog,
     ...(opts.healthProbeUnauthenticated !== undefined
       ? { healthProbeUnauthenticated: opts.healthProbeUnauthenticated }
       : {}),
@@ -119,6 +149,10 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       ? { metricsUnauthenticated: opts.metricsUnauthenticated }
       : {}),
   })
+
+  if (memoryWatchdog.enabled) {
+    memoryWatchdog.start()
+  }
   const endpointFile = opts.endpointFile || defaultEndpointPath()
   const compatFile = opts.compatTroy ? troyCompatEndpointPath() : null
 
@@ -210,6 +244,13 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       allowedOrigins: manager.policy.resolved.allowedOrigins,
       deniedOrigins: manager.policy.resolved.deniedOrigins,
       daemonConfigFile: manager.daemonConfigFile,
+      ...(memoryWatchdog.enabled
+        ? {
+            maxRssMb: memoryWatchdog.maxRssMb,
+            watchdogIntervalMs: memoryWatchdog.checkIntervalMs,
+            watchdogIdleTtlMs: memoryWatchdog.idleTabTtlMs,
+          }
+        : {}),
       ...(managedLogFile ? { logFile: managedLogFile } : {}),
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
@@ -220,6 +261,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
   const shutdown = async () => {
     if (shuttingDown) return
     shuttingDown = true
+    memoryWatchdog.stop()
     if (logRotateTimer) {
       clearInterval(logRotateTimer)
       logRotateTimer = null
@@ -272,6 +314,16 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
   if (opts.logMaxFiles !== undefined) args.push('--log-max-files', String(opts.logMaxFiles))
   if (opts.healthProbeUnauthenticated === false) args.push('--no-health-probe')
   if (opts.metricsUnauthenticated === true) args.push('--public-metrics')
+  const detachedMaxRssMb = opts.maxRssMb ?? opts.memoryWatchdog?.maxRssMb
+  if (detachedMaxRssMb !== undefined) args.push('--max-rss-mb', String(detachedMaxRssMb))
+  const detachedWatchdogIntervalMs = opts.watchdogIntervalMs ?? opts.memoryWatchdog?.checkIntervalMs
+  if (detachedWatchdogIntervalMs !== undefined) {
+    args.push('--watchdog-interval-ms', String(detachedWatchdogIntervalMs))
+  }
+  const detachedWatchdogIdleTtlMs = opts.watchdogIdleTtlMs ?? opts.memoryWatchdog?.idleTabTtlMs
+  if (detachedWatchdogIdleTtlMs !== undefined) {
+    args.push('--watchdog-idle-ttl-ms', String(detachedWatchdogIdleTtlMs))
+  }
   if (opts.engine) args.push('--engine', opts.engine)
   if (opts.port) args.push('--port', String(opts.port))
   if (opts.cdpPort) args.push('--cdp-port', String(opts.cdpPort))

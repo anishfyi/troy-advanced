@@ -112,6 +112,7 @@ import {
   renderDockerComposeYaml,
   validateDockerComposeFile,
 } from './cloud/docker-compose.js'
+import { parseMaxRssMb } from './cloud/memory-watchdog.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
   TOOL_SCHEMA_FORMATS,
@@ -130,7 +131,7 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--public-metrics] [--no-health-probe] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--max-rss-mb N] [--watchdog-interval-ms N] [--watchdog-idle-ttl-ms N] [--public-metrics] [--no-health-probe] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
   daemon logs  [--tail N | -n N] [--follow | -f] [--all] [--rotate] [--clear] [--log-file <path>] [--log-max-files N] [--json]
@@ -295,6 +296,9 @@ const VALUE_FLAGS = new Set([
   '--log-file',
   '--log-max-bytes',
   '--log-max-files',
+  '--max-rss-mb',
+  '--watchdog-interval-ms',
+  '--watchdog-idle-ttl-ms',
   '--profiles-dir',
   '--from',
   '--description',
@@ -1533,6 +1537,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       typeof flags['log-max-files'] === 'string' && Number.isFinite(Number(flags['log-max-files']))
         ? Number(flags['log-max-files'])
         : undefined
+    let maxRssMbFlag: number | undefined
+    if (typeof flags['max-rss-mb'] === 'string') {
+      try {
+        maxRssMbFlag = parseMaxRssMb(flags['max-rss-mb'])
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err))
+        process.exit(1)
+      }
+    }
+    const watchdogIntervalMsFlag =
+      typeof flags['watchdog-interval-ms'] === 'string' &&
+      Number.isFinite(Number(flags['watchdog-interval-ms']))
+        ? Number(flags['watchdog-interval-ms'])
+        : undefined
+    const watchdogIdleTtlMsFlag =
+      typeof flags['watchdog-idle-ttl-ms'] === 'string' &&
+      Number.isFinite(Number(flags['watchdog-idle-ttl-ms']))
+        ? Number(flags['watchdog-idle-ttl-ms'])
+        : undefined
 
     const daemonOpts = {
       engine,
@@ -1564,6 +1587,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       logMaxFiles: logMaxFilesFlag,
       healthProbeUnauthenticated: flags['no-health-probe'] ? false : undefined,
       metricsUnauthenticated: Boolean(flags['public-metrics']),
+      maxRssMb: maxRssMbFlag,
+      watchdogIntervalMs: watchdogIntervalMsFlag,
+      watchdogIdleTtlMs: watchdogIdleTtlMsFlag,
     }
 
     if (sub === 'run') {

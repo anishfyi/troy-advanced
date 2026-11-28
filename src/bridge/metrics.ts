@@ -77,6 +77,14 @@ export interface RuntimeMetricsSource {
   memoryEntriesTotal: number
   ready: boolean
   readyReason?: string
+  memoryWatchdog?: {
+    enabled: boolean
+    maxRssBytes: number
+    pressureEventsTotal: number
+    evictedTabsTotal: number
+    gcHintsTotal: number
+    gcInvokedTotal: number
+  }
 }
 
 export interface ToolLatencySummary {
@@ -141,6 +149,14 @@ export interface MetricsSnapshot {
     auditEventsTotal: number
     auditRefusalsTotal: number
     rateLimitBlockedTotal: number
+  }
+  memoryWatchdog?: {
+    enabled: boolean
+    maxRssBytes: number
+    pressureEventsTotal: number
+    evictedTabsTotal: number
+    gcHintsTotal: number
+    gcInvokedTotal: number
   }
   reliability: {
     crashRecoveriesTotal: number
@@ -481,6 +497,7 @@ export class AgentMetricsCollector {
       pageMemory: {
         entriesTotal: source.memoryEntriesTotal,
       },
+      ...(source.memoryWatchdog ? { memoryWatchdog: source.memoryWatchdog } : {}),
     }
   }
 
@@ -530,6 +547,21 @@ export class AgentMetricsCollector {
     addMetric('troy_process_external_memory_bytes', 'gauge', 'V8 external memory in bytes.', [
       `troy_process_external_memory_bytes ${formatPromNumber(snap.memory.externalBytes)}`,
     ])
+
+    if (snap.memoryWatchdog) {
+      addMetric('troy_memory_watchdog_limit_bytes', 'gauge', 'Configured memory watchdog RSS limit in bytes (0 if disabled).', [
+        `troy_memory_watchdog_limit_bytes ${formatPromNumber(snap.memoryWatchdog.maxRssBytes)}`,
+      ])
+      addMetric('troy_memory_watchdog_pressure_events_total', 'counter', 'Total memory watchdog RSS over-limit events.', [
+        `troy_memory_watchdog_pressure_events_total ${formatPromNumber(snap.memoryWatchdog.pressureEventsTotal)}`,
+      ])
+      addMetric('troy_memory_watchdog_evictions_total', 'counter', 'Total idle background tabs evicted by the memory watchdog.', [
+        `troy_memory_watchdog_evictions_total ${formatPromNumber(snap.memoryWatchdog.evictedTabsTotal)}`,
+      ])
+      addMetric('troy_memory_watchdog_gc_hints_total', 'counter', 'Total GC hint triggers attempted by the memory watchdog.', [
+        `troy_memory_watchdog_gc_hints_total ${formatPromNumber(snap.memoryWatchdog.gcHintsTotal)}`,
+      ])
+    }
 
     addMetric('troy_tabs_open', 'gauge', 'Total number of currently open browser tabs.', [
       `troy_tabs_open ${formatPromNumber(snap.tabs.open)}`,

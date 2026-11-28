@@ -1331,3 +1331,94 @@ export interface EncryptedProfileBundle {
   ciphertext: string
 }
 
+export interface WatchdogTabInfo {
+  id: number
+  url: string
+  title: string
+  active: boolean
+  ownerSession?: string
+  createdAt: number
+  lastActiveAt: number
+}
+
+export interface MemoryWatchdogOptions {
+  /** Maximum resident set size (RSS) in MiB before watchdog acts. Omit or <= 0 to disable. */
+  maxRssMb?: number
+  /** Polling interval in milliseconds (default: 10000, min: 50). */
+  checkIntervalMs?: number
+  /** Minimum idle time in milliseconds before a background tab is preferred for eviction (default: 60000). */
+  idleTabTtlMs?: number
+  /** Minimum number of tabs to keep open (default: 1). Active tabs are never evicted. */
+  minTabsToKeep?: number
+  /** Maximum number of background tabs to evict per check sweep (default: 2). */
+  maxEvictionsPerSweep?: number
+  /** Whether to fall back to evicting the oldest background tab even if younger than idleTabTtlMs when over limit (default: true). */
+  evictAnyBackgroundOnPressure?: boolean
+  /** Whether to clear cached snapshots on idle background tabs when over limit (default: true). */
+  clearSnapshotsOnPressure?: boolean
+  /** Whether to invoke global.gc() hint when over limit (default: true). */
+  gcHint?: boolean
+  /** Maximum recent watchdog events retained in memory (default: 50). */
+  maxRecentEvents?: number
+}
+
+export interface MemoryWatchdogEvent {
+  type: 'memory_watchdog_action'
+  timestamp: string
+  rssBytes: number
+  rssMb: number
+  afterRssBytes: number
+  afterRssMb: number
+  maxRssMb: number
+  evictedTabIds: number[]
+  cachesCleared: number
+  gcHinted: boolean
+  gcInvoked: boolean
+  stillOverLimit: boolean
+  reason: string
+}
+
+export interface MemoryWatchdogCheckResult {
+  enabled: boolean
+  overLimit: boolean
+  rssBytes: number
+  rssMb: number
+  afterRssBytes: number
+  afterRssMb: number
+  maxRssMb: number
+  evictedTabIds: number[]
+  cachesCleared: number
+  gcHinted: boolean
+  gcInvoked: boolean
+  stillOverLimit: boolean
+  action: 'disabled' | 'ok' | 'evicted' | 'gc_hint' | 'evicted_and_gc' | 'cache_cleared' | 'over_limit_no_action'
+}
+
+export interface MemoryWatchdogStats {
+  enabled: boolean
+  running: boolean
+  maxRssMb: number
+  maxRssBytes: number
+  checkIntervalMs: number
+  idleTabTtlMs: number
+  minTabsToKeep: number
+  maxEvictionsPerSweep: number
+  gcHintEnabled: boolean
+  gcAvailable: boolean
+  checksTotal: number
+  pressureEventsTotal: number
+  evictedTabsTotal: number
+  cachesClearedTotal: number
+  gcHintsTotal: number
+  gcInvokedTotal: number
+  lastCheckAt: string | null
+  lastActionAt: string | null
+  lastRssBytes: number
+  lastRssMb: number
+  peakRssBytes: number
+  peakRssMb: number
+  lastEvictedTabIds: number[]
+  recentEvents: MemoryWatchdogEvent[]
+}
+
+

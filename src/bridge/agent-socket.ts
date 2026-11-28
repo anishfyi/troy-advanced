@@ -35,6 +35,10 @@ import {
   type RuntimeMetricsSource,
   type ToolOutcome,
 } from './metrics.js'
+import {
+  formatMemoryWatchdogAscii,
+  type MemoryWatchdog,
+} from '../cloud/memory-watchdog.js'
 
 export const MAX_BODY = 128 * 1024
 export const MAX_IMPORT_BODY = 2 * 1024 * 1024
@@ -57,6 +61,8 @@ export interface AgentSocketOptions {
   metricsUnauthenticated?: boolean
   /** Optional custom metrics collector instance. */
   metrics?: AgentMetricsCollector
+  /** Optional daemon memory watchdog instance. */
+  memoryWatchdog?: MemoryWatchdog
 }
 
 export interface AgentSocketServer {
@@ -64,6 +70,7 @@ export interface AgentSocketServer {
   token: string
   wsUrl: string
   metrics: AgentMetricsCollector
+  memoryWatchdog?: MemoryWatchdog
   close: () => Promise<void>
 }
 
@@ -141,6 +148,7 @@ export async function createAgentSocket(
       : MAX_URL_LENGTH
   const rateLimiter = new AgentSocketRateLimiter(opts.rateLimit)
   const metrics = opts.metrics ?? new AgentMetricsCollector()
+  const memoryWatchdog = opts.memoryWatchdog
   const healthProbeUnauthenticated = opts.healthProbeUnauthenticated !== false
   const metricsUnauthenticated = Boolean(opts.metricsUnauthenticated)
   const streamHub = new SseStreamHub(manager)
@@ -172,6 +180,7 @@ export async function createAgentSocket(
     const sseStats = streamHub.getStats()
     const wsStats = wsHub?.getStats()
     const memStats = manager.memory?.stats()
+    const wdStats = memoryWatchdog?.getStats()
     const ownedTabIds = new Set<number>()
     for (const s of sessions) {
       for (const id of s.ownedTabIds) ownedTabIds.add(id)
@@ -203,6 +212,18 @@ export async function createAgentSocket(
       memoryEntriesTotal: memStats ? memStats.pages + memStats.elements : 0,
       ready,
       ...(readyReason ? { readyReason } : {}),
+      ...(wdStats
+        ? {
+            memoryWatchdog: {
+              enabled: wdStats.enabled,
+              maxRssBytes: wdStats.maxRssBytes,
+              pressureEventsTotal: wdStats.pressureEventsTotal,
+              evictedTabsTotal: wdStats.evictedTabsTotal,
+              gcHintsTotal: wdStats.gcHintsTotal,
+              gcInvokedTotal: wdStats.gcInvokedTotal,
+            },
+          }
+        : {}),
     }
   }
 
@@ -295,6 +316,7 @@ export async function createAgentSocket(
             untrustedMarkers: manager.getUntrustedMarkersStats(),
             secretRedaction: manager.getSecretRedactionStats(),
             rateLimit: rateLimiter.getStats(),
+            ...(memoryWatchdog ? { memoryWatchdog: memoryWatchdog.getStats() } : {}),
             stream: streamHub.getStats(),
             ws: wsHub?.getStats() ?? {
               clients: 0,
@@ -320,6 +342,33 @@ export async function createAgentSocket(
             snapshot,
             prometheus,
             ascii: formatMetricsAscii(snapshot, {
+              width: typeof body.width === 'number' ? body.width : undefined,
+            }),
+          },
+        }
+      }
+      case '/watchdog': {
+        if (!memoryWatchdog) {
+          return {
+            status: 200,
+            payload: {
+              ok: true,
+              enabled: false,
+              stats: null,
+              ascii: 'Memory watchdog is not configured for this server.',
+            },
+          }
+        }
+        const checkResult = body.check === true ? await memoryWatchdog.checkOnce() : undefined
+        const stats = memoryWatchdog.getStats()
+        return {
+          status: 200,
+          payload: {
+            ok: true,
+            enabled: stats.enabled,
+            stats,
+            ...(checkResult ? { checkResult } : {}),
+            ascii: formatMemoryWatchdogAscii(stats, {
               width: typeof body.width === 'number' ? body.width : undefined,
             }),
           },
@@ -1206,6 +1255,13 @@ export async function createAgentSocket(
       return
     }
 
+    if (req.method === 'GET' && url.pathname === '/watchdog') {
+      handleRoute('/watchdog', {}, headerSessionId)
+        .then((r) => respond(r.status, r.payload, rateHeaders))
+        .catch((e) => respond(500, { ok: false, error: String((e as Error)?.message ?? e) }, rateHeaders))
+      return
+    }
+
     if (req.method === 'GET' && url.pathname === '/policy') {
       handleRoute('/policy', {}, headerSessionId)
         .then((r) => respond(r.status, r.payload, rateHeaders))
@@ -1343,6 +1399,7 @@ export async function createAgentSocket(
     token,
     wsUrl,
     metrics,
+    ...(memoryWatchdog ? { memoryWatchdog } : {}),
     async close() {
       closing = true
       wsHub?.close()
