@@ -17,6 +17,7 @@ import type { BrowserManager } from '../engine/manager.js'
 import { parseSseStreamOptions, SseStreamHub } from './sse-stream.js'
 import { WsBridgeHub } from './ws-bridge.js'
 import { validateAgentRequestHeaders } from './host-guard.js'
+import { validateAgentTokenRequest } from './auth.js'
 
 const MAX_BODY = 128 * 1024
 const MAX_IMPORT_BODY = 2 * 1024 * 1024
@@ -671,8 +672,9 @@ export async function createAgentSocket(
         error: headerCheck.error ?? 'wrong host',
       })
     }
-    if (req.headers['x-troy-agent'] !== token) {
-      return respond(401, { ok: false, error: 'missing or invalid x-troy-agent token' })
+    const authCheck = validateAgentTokenRequest(req, token)
+    if (!authCheck.ok) {
+      return respond(401, { ok: false, error: authCheck.error ?? 'missing or invalid x-troy-agent token' })
     }
 
     const parsedHeaderSession = parseSessionId(req.headers[SESSION_HEADER])

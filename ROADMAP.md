@@ -85,7 +85,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 ## Track 6: Security, Refusals & Sandboxing (Milestones 71–80)
 - [x] M71: SSRF protection mode (`--block-private-net`) to optionally block AWS IMDS `169.254.169.254`, `10.0.0.0/8`, `127.0.0.1` on multi-tenant EC2 deployments
 - [x] M72: Strict DNS rebinding & Host header validation tests on Agent Socket
-- [ ] M73: Timing-safe token comparison (`crypto.timingSafeEqual`) on `x-troy-agent` header
+- [x] M73: Timing-safe token comparison (`crypto.timingSafeEqual`) on `x-troy-agent` header
 - [ ] M74: Prompt-injection sanitizer flag (`--untrusted-markers`) wrapping web page text in explicit untrusted delimiters for AI safety
 - [ ] M75: Configurable policy profiles (`strict`, `standard`, `permissive`) via `policy.json`
 - [ ] M76: Sensitive output redaction filter (automatically masks JWTs, AWS keys `AKIA...`, credit card numbers in `page_text` / `ascii` when `--redact-secrets` is on)

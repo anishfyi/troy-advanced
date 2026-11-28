@@ -4,13 +4,14 @@
 
 import type http from 'node:http'
 import type { Duplex } from 'node:stream'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { parseAsciiDensity, parseMaxTokens } from '../ascii/layout.js'
 import { parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import type { AsciiDensity } from '../types.js'
 import type { BrowserManager } from '../engine/manager.js'
 import type { AsciiFramePayload } from './sse-stream.js'
 import { validateAgentRequestHeaders } from './host-guard.js'
+import { validateAgentTokenRequest } from './auth.js'
 
 const WS_MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const MAX_WS_MESSAGE_BYTES = 2 * 1024 * 1024
@@ -124,13 +125,6 @@ const OP_TO_ROUTE: Record<string, string> = {
   downloads: '/downloads',
   dialogs: '/dialogs',
   audit: '/audit',
-}
-
-function safeTokenEqual(supplied: string, expected: string): boolean {
-  const a = Buffer.from(supplied, 'utf8')
-  const b = Buffer.from(expected, 'utf8')
-  if (a.length !== b.length) return false
-  return timingSafeEqual(a, b)
 }
 
 export function computeWebSocketAccept(key: string): string {
@@ -315,11 +309,10 @@ export class WsBridgeHub {
       return
     }
 
-    const headerToken = typeof req.headers['x-troy-agent'] === 'string' ? req.headers['x-troy-agent'] : undefined
-    const queryToken = url.searchParams.get('token') ?? undefined
-    const suppliedToken = headerToken ?? queryToken
-    if (!suppliedToken || !safeTokenEqual(suppliedToken, this.token)) {
-      writeHttpRejection(socket, 401, 'Unauthorized', 'missing or invalid x-troy-agent token')
+    const queryToken = url.searchParams.get('token')
+    const authCheck = validateAgentTokenRequest(req, this.token, { queryToken })
+    if (!authCheck.ok) {
+      writeHttpRejection(socket, 401, 'Unauthorized', authCheck.error ?? 'missing or invalid x-troy-agent token')
       return
     }
 
