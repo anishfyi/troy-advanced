@@ -27,6 +27,7 @@
     "test:unit": "vitest run --exclude test/chromium-e2e.test.ts",
     "test:e2e:chrome": "TROY_REQUIRE_CHROME=1 vitest run test/chromium-e2e.test.ts",
     "test:watch": "vitest",
+    "bench": "node ./bin/troy-advanced.mjs bench",
     "bench:ascii": "npm run build && node ./scripts/bench-ascii.mjs",
     "doctor": "node ./bin/troy-advanced.mjs doctor",
     "daemon": "node ./bin/troy-advanced.mjs daemon start",

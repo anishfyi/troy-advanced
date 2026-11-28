@@ -104,7 +104,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M87: GitHub Actions CI workflow (`.github/workflows/ci.yml`) running typecheck, build, unit tests, and headless Chrome E2E on Ubuntu Linux
 - [x] M88: Graceful memory watchdog in daemon: auto-evict idle background tabs or trigger GC hint if RSS exceeds `--max-rss-mb`
 - [x] M89: Proxy support (`--proxy http://...` / `socks5://...`, `HTTP_PROXY`/`HTTPS_PROXY`) for both Chromium and Lite engines
-- [ ] M90: One-command `troy-advanced bench` measuring startup latency, ASCII render throughput, and CDP snapshot latency
+- [x] M90: One-command `troy-advanced bench` measuring startup latency, ASCII render throughput, and CDP snapshot latency
 
 ## Track 8: Polish, Docs & Ecosystem (Milestones 91–105)
 - [ ] M91: Interactive demo server (`scripts/demo-site.mjs`) showcasing forms, tables, dynamic JS, and canvas art in ASCII

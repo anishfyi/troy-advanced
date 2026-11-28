@@ -115,6 +115,12 @@ import {
   validateDockerComposeFile,
 } from './cloud/docker-compose.js'
 import { parseMaxRssMb } from './cloud/memory-watchdog.js'
+import {
+  formatBenchAscii,
+  parseBenchFloat,
+  parseBenchInt,
+  runBench,
+} from './cloud/bench.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
   TOOL_SCHEMA_FORMATS,
@@ -150,6 +156,8 @@ Daemon & Modes:
                                                          Streaming stdin/stdout AI REPL
   doctor       [--json] [--no-imds] [--imds-timeout <ms>] [--imds-endpoint <url>]
                                                          EC2 (IMDSv2) / Linux / Chrome environment check
+  bench        [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--url <url>] [--iterations N] [--warmup N] [--budget-ms N] [--startup-runs N] [--snapshot-iterations N] [--snapshot-warmup N] [--screenshot] [--skip-ascii] [--skip-startup] [--skip-snapshot] [--out <file>] [--json]
+                                                         Measure engine startup latency, ASCII render throughput, and CDP snapshot latency
   profile      <list|show|create|delete|export|import> [args] [--profiles-dir <dir>] [--json]
                                                          Manage isolated multi-profile directories (list, create/clone, delete, export/import)
   ec2 setup                                              Print EC2 Docker Compose, systemd & SSH forwarding guide
@@ -329,6 +337,13 @@ const VALUE_FLAGS = new Set([
   '--validate',
   '--image',
   '--tz',
+  '--iterations',
+  '--warmup',
+  '--budget-ms',
+  '--startup-runs',
+  '--snapshot-iterations',
+  '--snapshot-warmup',
+  '--chrome-bin',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -664,6 +679,58 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       },
     })
     console.log(flags.json ? JSON.stringify(report, null, 2) : formatDoctorAscii(report))
+    return
+  }
+
+  if (cmd === 'bench') {
+    const rawEngine = typeof flags.engine === 'string' ? flags.engine.trim().toLowerCase() : 'auto'
+    if (rawEngine !== 'auto' && rawEngine !== 'chromium' && rawEngine !== 'lite') {
+      console.error(`Invalid --engine "${rawEngine}": expected auto, chromium, or lite`)
+      process.exit(1)
+    }
+    const benchEngine: EngineKind = rawEngine
+    const benchUrl =
+      typeof flags.url === 'string' && flags.url.trim()
+        ? flags.url.trim()
+        : typeof positional[1] === 'string' && positional[1].trim()
+          ? positional[1].trim()
+          : undefined
+    const report = await runBench({
+      engine: benchEngine,
+      cdpUrl: typeof flags['cdp-url'] === 'string' && flags['cdp-url'].trim() ? flags['cdp-url'].trim() : undefined,
+      chromeBin:
+        typeof flags['chrome-bin'] === 'string' && flags['chrome-bin'].trim() ? flags['chrome-bin'].trim() : undefined,
+      proxy: proxyFlag,
+      url: benchUrl,
+      asciiIterations: parseBenchInt(flags.iterations, '--iterations', { min: 1, max: 5000, fallback: 30 }),
+      asciiWarmup: parseBenchInt(flags.warmup, '--warmup', { min: 0, max: 500, fallback: 5 }),
+      asciiBudgetMs: parseBenchFloat(flags['budget-ms'], '--budget-ms', { min: 0.1, max: 1000, fallback: 5.0 }),
+      startupRuns: parseBenchInt(flags['startup-runs'], '--startup-runs', { min: 1, max: 10, fallback: 1 }),
+      snapshotIterations: parseBenchInt(flags['snapshot-iterations'], '--snapshot-iterations', {
+        min: 1,
+        max: 200,
+        fallback: 5,
+      }),
+      snapshotWarmup: parseBenchInt(flags['snapshot-warmup'], '--snapshot-warmup', {
+        min: 0,
+        max: 20,
+        fallback: 1,
+      }),
+      includeScreenshot: Boolean(flags.screenshot),
+      skipAscii: Boolean(flags['skip-ascii']),
+      skipStartup: Boolean(flags['skip-startup']),
+      skipSnapshot: Boolean(flags['skip-snapshot']),
+    })
+    const formatted = flags.json ? JSON.stringify(report, null, 2) : formatBenchAscii(report)
+    if (typeof flags.out === 'string' && flags.out.trim()) {
+      const outPath = path.resolve(flags.out.trim())
+      fs.mkdirSync(path.dirname(outPath), { recursive: true })
+      fs.writeFileSync(outPath, `${formatted}\n`, 'utf8')
+    }
+    console.log(formatted)
+    if (!report.ok) {
+      process.exit(1)
+    }
     return
   }
 
