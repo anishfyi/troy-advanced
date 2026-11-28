@@ -139,6 +139,14 @@ import {
   generateShellCompletion,
   parseCompletionShell,
 } from './completions.js'
+import {
+  CLI_EXIT_CODES,
+  CliExitError,
+  CliRuntime,
+  isDaemonOfflineError,
+  isTimeoutError,
+  resolveCliRuntime,
+} from './cli-runtime.js'
 
 const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI browser
 
@@ -236,7 +244,13 @@ Client Commands (talk to running daemon, or use --oneshot):
                                           Inspect or configure viewport presets, User-Agent, and custom HTTP headers
 
 Global Flags:
-  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --proxy <http://...|socks5://...>  --proxy-bypass <hosts>  --no-env-proxy  --policy <strict|standard|permissive>  --policy-file <path>  --allow-origin <origin>  --deny-origin <origin>  --daemon-config <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>
+  --tab <id>  --session <id>  --endpoint <file>  --engine <auto|chromium|lite>  --cdp-url <ws://...|http://...>  --proxy <http://...|socks5://...>  --proxy-bypass <hosts>  --no-env-proxy  --policy <strict|standard|permissive>  --policy-file <path>  --allow-origin <origin>  --deny-origin <origin>  --daemon-config <path>  --readonly  --viewport <preset|WxH>  --user-agent <ua>  --header "K: V"  --untrusted-markers  --untrusted-style <banner|xml>  --redact-secrets  --redact-mode <tag|partial>  --json  --ascii  --width <n>  --quiet (-q)  --verbose (-v)  --timeout <ms|5s|1m>
+
+Exit Codes:
+  0  OK
+  1  General error / timeout / invalid arguments
+  2  Policy refusal (readonly, SSRF, origin boundary, sensitive field, submit guard)
+  3  Daemon offline / unreachable
 `
 
 const VALUE_FLAGS = new Set([
@@ -406,6 +420,14 @@ function parseArgv(argv: string[]) {
       flags.follow = true
       continue
     }
+    if (tok === '-q') {
+      flags.quiet = true
+      continue
+    }
+    if (tok === '-v') {
+      flags.verbose = true
+      continue
+    }
     if (tok === '-n' && i + 1 < argv.length) {
       flags.tail = argv[++i]!
       continue
@@ -433,10 +455,14 @@ function parseArgv(argv: string[]) {
   return { positional, flags, multiFlags }
 }
 
+const daemonHttpStatus = new WeakMap<object, number>()
+
 async function callDaemon(
   endpoint: { agentPort: number; agentToken: string; sessionId?: string },
   route: string,
   body: Record<string, unknown> = {},
+  runtime?: CliRuntime,
+  timeoutOverrideMs?: number,
 ): Promise<Record<string, unknown>> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -445,22 +471,88 @@ async function callDaemon(
   if (endpoint.sessionId) {
     headers[SESSION_HEADER] = endpoint.sessionId
   }
-  const res = await fetch(`http://127.0.0.1:${endpoint.agentPort}${route}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
+  const url = `http://127.0.0.1:${endpoint.agentPort}${route}`
+  const timeoutCtl = runtime?.createTimeoutSignal(timeoutOverrideMs)
+  const startedAt = Date.now()
+  runtime?.debug(`POST ${route}`, {
+    port: endpoint.agentPort,
+    session: endpoint.sessionId,
+    timeoutMs: timeoutCtl?.timeoutMs,
   })
-  return (await res.json()) as Record<string, unknown>
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      ...(timeoutCtl ? { signal: timeoutCtl.signal } : {}),
+    })
+    const payload = (await res.json()) as Record<string, unknown>
+    if (payload && typeof payload === 'object') {
+      daemonHttpStatus.set(payload, res.status)
+    }
+    runtime?.debug(`POST ${route} -> ${res.status}`, {
+      ok: payload.ok !== false,
+      elapsedMs: Date.now() - startedAt,
+    })
+    return payload
+  } catch (err) {
+    const elapsedMs = Date.now() - startedAt
+    if (err instanceof CliExitError) throw err
+    if (timeoutCtl?.signal.aborted || isTimeoutError(err)) {
+      const ms = timeoutCtl?.timeoutMs ?? runtime?.effectiveTimeoutMs() ?? 30_000
+      runtime?.debug(`POST ${route} timed out`, { elapsedMs, timeoutMs: ms })
+      throw new CliExitError(`Daemon request ${route} timed out after ${ms}ms`, {
+        exitCode: CLI_EXIT_CODES.ERROR,
+        code: 'timeout',
+        payload: { ok: false, code: 'timeout', error: `Daemon request ${route} timed out after ${ms}ms`, timeoutMs: ms },
+        cause: err,
+      })
+    }
+    if (isDaemonOfflineError(err) || (err instanceof TypeError && /fetch failed/i.test(err.message))) {
+      runtime?.debug(`POST ${route} daemon unreachable`, { elapsedMs, port: endpoint.agentPort })
+      throw new CliExitError(
+        `Unable to reach troy-advanced daemon on 127.0.0.1:${endpoint.agentPort}. Start it with: troy-advanced daemon start`,
+        {
+          exitCode: CLI_EXIT_CODES.DAEMON_OFFLINE,
+          code: 'daemon_offline',
+          payload: {
+            ok: false,
+            code: 'daemon_offline',
+            error: `Unable to reach troy-advanced daemon on 127.0.0.1:${endpoint.agentPort}. Start it with: troy-advanced daemon start`,
+          },
+          cause: err,
+        },
+      )
+    }
+    throw err
+  } finally {
+    timeoutCtl?.clear()
+  }
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
   const { positional, flags, multiFlags } = parseArgv(argv)
   const cmd = positional[0]
 
+  const runtimeRes = resolveCliRuntime(flags)
+  if (!runtimeRes.ok) {
+    if (!flags.quiet) {
+      console.error(JSON.stringify({ ok: false, code: 'invalid_argument', error: runtimeRes.error }, null, 2))
+    }
+    process.exit(CLI_EXIT_CODES.ERROR)
+  }
+  const cli = runtimeRes.runtime
+
   if (!cmd || cmd === 'help' || flags.help) {
-    console.log(USAGE)
+    cli.out(USAGE)
     return
   }
+
+  cli.debug('cli invoke', {
+    cmd,
+    verbosity: cli.verbosity,
+    timeoutMs: cli.timeoutMs,
+  })
 
   const engine = (typeof flags.engine === 'string' ? flags.engine : 'auto') as EngineKind
   const endpointFlag = typeof flags.endpoint === 'string' ? flags.endpoint : undefined
@@ -1110,16 +1202,23 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     if (sub === 'show') {
       const live = !explicitFile && !policyProfileFlag && !flags.oneshot ? readLiveEndpoint(endpointFlag) : null
       if (live) {
-        const res = await callDaemon(live.endpoint, '/policy', {
-          width: flags.width !== undefined ? Number(flags.width) : undefined,
-        })
+        const res = await callDaemon(
+          live.endpoint,
+          '/policy',
+          {
+            width: flags.width !== undefined ? Number(flags.width) : undefined,
+          },
+          cli,
+        )
         if (flags.json) {
-          console.log(JSON.stringify(res, null, 2))
+          cli.json(res)
         } else if (typeof res.ascii === 'string') {
-          console.log(res.ascii)
+          cli.out(res.ascii)
         } else {
-          console.log(JSON.stringify(res, null, 2))
+          cli.json(res)
         }
+        const exitCode = cli.classifyResponse(res, daemonHttpStatus.get(res))
+        if (exitCode !== CLI_EXIT_CODES.OK) process.exit(exitCode)
         return
       }
       const resolved = resolvePolicyProfile(policyProfileFlag, {
@@ -1159,17 +1258,23 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       (typeof flags.file === 'string' && flags.file.trim() ? path.resolve(flags.file.trim()) : undefined)
     const live = !explicitConfig && !flags.oneshot ? readLiveEndpoint(endpointFlag) : null
     if (live) {
-      const res = await callDaemon(live.endpoint, '/origins', {
-        action: sub,
-        ...(targetArg !== undefined ? { origin: targetArg } : {}),
-        width: flags.width !== undefined ? Number(flags.width) : undefined,
-      })
+      const res = await callDaemon(
+        live.endpoint,
+        '/origins',
+        {
+          action: sub,
+          ...(targetArg !== undefined ? { origin: targetArg } : {}),
+          width: flags.width !== undefined ? Number(flags.width) : undefined,
+        },
+        cli,
+      )
       if (flags.json || !res.ok || typeof res.ascii !== 'string') {
-        console.log(JSON.stringify(res, null, 2))
+        cli.json(res)
       } else {
-        console.log(res.ascii)
+        cli.out(res.ascii)
       }
-      if (!res.ok) process.exit(1)
+      const exitCode = cli.classifyResponse(res, daemonHttpStatus.get(res))
+      if (exitCode !== CLI_EXIT_CODES.OK) process.exit(exitCode)
       return
     }
 
@@ -1888,15 +1993,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     if (sub === 'status') {
       const live = readLiveEndpoint(endpointFlag)
       if (!live) {
-        console.log(JSON.stringify({ ok: false, running: false }, null, 2))
-        process.exit(1)
+        cli.debug('daemon status: no live endpoint', { endpoint: endpointFlag ?? 'default' })
+        cli.json({ ok: false, running: false, code: 'daemon_offline' })
+        process.exit(CLI_EXIT_CODES.DAEMON_OFFLINE)
       }
-      const health = await callDaemon(live.endpoint, '/health')
-      console.log(JSON.stringify({ ok: true, running: true, endpoint: live.endpoint, health }, null, 2))
+      const health = await callDaemon(live.endpoint, '/health', {}, cli)
+      cli.json({ ok: true, running: true, endpoint: live.endpoint, health })
       return
     }
-    console.error(`Unknown daemon subcommand: "${sub}". Expected start | run | stop | status | logs`)
-    process.exit(1)
+    cli.error(`Unknown daemon subcommand: "${sub}". Expected start | run | stop | status | logs`)
+    process.exit(CLI_EXIT_CODES.ERROR)
   }
 
   if (cmd === 'browse') {
@@ -2481,77 +2587,99 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   // One-shot ASCII / Markdown / Visual / Extract fetch without needing a running daemon
   if ((cmd === 'ascii' || cmd === 'visual' || cmd === 'markdown' || cmd === 'md' || cmd === 'extract') && positional[1] && !readLiveEndpoint(endpointFlag)) {
-    const manager = await BrowserManager.create({
-      engine,
-      remoteCdpPort: remoteCdpPortFlag,
-      cdpUrl: cdpUrlFlag,
-      proxy: proxyFlag,
-      trackerBlocking,
-      emulation: cliEmulation,
-      ssrf: ssrfOpts,
-      untrustedMarkers: untrustedMarkersOpts,
-      redactSecrets: redactSecretsOpts,
-      policy: policyProfileFlag,
-      policyFile: policyFileFlag,
-      readonly: readonlyFlag || undefined,
-      allowOrigins: allowOriginsFlag,
-      denyOrigins: denyOriginsFlag,
-      daemonConfigFile: daemonConfigFileFlag,
-    })
+    cli.debug(`oneshot ${cmd}`, { target: positional[1], engine })
+    const manager = await cli.withTimeout(
+      BrowserManager.create({
+        engine,
+        remoteCdpPort: remoteCdpPortFlag,
+        cdpUrl: cdpUrlFlag,
+        proxy: proxyFlag,
+        trackerBlocking,
+        emulation: cliEmulation,
+        ssrf: ssrfOpts,
+        untrustedMarkers: untrustedMarkersOpts,
+        redactSecrets: redactSecretsOpts,
+        policy: policyProfileFlag,
+        policyFile: policyFileFlag,
+        readonly: readonlyFlag || undefined,
+        allowOrigins: allowOriginsFlag,
+        denyOrigins: denyOriginsFlag,
+        daemonConfigFile: daemonConfigFileFlag,
+      }),
+      `oneshot ${cmd} startup`,
+    )
     try {
-      const opened = await manager.openTab(positional[1], { activate: true, bypassReadonly: true })
+      const opened = await cli.withTimeout(
+        manager.openTab(positional[1], { activate: true, bypassReadonly: true }),
+        `oneshot ${cmd} open`,
+      )
       if (!opened.ok) {
-        console.error(JSON.stringify(opened, null, 2))
-        process.exit(1)
+        cli.errorJson(opened)
+        process.exit(cli.classifyResponse(opened as unknown as Record<string, unknown>))
       }
       if (cmd === 'extract') {
-        const res = await manager.runTool(opened.id, 'page_extract', {
-          sections: typeof flags.sections === 'string' ? flags.sections : undefined,
-          maxItems: flags['max-items'] ? Number(flags['max-items']) : undefined,
-          includeObjects: !flags['no-objects'],
-          asciiOnly: Boolean(flags['ascii-only']),
-          externalLinksOnly: Boolean(flags.external),
-          internalLinksOnly: Boolean(flags.internal),
-          ascii: Boolean(flags.ascii),
-          width: flags.width ? Number(flags.width) : undefined,
-          settle: Boolean(flags.settle),
-        })
-        if (flags.ascii && !flags.json && typeof res.ascii === 'string') console.log(res.ascii)
-        else console.log(JSON.stringify(res, null, 2))
+        const res = await cli.withTimeout(
+          manager.runTool(opened.id, 'page_extract', {
+            sections: typeof flags.sections === 'string' ? flags.sections : undefined,
+            maxItems: flags['max-items'] ? Number(flags['max-items']) : undefined,
+            includeObjects: !flags['no-objects'],
+            asciiOnly: Boolean(flags['ascii-only']),
+            externalLinksOnly: Boolean(flags.external),
+            internalLinksOnly: Boolean(flags.internal),
+            ascii: Boolean(flags.ascii),
+            width: flags.width ? Number(flags.width) : undefined,
+            settle: Boolean(flags.settle),
+          }),
+          'oneshot extract',
+        )
+        if (flags.ascii && !flags.json && typeof res.ascii === 'string') cli.out(res.ascii)
+        else cli.json(res)
+        const exitCode = cli.classifyResponse(res as Record<string, unknown>)
+        if (exitCode !== CLI_EXIT_CODES.OK) process.exit(exitCode)
         return
       }
       if (cmd === 'markdown' || cmd === 'md') {
-        const res = await manager.runTool(opened.id, 'page_read_markdown', {
-          includeFrontmatter: Boolean(flags.frontmatter),
-          includeMediaSummary: Boolean(flags.media),
-          asciiOnly: Boolean(flags.ascii),
-          showRefs: !flags['no-refs'],
-          includeUrls: !flags['no-urls'],
-          crop: typeof flags.crop === 'string' ? flags.crop : undefined,
-          ref: typeof flags.ref === 'string' ? flags.ref : undefined,
-        })
-        if (flags.json) console.log(JSON.stringify(res, null, 2))
-        else if (typeof res.markdown === 'string') console.log(res.markdown)
-        else console.log(JSON.stringify(res, null, 2))
+        const res = await cli.withTimeout(
+          manager.runTool(opened.id, 'page_read_markdown', {
+            includeFrontmatter: Boolean(flags.frontmatter),
+            includeMediaSummary: Boolean(flags.media),
+            asciiOnly: Boolean(flags.ascii),
+            showRefs: !flags['no-refs'],
+            includeUrls: !flags['no-urls'],
+            crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+            ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+          }),
+          'oneshot markdown',
+        )
+        if (flags.json) cli.json(res)
+        else if (typeof res.markdown === 'string') cli.out(res.markdown)
+        else cli.json(res)
+        const exitCode = cli.classifyResponse(res as Record<string, unknown>)
+        if (exitCode !== CLI_EXIT_CODES.OK) process.exit(exitCode)
         return
       }
       const toolName = cmd === 'visual' ? 'page_screenshot_ascii' : 'page_read_ascii'
       const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-      const res = await manager.runTool(opened.id, toolName, {
-        width: flags.width ? Number(flags.width) : cmd === 'visual' ? 80 : undefined,
-        height: flags.height ? Number(flags.height) : undefined,
-        layout: typeof flags.layout === 'string' ? flags.layout : undefined,
-        density: typeof flags.density === 'string' ? flags.density : undefined,
-        ...(maxTokensOpt !== undefined ? { maxTokens: maxTokensOpt } : {}),
-        mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
-        crop: typeof flags.crop === 'string' ? flags.crop : undefined,
-        ref: typeof flags.ref === 'string' ? flags.ref : undefined,
-        showMediaSummary: Boolean(flags.media),
-        annotate: Boolean(flags.annotate),
-      })
-      if (flags.json) console.log(JSON.stringify(res, null, 2))
-      else if (typeof res.ascii === 'string') console.log(res.ascii)
-      else console.log(JSON.stringify(res, null, 2))
+      const res = await cli.withTimeout(
+        manager.runTool(opened.id, toolName, {
+          width: flags.width ? Number(flags.width) : cmd === 'visual' ? 80 : undefined,
+          height: flags.height ? Number(flags.height) : undefined,
+          layout: typeof flags.layout === 'string' ? flags.layout : undefined,
+          density: typeof flags.density === 'string' ? flags.density : undefined,
+          ...(maxTokensOpt !== undefined ? { maxTokens: maxTokensOpt } : {}),
+          mode: typeof flags.mode === 'string' ? flags.mode : 'ascii',
+          crop: typeof flags.crop === 'string' ? flags.crop : undefined,
+          ref: typeof flags.ref === 'string' ? flags.ref : undefined,
+          showMediaSummary: Boolean(flags.media),
+          annotate: Boolean(flags.annotate),
+        }),
+        `oneshot ${cmd}`,
+      )
+      if (flags.json) cli.json(res)
+      else if (typeof res.ascii === 'string') cli.out(res.ascii)
+      else cli.json(res)
+      const exitCode = cli.classifyResponse(res as Record<string, unknown>)
+      if (exitCode !== CLI_EXIT_CODES.OK) process.exit(exitCode)
     } finally {
       await manager.close()
     }
@@ -2561,24 +2689,31 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // Daemon client commands
   const live = readLiveEndpoint(endpointFlag)
   if (!live) {
-    console.error(
-      JSON.stringify(
-        { ok: false, error: 'troy-advanced daemon is not running. Start it with: troy-advanced daemon start' },
-        null,
-        2,
-      ),
-    )
-    process.exit(1)
+    cli.debug('daemon offline: no live endpoint file', { endpoint: endpointFlag ?? 'default' })
+    cli.errorJson({
+      ok: false,
+      code: 'daemon_offline',
+      error: 'troy-advanced daemon is not running. Start it with: troy-advanced daemon start',
+    })
+    process.exit(CLI_EXIT_CODES.DAEMON_OFFLINE)
   }
+
+  cli.debug('daemon endpoint loaded', {
+    port: live.endpoint.agentPort,
+    pid: live.endpoint.pid,
+    file: live.endpoint.file,
+  })
 
   const rawSession = typeof flags.session === 'string' ? flags.session : process.env.TROY_SESSION
   const parsedSession = parseSessionId(rawSession)
   if (!parsedSession.ok) {
-    console.error(JSON.stringify({ ok: false, error: parsedSession.error }, null, 2))
-    process.exit(1)
+    cli.errorJson({ ok: false, error: parsedSession.error })
+    process.exit(CLI_EXIT_CODES.ERROR)
   }
   const sessionId = parsedSession.sessionId
   const daemonEndpoint = sessionId ? { ...live.endpoint, sessionId } : live.endpoint
+  const daemonCall = (route: string, body: Record<string, unknown> = {}, timeoutOverrideMs?: number) =>
+    callDaemon(daemonEndpoint, route, body, cli, timeoutOverrideMs)
 
   const tabId = flags.tab !== undefined ? Number(flags.tab) : undefined
   const args = positional.slice(1)
@@ -2654,12 +2789,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
             }
 
             if (flags.json) {
-              console.log(JSON.stringify(parsed))
+              cli.out(JSON.stringify(parsed))
             } else if (parsed.type === 'ascii_frame' && typeof parsed.ascii === 'string') {
-              console.log(
+              cli.out(
                 `--- [frame #${parsed.seq ?? '?'} | ${parsed.reason ?? 'update'} | tab ${parsed.tabId ?? '?'} | ${parsed.mode ?? 'full'}] ---`,
               )
-              console.log(parsed.ascii)
+              cli.out(parsed.ascii)
             }
 
             if (parsed.type === 'ascii_frame') {
@@ -2673,8 +2808,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         }
       } catch (err) {
         if ((err as Error)?.name !== 'AbortError') {
-          console.error(JSON.stringify({ ok: false, error: String((err as Error)?.message ?? err) }))
-          process.exit(1)
+          if (isDaemonOfflineError(err) || (err instanceof TypeError && /fetch failed/i.test(err.message))) {
+            throw cli.daemonOfflineError(
+              `Unable to reach troy-advanced daemon on 127.0.0.1:${daemonEndpoint.agentPort}`,
+            )
+          }
+          cli.errorJson({ ok: false, error: String((err as Error)?.message ?? err) })
+          process.exit(CLI_EXIT_CODES.ERROR)
         }
       } finally {
         process.off('SIGINT', onSig)
@@ -2683,20 +2823,39 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       return
     }
     case 'status': {
-      const health = await callDaemon(daemonEndpoint, '/health')
-      const memory = await callDaemon(daemonEndpoint, '/memory')
+      const health = await daemonCall('/health')
+      const memory = await daemonCall('/memory')
       res = { ok: true, endpoint: live.endpoint.file, pid: live.endpoint.pid, health, memory }
       break
     }
     case 'health': {
       const base = `http://127.0.0.1:${daemonEndpoint.agentPort}`
-      const [livezRes, readyzRes] = await Promise.all([
-        fetch(`${base}/healthz`),
-        fetch(`${base}/readyz`),
-      ])
+      const timeoutCtl = cli.createTimeoutSignal()
+      let livezRes: Response
+      let readyzRes: Response
+      try {
+        ;[livezRes, readyzRes] = await Promise.all([
+          fetch(`${base}/healthz`, { signal: timeoutCtl.signal }),
+          fetch(`${base}/readyz`, { signal: timeoutCtl.signal }),
+        ])
+      } catch (err) {
+        if (timeoutCtl.signal.aborted || isTimeoutError(err)) {
+          throw new CliExitError(`Health probe timed out after ${timeoutCtl.timeoutMs}ms`, {
+            exitCode: CLI_EXIT_CODES.ERROR,
+            code: 'timeout',
+            payload: { ok: false, code: 'timeout', error: `Health probe timed out after ${timeoutCtl.timeoutMs}ms` },
+            cause: err,
+          })
+        }
+        throw cli.daemonOfflineError(
+          `Unable to reach troy-advanced daemon on 127.0.0.1:${daemonEndpoint.agentPort}`,
+        )
+      } finally {
+        timeoutCtl.clear()
+      }
       const livez = (await livezRes.json().catch(() => ({ ok: false }))) as Record<string, unknown>
       const readyz = (await readyzRes.json().catch(() => ({ ok: false }))) as Record<string, unknown>
-      const health = await callDaemon(daemonEndpoint, '/health')
+      const health = await daemonCall('/health')
       const ok = livezRes.ok && readyzRes.ok && Boolean(health.ok)
       res = {
         ok,
@@ -2707,14 +2866,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         health,
       }
       if (!ok) {
-        console.log(JSON.stringify(res, null, 2))
-        process.exit(1)
+        cli.json(res)
+        process.exit(CLI_EXIT_CODES.ERROR)
       }
       break
     }
     case 'metrics': {
       const wantProm = Boolean(flags.prometheus || flags.prom)
-      const metricsRes = await callDaemon(daemonEndpoint, '/metrics', {
+      const metricsRes = await daemonCall('/metrics', {
         ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
       })
       if (!metricsRes.ok) {
@@ -2722,44 +2881,44 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         break
       }
       if (wantProm) {
-        process.stdout.write(String(metricsRes.prometheus ?? ''))
+        if (!cli.quiet) process.stdout.write(String(metricsRes.prometheus ?? ''))
         return
       }
       if (flags.json) {
-        console.log(JSON.stringify(metricsRes.snapshot ?? metricsRes, null, 2))
+        cli.json(metricsRes.snapshot ?? metricsRes)
         return
       }
-      console.log(String(metricsRes.ascii ?? ''))
+      cli.out(String(metricsRes.ascii ?? ''))
       return
     }
     case 'sessions': {
       if (args[0] === 'close') {
         const targetId = args[1] || sessionId
-        res = await callDaemon(daemonEndpoint, '/sessions', {
+        res = await daemonCall('/sessions', {
           sessionId: targetId,
           close: true,
           closeTabs: !flags['keep-tabs'],
         })
       } else if (args[0]) {
-        res = await callDaemon(daemonEndpoint, '/sessions', {
+        res = await daemonCall('/sessions', {
           sessionId: args[0],
           ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
         })
       } else {
-        res = await callDaemon(daemonEndpoint, '/sessions', {
+        res = await daemonCall('/sessions', {
           ...(flags.width !== undefined ? { width: Number(flags.width) } : {}),
         })
       }
       break
     }
     case 'tabs':
-      res = await callDaemon(daemonEndpoint, '/tabs')
+      res = await daemonCall('/tabs')
       break
     case 'open':
-      res = await callDaemon(daemonEndpoint, '/open', { url: args.join(' '), activate: true })
+      res = await daemonCall('/open', { url: args.join(' '), activate: true })
       if (res.ok && flags.ascii) {
         const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-        res = await callDaemon(daemonEndpoint, '/ascii', {
+        res = await daemonCall('/ascii', {
           tabId: res.id,
           width: flags.width ? Number(flags.width) : undefined,
           height: flags.height ? Number(flags.height) : undefined,
@@ -2770,17 +2929,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       }
       break
     case 'focus':
-      res = await callDaemon(daemonEndpoint, '/activate', { tabId: Number(args[0]) })
+      res = await daemonCall('/activate', { tabId: Number(args[0]) })
       break
     case 'close':
-      res = await callDaemon(daemonEndpoint, '/close', { tabId: Number(args[0]) })
+      res = await daemonCall('/close', { tabId: Number(args[0]) })
       break
     case 'grant':
-      res = await callDaemon(daemonEndpoint, '/grant-origin', { origin: args[0], tabId })
+      res = await daemonCall('/grant-origin', { origin: args[0], tabId })
       break
     case 'ascii': {
       const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-      res = await callDaemon(daemonEndpoint, '/ascii', {
+      res = await daemonCall('/ascii', {
         tabId,
         width: flags.width ? Number(flags.width) : undefined,
         height: flags.height ? Number(flags.height) : undefined,
@@ -2800,7 +2959,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
     case 'markdown':
     case 'md':
-      res = await callDaemon(daemonEndpoint, '/markdown', {
+      res = await daemonCall('/markdown', {
         tabId,
         includeFrontmatter: Boolean(flags.frontmatter),
         includeMediaSummary: Boolean(flags.media),
@@ -2815,7 +2974,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     case 'visual':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_screenshot_ascii',
         args: {
@@ -2830,7 +2989,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     case 'read': {
       const maxTokensOpt = parseMaxTokens(flags['max-tokens'])
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: flags.visual ? 'page_read_visual' : flags.ascii ? 'page_read_ascii' : 'page_read',
         args: {
@@ -2859,7 +3018,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       if (flags.select) findRoles.push('select')
       if (flags.checkbox) findRoles.push('checkbox')
       if (flags.radio) findRoles.push('radio')
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_find',
         args: {
@@ -2874,7 +3033,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'text':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_text',
         args: {
@@ -2885,7 +3044,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     case 'extract':
-      res = await callDaemon(daemonEndpoint, '/extract', {
+      res = await daemonCall('/extract', {
         tabId,
         sections: typeof flags.sections === 'string' ? flags.sections : undefined,
         maxItems: flags['max-items'] ? Number(flags['max-items']) : undefined,
@@ -2901,65 +3060,72 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     case 'click':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_click',
         args: { ref: args[0], allowSubmit: Boolean(flags['allow-submit'] || flags.submit) },
       })
       break
     case 'fill':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_fill',
         args: { ref: args[0], text: args.slice(1).join(' '), clear: flags.clear !== undefined ? Boolean(flags.clear) : true },
       })
       break
     case 'select':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_select',
         args: { ref: args[0], value: args.slice(1).join(' ') },
       })
       break
     case 'press':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_press',
         args: { key: args[0] ?? 'Enter', ref: typeof flags.ref === 'string' ? flags.ref : undefined },
       })
       break
     case 'scroll':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_scroll',
         args: { direction: args[0] || 'down', amount: args[1] ? Number(args[1]) : 450 },
       })
       break
-    case 'wait':
-      res = await callDaemon(daemonEndpoint, '/tool', {
-        tabId,
-        name: 'page_wait',
-        args: {
-          ...(args[0] && /^\d+$/.test(args[0]) ? { ms: Number(args[0]) } : {}),
-          ...(flags.ms !== undefined ? { ms: Number(flags.ms) } : {}),
-          ...(typeof flags.text === 'string' ? { text: flags.text } : {}),
-          ...(typeof flags.selector === 'string' ? { selector: flags.selector } : {}),
-          ...(typeof flags.url === 'string' ? { url: flags.url } : {}),
-          ...(typeof flags.state === 'string' ? { state: flags.state } : {}),
-          ...(flags.settle ? { settle: true } : {}),
-          ...(flags['network-idle-ms'] !== undefined ? { networkIdleMs: Number(flags['network-idle-ms']) } : {}),
-          ...(flags['dom-quiet-ms'] !== undefined ? { domQuietMs: Number(flags['dom-quiet-ms']) } : {}),
-          ...(flags.timeout !== undefined ? { timeout: Number(flags.timeout) } : {}),
+    case 'wait': {
+      const waitTimeout = cli.timeoutMs
+      const rpcTimeout = waitTimeout !== undefined ? Math.max(waitTimeout + 5_000, 10_000) : undefined
+      res = await daemonCall(
+        '/tool',
+        {
+          tabId,
+          name: 'page_wait',
+          args: {
+            ...(args[0] && /^\d+$/.test(args[0]) ? { ms: Number(args[0]) } : {}),
+            ...(flags.ms !== undefined ? { ms: Number(flags.ms) } : {}),
+            ...(typeof flags.text === 'string' ? { text: flags.text } : {}),
+            ...(typeof flags.selector === 'string' ? { selector: flags.selector } : {}),
+            ...(typeof flags.url === 'string' ? { url: flags.url } : {}),
+            ...(typeof flags.state === 'string' ? { state: flags.state } : {}),
+            ...(flags.settle ? { settle: true } : {}),
+            ...(flags['network-idle-ms'] !== undefined ? { networkIdleMs: Number(flags['network-idle-ms']) } : {}),
+            ...(flags['dom-quiet-ms'] !== undefined ? { domQuietMs: Number(flags['dom-quiet-ms']) } : {}),
+            ...(waitTimeout !== undefined ? { timeout: waitTimeout } : {}),
+          },
         },
-      })
+        rpcTimeout,
+      )
       break
+    }
     case 'back':
     case 'forward':
     case 'reload':
-      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_history', args: { direction: cmd } })
+      res = await daemonCall('/tool', { tabId, name: 'page_history', args: { direction: cmd } })
       break
     case 'console':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_console',
         args: { clear: Boolean(flags.clear), level: flags.level, limit: flags.limit ? Number(flags.limit) : 50 },
@@ -2967,7 +3133,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     case 'network': {
       const bodyReqId = typeof flags.body === 'string' ? flags.body : undefined
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_network',
         args: bodyReqId
@@ -2990,17 +3156,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'eval':
-      res = await callDaemon(daemonEndpoint, '/tool', { tabId, name: 'page_eval', args: { expression: args.join(' ') } })
+      res = await daemonCall('/tool', { tabId, name: 'page_eval', args: { expression: args.join(' ') } })
       break
     case 'act':
-      res = await callDaemon(daemonEndpoint, '/tool', {
+      res = await daemonCall('/tool', {
         tabId,
         name: 'page_act',
         args: { steps: JSON.parse(args.join(' ')), allowSubmit: Boolean(flags['allow-submit']) },
       })
       break
     case 'recall':
-      res = await callDaemon(daemonEndpoint, '/recall', {
+      res = await daemonCall('/recall', {
         tabId,
         query: args.join(' '),
         origin: flags.origin,
@@ -3012,14 +3178,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       })
       break
     case 'forget':
-      res = await callDaemon(daemonEndpoint, '/forget', { origin: args[0] })
+      res = await daemonCall('/forget', { origin: args[0] })
       break
     case 'emulate':
     case 'viewport': {
       const viewportArg = typeof flags.viewport === 'string' ? flags.viewport : args[0]
       const extraHeaders = rawHeaderArgs.length > 0 ? parseHeaderList(rawHeaderArgs) : undefined
       const removeHeaders = multiFlags['remove-header']
-      res = await callDaemon(daemonEndpoint, '/emulation', {
+      res = await daemonCall('/emulation', {
         tabId,
         allTabs: Boolean(flags['all-tabs']),
         ...(viewportArg !== undefined ? { viewport: viewportArg } : {}),
@@ -3036,7 +3202,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
     case 'downloads': {
       const modeArg = parseDownloadMode(flags.mode) ?? parseDownloadMode(args[0])
-      res = await callDaemon(daemonEndpoint, '/downloads', {
+      res = await daemonCall('/downloads', {
         blockedOnly: Boolean(flags.blocked),
         clear: Boolean(flags.clear),
         ...(typeof flags.status === 'string' ? { status: flags.status } : {}),
@@ -3053,7 +3219,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const nextRaw = typeof flags.next === 'string' ? flags.next.trim().toLowerCase() : undefined
       const queueAccept =
         nextRaw === 'accept' ? true : nextRaw === 'dismiss' ? false : undefined
-      res = await callDaemon(daemonEndpoint, '/dialogs', {
+      res = await daemonCall('/dialogs', {
         ...(tabId !== undefined ? { tabId } : {}),
         ...(typeArg ? { type: typeArg } : {}),
         ...(modeArg ? { mode: modeArg } : {}),
@@ -3072,7 +3238,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     case 'audit': {
-      res = await callDaemon(daemonEndpoint, '/audit', {
+      res = await daemonCall('/audit', {
         ...(tabId !== undefined ? { tabId } : {}),
         ...(sessionId ? { sessionId } : {}),
         ...(typeof flags.kind === 'string' ? { kind: flags.kind } : {}),
@@ -3089,8 +3255,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break
     }
     default:
-      console.error(`Unknown command: ${cmd}\nRun "troy-advanced help" for usage.`)
-      process.exit(1)
+      cli.error(`Unknown command: ${cmd}\nRun "troy-advanced help" for usage.`)
+      process.exit(CLI_EXIT_CODES.ERROR)
   }
 
   if (
@@ -3107,11 +3273,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       flags.ascii) &&
     typeof res.ascii === 'string'
   ) {
-    console.log(res.ascii)
+    cli.out(res.ascii)
   } else if (!flags.json && (cmd === 'markdown' || cmd === 'md') && typeof res.markdown === 'string') {
-    console.log(res.markdown)
+    cli.out(res.markdown)
   } else {
-    console.log(JSON.stringify(res, null, 2))
+    cli.json(res)
   }
-  if (res.ok === false) process.exit(1)
+  const exitCode = cli.classifyResponse(res, daemonHttpStatus.get(res))
+  if (exitCode !== CLI_EXIT_CODES.OK) process.exit(exitCode)
 }

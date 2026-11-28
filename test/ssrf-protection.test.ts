@@ -382,7 +382,7 @@ describe('SSRF protection (`--block-private-net`)', () => {
       exitCode = e.code ?? 1
       stderr = e.stderr ?? ''
     }
-    expect(exitCode).toBe(1)
+    expect(exitCode).toBe(2)
     expect(stderr).toContain('"code": "ssrf"')
     expect(stderr).toContain('"category": "imds"')
   })
