@@ -79,6 +79,14 @@ import {
   persistDaemonOriginRules,
   readDaemonConfig,
 } from './cloud/daemon-config.js'
+import {
+  DEFAULT_LOG_TAIL_LINES,
+  clearLogFiles,
+  defaultDaemonLogPath,
+  followLogFile,
+  readLogTail,
+  rotateLogFile,
+} from './cloud/daemon-logs.js'
 import { formatDoctorAscii, runDoctorAsync } from './cloud/doctor.js'
 import { parseMcpFramingMode, runMcpStdioServer } from './mcp/server.js'
 import {
@@ -98,9 +106,11 @@ const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI b
 Usage: troy-advanced <command> [args] [flags]
 
 Daemon & Modes:
-  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
+  daemon start [--engine auto|chromium|lite] [--cdp-url ws://...|http://...] [--compat-troy] [--policy strict|standard|permissive] [--policy-file <path>] [--allow-origin <origin>] [--deny-origin <origin>] [--daemon-config <path>] [--log-file <path>] [--log-max-bytes N] [--log-max-files N] [--readonly] [--block-private-net] [--ssrf-allow-host <host>] [--untrusted-markers] [--untrusted-style banner|xml] [--redact-secrets] [--redact-mode tag|partial] [--port N] [--url U]
   daemon run   (foreground daemon for systemd / Docker)
   daemon stop | status
+  daemon logs  [--tail N | -n N] [--follow | -f] [--all] [--rotate] [--clear] [--log-file <path>] [--log-max-files N] [--json]
+                                                         View, tail, follow, rotate, or clear daemon logs
   browse [url] [--ascii] [--view layout|pixel-ascii|braille|halfblock] [--split] [--inspector console|network|refs|activity] [--non-tty auto|snapshot|batch|interactive] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
                                                          Interactive ASCII terminal browser (auto-detects piped/non-TTY fallback)
   mcp          [--framing auto|ndjson|content-length] [--engine auto|chromium|lite] [--cdp-url ws://...|http://...]
@@ -249,6 +259,10 @@ const VALUE_FLAGS = new Set([
   '--ssrf-allow-host',
   '--imds-timeout',
   '--imds-endpoint',
+  '--tail',
+  '--log-file',
+  '--log-max-bytes',
+  '--log-max-files',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -285,6 +299,14 @@ function parseArgv(argv: string[]) {
     }
     if (tok === '-H' && i + 1 < argv.length) {
       pushMulti('header', argv[++i]!)
+      continue
+    }
+    if (tok === '-f') {
+      flags.follow = true
+      continue
+    }
+    if (tok === '-n' && i + 1 < argv.length) {
+      flags.tail = argv[++i]!
       continue
     }
     if (tok.startsWith('--')) {
@@ -977,6 +999,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (cmd === 'daemon') {
     const sub = positional[1] || 'status'
     const binPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'troy-advanced.mjs')
+    const logFileFlag =
+      typeof flags['log-file'] === 'string' && flags['log-file'].trim()
+        ? path.resolve(flags['log-file'].trim())
+        : undefined
+    const logMaxBytesFlag =
+      typeof flags['log-max-bytes'] === 'string' && Number.isFinite(Number(flags['log-max-bytes']))
+        ? Number(flags['log-max-bytes'])
+        : undefined
+    const logMaxFilesFlag =
+      typeof flags['log-max-files'] === 'string' && Number.isFinite(Number(flags['log-max-files']))
+        ? Number(flags['log-max-files'])
+        : undefined
+
     const daemonOpts = {
       engine,
       port: flags.port ? Number(flags.port) : undefined,
@@ -1002,6 +1037,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       allowOrigins: allowOriginsFlag,
       denyOrigins: denyOriginsFlag,
       daemonConfigFile: daemonConfigFileFlag,
+      logFile: logFileFlag,
+      logMaxBytes: logMaxBytesFlag,
+      logMaxFiles: logMaxFilesFlag,
     }
 
     if (sub === 'run') {
@@ -1019,6 +1057,104 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       console.log(JSON.stringify(res, null, 2))
       return
     }
+    if (sub === 'logs') {
+      const logFile = logFileFlag ?? defaultDaemonLogPath(endpointFlag)
+      const includeRotated = Boolean(flags.all) || Boolean(flags['include-rotated'])
+
+      if (flags.rotate) {
+        const res = rotateLogFile(logFile, {
+          maxBytes: logMaxBytesFlag,
+          maxFiles: logMaxFilesFlag,
+          copyTruncate: true,
+        })
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, ...res }, null, 2))
+        } else if (res.rotated) {
+          console.log(
+            res.rotatedTo
+              ? `Rotated ${res.logFile} -> ${res.rotatedTo} (${res.sizeBytes ?? 0} bytes)`
+              : `Truncated ${res.logFile} (${res.sizeBytes ?? 0} bytes)`,
+          )
+        } else {
+          console.log(`No active log file to rotate at ${res.logFile}`)
+        }
+        return
+      }
+
+      if (flags.clear) {
+        const res = clearLogFiles(logFile, { includeRotated })
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, logFile, ...res }, null, 2))
+        } else {
+          console.log(`Cleared ${res.cleared.length} log file(s) for ${logFile}`)
+        }
+        return
+      }
+
+      let tailCount: number | null = DEFAULT_LOG_TAIL_LINES
+      if (typeof flags.tail === 'string') {
+        const parsed = Number(flags.tail)
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          console.error(`Invalid --tail value: "${flags.tail}" (expected non-negative integer)`)
+          process.exit(1)
+        }
+        tailCount = Math.floor(parsed)
+      } else if (flags.all) {
+        tailCount = null
+      }
+
+      if (flags.follow) {
+        const pollMs =
+          typeof flags['poll-ms'] === 'string' && Number.isFinite(Number(flags['poll-ms']))
+            ? Math.max(25, Math.floor(Number(flags['poll-ms'])))
+            : undefined
+        const handle = followLogFile(logFile, {
+          tail: tailCount ?? DEFAULT_LOG_TAIL_LINES,
+          pollIntervalMs: pollMs,
+          onLine: (line) => {
+            if (flags.json) {
+              console.log(JSON.stringify({ logFile, line }))
+            } else {
+              console.log(line)
+            }
+          },
+          onRotate: (info) => {
+            if (flags.json) {
+              console.log(JSON.stringify({ event: 'log_rotated', ...info }))
+            } else {
+              console.error(`[troy-advanced] log rotated (${info.reason}): ${info.logFile}`)
+            }
+          },
+          onError: (err) => {
+            console.error(`[troy-advanced] log follow error: ${err.message}`)
+          },
+        })
+        const onStop = () => handle.stop()
+        process.once('SIGINT', onStop)
+        process.once('SIGTERM', onStop)
+        await handle.done
+        process.removeListener('SIGINT', onStop)
+        process.removeListener('SIGTERM', onStop)
+        return
+      }
+
+      const result = readLogTail(logFile, {
+        tail: tailCount,
+        includeRotated,
+      })
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: true, ...result }, null, 2))
+        return
+      }
+      if (!result.exists) {
+        console.log(`No daemon log found at ${result.logFile}`)
+        return
+      }
+      if (result.lines.length > 0) {
+        console.log(result.lines.join('\n'))
+      }
+      return
+    }
     if (sub === 'status') {
       const live = readLiveEndpoint(endpointFlag)
       if (!live) {
@@ -1029,6 +1165,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       console.log(JSON.stringify({ ok: true, running: true, endpoint: live.endpoint, health }, null, 2))
       return
     }
+    console.error(`Unknown daemon subcommand: "${sub}". Expected start | run | stop | status | logs`)
+    process.exit(1)
   }
 
   if (cmd === 'browse') {

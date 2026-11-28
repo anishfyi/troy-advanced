@@ -31,6 +31,11 @@ import {
   defaultDaemonConfigPath,
   persistDaemonOriginRules,
 } from './daemon-config.js'
+import {
+  DEFAULT_LOG_FILE_MODE,
+  defaultDaemonLogPath,
+  rotateIfNeeded,
+} from './daemon-logs.js'
 
 export interface DaemonOptions {
   engine?: EngineKind
@@ -57,6 +62,10 @@ export interface DaemonOptions {
   allowOrigins?: string[]
   denyOrigins?: string[]
   daemonConfigFile?: string
+  logFile?: string
+  logMaxBytes?: number
+  logMaxFiles?: number
+  logRotationIntervalMs?: number
 }
 
 export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<void> {
@@ -150,6 +159,28 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
     }
   })
 
+  // Periodic copy-truncate log rotation when running with a managed log file
+  let logRotateTimer: ReturnType<typeof setInterval> | null = null
+  const managedLogFile = opts.logFile ? path.resolve(opts.logFile) : null
+  if (managedLogFile) {
+    const intervalMs =
+      typeof opts.logRotationIntervalMs === 'number' && opts.logRotationIntervalMs >= 100
+        ? opts.logRotationIntervalMs
+        : 30_000
+    logRotateTimer = setInterval(() => {
+      try {
+        rotateIfNeeded(managedLogFile, {
+          maxBytes: opts.logMaxBytes,
+          maxFiles: opts.logMaxFiles,
+          copyTruncate: true,
+        })
+      } catch {
+        // Best-effort background rotation
+      }
+    }, intervalMs)
+    logRotateTimer.unref()
+  }
+
   console.log(
     JSON.stringify({
       ok: true,
@@ -169,6 +200,7 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
       allowedOrigins: manager.policy.resolved.allowedOrigins,
       deniedOrigins: manager.policy.resolved.deniedOrigins,
       daemonConfigFile: manager.daemonConfigFile,
+      ...(managedLogFile ? { logFile: managedLogFile } : {}),
       endpointFile,
       ...(compatFile ? { compatFile } : {}),
     }),
@@ -178,6 +210,10 @@ export async function runDaemonForeground(opts: DaemonOptions = {}): Promise<voi
   const shutdown = async () => {
     if (shuttingDown) return
     shuttingDown = true
+    if (logRotateTimer) {
+      clearInterval(logRotateTimer)
+      logRotateTimer = null
+    }
     offCrashSync()
     clearEndpoint(endpointFile)
     if (compatFile && compatFile !== endpointFile) clearEndpoint(compatFile)
@@ -211,11 +247,19 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
       denyOrigins: opts.denyOrigins,
     })
   }
-  const logFile = path.join(path.dirname(endpointFile), 'daemon.log')
+  const logFile = opts.logFile ? path.resolve(opts.logFile) : defaultDaemonLogPath(endpointFile)
   fs.mkdirSync(path.dirname(logFile), { recursive: true })
-  const outFd = fs.openSync(logFile, 'a')
+  rotateIfNeeded(logFile, {
+    maxBytes: opts.logMaxBytes,
+    maxFiles: opts.logMaxFiles,
+    fileMode: DEFAULT_LOG_FILE_MODE,
+  })
+  const outFd = fs.openSync(logFile, 'a', DEFAULT_LOG_FILE_MODE)
 
   const args = [binPath, 'daemon', 'run']
+  args.push('--log-file', logFile)
+  if (opts.logMaxBytes !== undefined) args.push('--log-max-bytes', String(opts.logMaxBytes))
+  if (opts.logMaxFiles !== undefined) args.push('--log-max-files', String(opts.logMaxFiles))
   if (opts.engine) args.push('--engine', opts.engine)
   if (opts.port) args.push('--port', String(opts.port))
   if (opts.cdpPort) args.push('--cdp-port', String(opts.cdpPort))
@@ -311,6 +355,11 @@ export async function startDaemonDetached(binPath: string, opts: DaemonOptions =
     detached: true,
     stdio: ['ignore', outFd, outFd],
   })
+  try {
+    fs.closeSync(outFd)
+  } catch {
+    // Ignore close error
+  }
   child.unref()
 
   // Wait up to 15s for endpoint file to appear with this pid
