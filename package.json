@@ -29,6 +29,7 @@
     "test:watch": "vitest",
     "bench": "node ./bin/troy-advanced.mjs bench",
     "bench:ascii": "npm run build && node ./scripts/bench-ascii.mjs",
+    "demo": "npm run build && node ./scripts/demo-site.mjs",
     "doctor": "node ./bin/troy-advanced.mjs doctor",
     "daemon": "node ./bin/troy-advanced.mjs daemon start",
     "browse": "node ./bin/troy-advanced.mjs browse",
