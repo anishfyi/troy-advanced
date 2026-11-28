@@ -294,7 +294,6 @@ function resolveHref(href: string | undefined, baseUrl: string): string | undefi
   }
 }
 
-const UNSAFE_BASE_PROTOCOLS = new Set(['javascript:', 'vbscript:', 'data:'])
 const ALLOWED_REFRESH_PROTOCOLS = new Set(['http:', 'https:'])
 
 function stripIgnoredHtmlBlocks(html: string): string {
@@ -327,7 +326,7 @@ export function extractBaseHref(html: string, documentUrl: string): string | und
     const rawHref = attrs.href.trim()
     try {
       const resolved = new URL(rawHref, documentUrl)
-      if (UNSAFE_BASE_PROTOCOLS.has(resolved.protocol.toLowerCase())) {
+      if (!ALLOWED_REFRESH_PROTOCOLS.has(resolved.protocol.toLowerCase())) {
         return undefined
       }
       return resolved.toString()

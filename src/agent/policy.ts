@@ -2,18 +2,18 @@
 // The AI agent can request an action; only this deterministic code authorizes it.
 
 import type { ElementDescriptor, PolicyDecision, ResolvedPolicyProfile, SsrfProtectionOptions } from '../types.js'
-import { exactOrigin } from './omnibox.js'
+import { detectRefusedScheme, exactOrigin } from './omnibox.js'
 import { PolicyProfileGuard, compilePolicyPatterns } from './policy-profile.js'
 import { isMutatingTool } from './readonly.js'
 import { checkUrlSsrfSync } from './ssrf.js'
 
 export const SENSITIVE_PATTERNS = Object.freeze({
   secret:
-    /password|passcode|passkey|one[- ]?time(?: code)?|\botp\b|\bpin\b|verification[- ]?code|security[- ]?code|recovery[- ]?(?:code|phrase)|seed[- ]?phrase|private[- ]?key|api[- ]?key|secret[- ]?key|auth[- ]?token/i,
+    /password|passcode|passkey|one[-_ ]?time(?:[-_ ]?code)?|(?<![a-z0-9])(?:otp|pin)(?![a-z0-9])|verification[-_ ]?code|security[-_ ]?code|recovery[-_ ]?(?:code|phrase)|seed[-_ ]?phrase|private[-_ ]?key|api[-_ ]?key|secret[-_ ]?key|auth[-_ ]?token/i,
   payment:
-    /card[- ]?number|credit[- ]?card|debit[- ]?card|\bcvv\b|\bcvc\b|expiry|expiration|routing[- ]?number|bank[- ]?account|account[- ]?number|iban|swift|sort[- ]?code|payment|billing/i,
+    /card[-_ ]?number|credit[-_ ]?card|debit[-_ ]?card|(?<![a-z0-9])(?:cvv|cvc)(?![a-z0-9])|expiry|expiration|routing[-_ ]?number|bank[-_ ]?account|account[-_ ]?number|iban|swift|sort[-_ ]?code|payment|billing/i,
   identity:
-    /social[- ]security|\bssn\b|national[- ]id|passport|driver'?s?[- ]?licen[cs]e|tax[- ]id|aadhaar|government[- ]id|identity[- ]?document/i,
+    /social[-_ ]?security|(?<![a-z0-9])ssn(?![a-z0-9])|national[-_ ]?id|passport|driver'?s?[-_ ]?licen[cs]e|tax[-_ ]?id|aadhaar|government[-_ ]?id|identity[-_ ]?document/i,
 })
 
 const SUBMIT_PATTERN =
@@ -69,7 +69,8 @@ export function isCommitLikeElement(
   item: Partial<ElementDescriptor>,
   extraPatterns?: readonly RegExp[],
 ): boolean {
-  if (item.defaultSubmit) return true
+  if (item.defaultSubmit === true) return true
+  if (item.defaultSubmit !== false && String(item.type ?? '').toLowerCase() === 'submit') return true
   const words = [item.text, item.label, item.ariaLabel, item.name, item.value].filter(Boolean).join(' ')
   if (SUBMIT_PATTERN.test(words)) return true
   if (extraPatterns && extraPatterns.length > 0) {
@@ -227,20 +228,42 @@ export function authorizeAction(request: {
     }
   }
 
-  if (item.href) {
+  // Check `item.href` on any action, and `item.formAction` on `page_click` (where a submitter
+  // can actually trigger navigation/submission; filling an input inside a cross-origin iframe
+  // does not submit the form).
+  const frameOrigin = item.frameUrl ? exactOrigin(item.frameUrl) : null
+  const targetAttrs: Array<{ url: string | undefined; isFormAction: boolean }> =
+    request.name === 'page_click'
+      ? [
+          { url: item.href, isFormAction: false },
+          { url: item.formAction, isFormAction: true },
+        ]
+      : [{ url: item.href, isFormAction: false }]
+
+  for (const { url: targetAttr, isFormAction } of targetAttrs) {
+    if (!targetAttr) continue
+    const refusedScheme = detectRefusedScheme(targetAttr)
+    if (refusedScheme) {
+      return {
+        allowed: false,
+        status: 'blocked',
+        code: 'scheme',
+        reason: `that control targets a refused scheme (${refusedScheme})`,
+      }
+    }
     if (ssrfOpts?.enabled) {
-      const ssrf = checkUrlSsrfSync(item.href, ssrfOpts)
+      const ssrf = checkUrlSsrfSync(targetAttr, ssrfOpts)
       if (ssrf.blocked && ssrf.reason) {
         return {
           allowed: false,
           status: 'blocked',
           code: 'ssrf',
           reason: ssrf.reason,
-          origin: exactOrigin(item.href) ?? undefined,
+          origin: exactOrigin(targetAttr) ?? undefined,
         }
       }
     }
-    const origin = exactOrigin(item.href)
+    const origin = exactOrigin(targetAttr)
     if (origin && guard?.isOriginDenied(origin)) {
       return {
         allowed: false,
@@ -250,7 +273,16 @@ export function authorizeAction(request: {
         origin,
       }
     }
-    if (requireOriginGrant && origin && !allowed.has(origin) && !guard?.isOriginAllowed(origin)) {
+    // A form inside an embedded cross-origin iframe defaults its `formAction` to its own frame URL;
+    // do not block same-frame form submissions as cross-origin, while still blocking external formActions.
+    const sameAsEmbeddedFrame = isFormAction && frameOrigin !== null && origin === frameOrigin
+    if (
+      requireOriginGrant &&
+      origin &&
+      !sameAsEmbeddedFrame &&
+      !allowed.has(origin) &&
+      !guard?.isOriginAllowed(origin)
+    ) {
       return {
         allowed: false,
         status: 'boundary',

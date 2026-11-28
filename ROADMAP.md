@@ -92,7 +92,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M77: Rate-limiting & body-size fuzz tests on Agent Socket HTTP server
 - [x] M78: Read-only observer mode (`--readonly`) where all mutating tools (`click`, `fill`, `eval`, `navigate`) are deterministically refused
 - [x] M79: Origin allowlist / denylist CLI flags (`--allow-origin`, `--deny-origin`) persisted in daemon config
-- [ ] M80: Comprehensive security regression suite testing XSS/scheme disguises, IMDS blocking, sensitive field blocking, and submit guards
+- [x] M80: Comprehensive security regression suite testing XSS/scheme disguises, IMDS blocking, sensitive field blocking, and submit guards
 
 ## Track 7: EC2, Cloud & Ops Excellence (Milestones 81–90)
 - [ ] M81: EC2 Instance Metadata Service (IMDSv2) detection in `doctor` (instance type, region, AZ without failing outside AWS)

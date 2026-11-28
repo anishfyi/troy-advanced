@@ -226,14 +226,35 @@ export function normalizeOrigin(value: unknown): string {
   }
 }
 
+const INVISIBLE_SCHEME_CHARS_RE = /[\u0000-\u001f\u007f\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]+/g
+
+/**
+ * Detect whether a URL/href string disguises or directly uses a refused scheme
+ * (such as `javascript:`, `data:`, `file:`, `vbscript:`, `blob:`, `chrome:`),
+ * even when obfuscated with ASCII control characters or Unicode zero-width / BiDi chars.
+ * Returns the lowercased scheme (with trailing `:`) if refused, or `null` otherwise.
+ */
+export function detectRefusedScheme(rawUrl: unknown): string | null {
+  const normalized = String(rawUrl ?? '').trim().replace(INVISIBLE_SCHEME_CHARS_RE, '')
+  if (!normalized) return null
+  const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(normalized)
+  if (!schemeMatch) return null
+  const scheme = `${schemeMatch[1]!.toLowerCase()}:`
+  return REFUSED_SCHEMES.has(scheme) ? scheme : null
+}
+
 export function resolveInput(rawInput: string, searchEngine = 'https://duckduckgo.com/html/?q='): ResolveResult {
-  // Strip ASCII control chars (like \n or \t) used to disguise javascript:\n...
+  // Strip ASCII control chars (like \n or \t) and Unicode zero-width / BiDi chars
+  // used to disguise javascript:\n... or java\u200bscript:...
   const trimmed = String(rawInput ?? '').trim()
   if (!trimmed) {
     return { kind: 'refused', reason: 'empty address' }
   }
 
-  const normalizedForScheme = trimmed.replace(/[\u0000-\u001f\u007f]+/g, '')
+  const normalizedForScheme = trimmed.replace(INVISIBLE_SCHEME_CHARS_RE, '')
+  if (!normalizedForScheme) {
+    return { kind: 'refused', reason: 'empty address' }
+  }
   const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(normalizedForScheme)
   if (schemeMatch) {
     const scheme = `${schemeMatch[1]!.toLowerCase()}:`
