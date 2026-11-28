@@ -7,6 +7,13 @@ import { BrowserManager } from '../src/engine/manager.js'
 import { findChromeBinary } from '../src/engine/chromium.js'
 
 const hasChrome = Boolean(findChromeBinary())
+const requireChrome = process.env.TROY_REQUIRE_CHROME === '1' || process.env.TROY_REQUIRE_CHROME === 'true'
+
+if (requireChrome && !hasChrome) {
+  throw new Error(
+    'TROY_REQUIRE_CHROME is enabled, but no Chrome/Chromium binary was found (set TROY_CHROME_BIN or install Chrome/Chromium).',
+  )
+}
 
 describe.skipIf(!hasChrome)('Headless Chromium CDP E2E + PNG-to-ASCII screenshot', () => {
   let server: http.Server

@@ -24,6 +24,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "test:unit": "vitest run --exclude test/chromium-e2e.test.ts",
+    "test:e2e:chrome": "TROY_REQUIRE_CHROME=1 vitest run test/chromium-e2e.test.ts",
     "test:watch": "vitest",
     "bench:ascii": "npm run build && node ./scripts/bench-ascii.mjs",
     "doctor": "node ./bin/troy-advanced.mjs doctor",
