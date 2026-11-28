@@ -133,6 +133,12 @@ import { parseMaxTokens } from './ascii/token-budget.js'
 import { parseInspectorTab } from './tui/inspector.js'
 import { parseViewMode } from './tui/pixel-preview.js'
 import { parseNonTtyPolicy } from './tui/tty-fallback.js'
+import {
+  COMPLETION_SHELLS,
+  formatInstallHint,
+  generateShellCompletion,
+  parseCompletionShell,
+} from './completions.js'
 
 const USAGE = `troy-advanced — terminal-native, EC2-ready, ASCII-rendered AI browser
 
@@ -165,6 +171,8 @@ Daemon & Modes:
                                                          Generate or validate a hardened EC2 docker-compose.yml manifest
   ec2 tunnel   <user@host> [--local-port N] [--remote-port N] [--cdp] [--cdp-only] [--cdp-port N] [--remote-cdp-port N] [-i <key>] [--ssh-port N] [--jump <bastion>] [--discover] [--write-endpoint <file>] [--connect] [--background] [--json]
                                                          Print or establish secure 127.0.0.1 SSH loopback forwarding to an EC2 host
+  completions  <bash|zsh|fish> [--bin <name>] [--out <file>] [--install-hint] [--json]
+                                                         Generate shell completion script for bash, zsh, or fish
 
 Client Commands (talk to running daemon, or use --oneshot):
   status                                  Daemon health + memory stats
@@ -344,6 +352,7 @@ const VALUE_FLAGS = new Set([
   '--snapshot-iterations',
   '--snapshot-warmup',
   '--chrome-bin',
+  '--bin',
 ])
 
 const REPEATABLE_FLAGS = new Set([
@@ -355,6 +364,7 @@ const REPEATABLE_FLAGS = new Set([
   '--deny-origin',
   '--proxy-bypass',
   '--tag',
+  '--bin',
 ])
 
 async function readStdinBuffer(): Promise<Buffer> {
@@ -661,6 +671,86 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
           ...(noEnvProxyFlag ? { useEnv: false } : {}),
         }
       : undefined
+
+  if (cmd === 'completions' || cmd === 'completion') {
+    const rawShell = typeof positional[1] === 'string' ? positional[1] : ''
+    if (flags['install-hint']) {
+      if (!rawShell) {
+        console.log(formatInstallHint())
+        return
+      }
+      const parsedShell = parseCompletionShell(rawShell)
+      if (!parsedShell) {
+        console.error(
+          `Invalid shell "${rawShell}": expected one of ${COMPLETION_SHELLS.join(', ')}`,
+        )
+        process.exit(1)
+      }
+      console.log(formatInstallHint(parsedShell))
+      return
+    }
+
+    if (!rawShell) {
+      console.error(
+        `Usage: troy-advanced completions <${COMPLETION_SHELLS.join('|')}> [--bin <name>] [--out <file>] [--install-hint] [--json]`,
+      )
+      process.exit(1)
+    }
+
+    const shell = parseCompletionShell(rawShell)
+    if (!shell) {
+      console.error(
+        `Invalid shell "${rawShell}": expected one of ${COMPLETION_SHELLS.join(', ')}`,
+      )
+      process.exit(1)
+    }
+
+    const binNames =
+      multiFlags.bin && multiFlags.bin.length > 0
+        ? multiFlags.bin
+        : typeof flags.bin === 'string' && flags.bin.trim()
+          ? [flags.bin.trim()]
+          : undefined
+
+    try {
+      const script = generateShellCompletion(shell, {
+        ...(binNames ? { binNames } : {}),
+        includeHeader: !flags['no-header'],
+      })
+
+      if (typeof flags.out === 'string' && flags.out.trim()) {
+        const outPath = path.resolve(flags.out.trim())
+        fs.mkdirSync(path.dirname(outPath), { recursive: true })
+        fs.writeFileSync(outPath, script, 'utf8')
+        if (flags.json) {
+          console.log(
+            JSON.stringify({ ok: true, shell, out: outPath, bytes: Buffer.byteLength(script, 'utf8') }, null, 2),
+          )
+        } else {
+          console.log(`Wrote ${shell} completions to ${outPath}`)
+        }
+      } else if (flags.json) {
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              shell,
+              binNames: binNames ?? ['troy-advanced', 'troya'],
+              script,
+            },
+            null,
+            2,
+          ),
+        )
+      } else {
+        process.stdout.write(script)
+      }
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err))
+      process.exit(1)
+    }
+    return
+  }
 
   if (cmd === 'doctor') {
     const imdsTimeoutRaw =

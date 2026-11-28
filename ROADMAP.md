@@ -111,7 +111,7 @@ Each 10-minute `continue` iteration picks the next unchecked milestone (or fixes
 - [x] M92: Architecture documentation (`docs/ARCHITECTURE.md`) with ASCII system diagrams
 - [x] M93: Protocol specification (`docs/PROTOCOL.md`) documenting Agent Socket, MCP, and Pipe REPL contracts
 - [x] M94: EC2 Production Operations Guide (`docs/EC2_GUIDE.md`) covering t3/t4g sizing, IAM/IMDS hardening, systemd, and SSH tunneling
-- [ ] M95: Shell completion generator (`troy-advanced completions bash|zsh|fish`)
+- [x] M95: Shell completion generator (`troy-advanced completions bash|zsh|fish`)
 - [ ] M96: CLI `--quiet` / `--verbose` / `--timeout` global flags with clean exit codes (`0` ok, `1` error, `2` policy refusal, `3` daemon offline)
 - [ ] M97: Package export map (`exports` in `package.json`) with clean ESM subpath imports (`@anishfyi/troy-advanced/ascii`, `/engine`, `/mcp`)
 - [ ] M98: ESLint / strict lint check script added to `package.json` and passing cleanly
