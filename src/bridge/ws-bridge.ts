@@ -10,6 +10,7 @@ import { parseSessionId, SESSION_HEADER } from '../agent/sessions.js'
 import type { AsciiDensity } from '../types.js'
 import type { BrowserManager } from '../engine/manager.js'
 import type { AsciiFramePayload } from './sse-stream.js'
+import { validateAgentRequestHeaders } from './host-guard.js'
 
 const WS_MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const MAX_WS_MESSAGE_BYTES = 2 * 1024 * 1024
@@ -177,7 +178,9 @@ function writeHttpRejection(socket: Duplex, status: number, statusText: string, 
     `Connection: close\r\n\r\n` +
     body
   try {
-    socket.end(resp)
+    socket.end(resp, () => {
+      socket.destroy()
+    })
   } catch {
     socket.destroy()
   }
@@ -253,6 +256,8 @@ export class WsBridgeHub {
   private readonly manager: BrowserManager
   private readonly handleRoute: AgentRouteHandler
   private readonly token: string
+  private readonly getExpectedPort?: () => number | undefined
+  private readonly strictPort: boolean
   private readonly clients = new Set<WsClientState>()
   private offManagerEvent: (() => void) | null = null
   private requestsHandled = 0
@@ -261,10 +266,16 @@ export class WsBridgeHub {
   private framesSkippedDuplicate = 0
   private eventsSent = 0
 
-  constructor(manager: BrowserManager, handleRoute: AgentRouteHandler, opts: { token: string }) {
+  constructor(
+    manager: BrowserManager,
+    handleRoute: AgentRouteHandler,
+    opts: { token: string; getExpectedPort?: () => number | undefined; strictPort?: boolean },
+  ) {
     this.manager = manager
     this.handleRoute = handleRoute
     this.token = opts.token
+    this.getExpectedPort = opts.getExpectedPort
+    this.strictPort = Boolean(opts.strictPort)
   }
 
   getStats(): WsBridgeStats {
@@ -284,9 +295,12 @@ export class WsBridgeHub {
   }
 
   handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
-    const reqHost = String(req.headers.host ?? '')
-    if (!reqHost.startsWith('127.0.0.1') && !reqHost.startsWith('localhost') && !reqHost.startsWith('[::1]')) {
-      writeHttpRejection(socket, 403, 'Forbidden', 'wrong host')
+    const headerCheck = validateAgentRequestHeaders(req, {
+      expectedPort: this.getExpectedPort?.(),
+      strictPort: this.strictPort,
+    })
+    if (!headerCheck.ok) {
+      writeHttpRejection(socket, headerCheck.status ?? 403, 'Forbidden', headerCheck.error ?? 'wrong host')
       return
     }
 
@@ -428,7 +442,9 @@ export class WsBridgeHub {
     if (client.closed) return
     try {
       client.socket.write(encodeWsClose(code, reason))
-      client.socket.end()
+      client.socket.end(() => {
+        client.socket.destroy()
+      })
     } catch {
       client.socket.destroy()
     }

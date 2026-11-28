@@ -3,6 +3,7 @@
 // extended with `/ascii` (instant pure-ASCII page viewport) and `/stream` (SSE events).
 
 import http from 'node:http'
+import type net from 'node:net'
 import { randomBytes } from 'node:crypto'
 import { parseAsciiDensity, parseMaxTokens } from '../ascii/layout.js'
 import type { BrowserCookie, DownloadStatus, EmulationOptions, OriginStorageSnapshot } from '../types.js'
@@ -15,6 +16,7 @@ import { normalizeStorageArea } from '../engine/storage.js'
 import type { BrowserManager } from '../engine/manager.js'
 import { parseSseStreamOptions, SseStreamHub } from './sse-stream.js'
 import { WsBridgeHub } from './ws-bridge.js'
+import { validateAgentRequestHeaders } from './host-guard.js'
 
 const MAX_BODY = 128 * 1024
 const MAX_IMPORT_BODY = 2 * 1024 * 1024
@@ -28,12 +30,14 @@ export interface AgentSocketServer {
 
 export async function createAgentSocket(
   manager: BrowserManager,
-  opts: { host?: string; port?: number; token?: string } = {},
+  opts: { host?: string; port?: number; token?: string; strictPort?: boolean } = {},
 ): Promise<AgentSocketServer> {
   const host = opts.host ?? '127.0.0.1'
   const token = opts.token ?? randomBytes(24).toString('hex')
+  const strictPort = Boolean(opts.strictPort)
   const streamHub = new SseStreamHub(manager)
   let wsHub: WsBridgeHub | null = null
+  let boundPort = opts.port ?? 0
 
   async function handleRoute(
     pathname: string,
@@ -651,13 +655,21 @@ export async function createAgentSocket(
         'content-type': 'application/json; charset=utf-8',
         'content-length': Buffer.byteLength(json),
         'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
       })
       res.end(json)
     }
 
-    const reqHost = String(req.headers.host ?? '')
-    if (!reqHost.startsWith('127.0.0.1') && !reqHost.startsWith('localhost') && !reqHost.startsWith('[::1]')) {
-      return respond(403, { ok: false, error: 'wrong host' })
+    const headerCheck = validateAgentRequestHeaders(req, {
+      expectedPort: boundPort || undefined,
+      strictPort,
+    })
+    if (!headerCheck.ok) {
+      return respond(headerCheck.status ?? 403, {
+        ok: false,
+        code: headerCheck.code,
+        error: headerCheck.error ?? 'wrong host',
+      })
     }
     if (req.headers['x-troy-agent'] !== token) {
       return respond(401, { ok: false, error: 'missing or invalid x-troy-agent token' })
@@ -724,7 +736,17 @@ export async function createAgentSocket(
     })
   })
 
-  wsHub = new WsBridgeHub(manager, handleRoute, { token })
+  const sockets = new Set<net.Socket>()
+  server.on('connection', (sock) => {
+    sockets.add(sock)
+    sock.once('close', () => sockets.delete(sock))
+  })
+
+  wsHub = new WsBridgeHub(manager, handleRoute, {
+    token,
+    getExpectedPort: () => (boundPort || undefined),
+    strictPort,
+  })
   server.on('upgrade', (req, socket, head) => {
     wsHub?.handleUpgrade(req, socket, head)
   })
@@ -736,6 +758,7 @@ export async function createAgentSocket(
 
   const addr = server.address()
   const port = typeof addr === 'object' && addr ? addr.port : 0
+  boundPort = port
   const wsUrl = `ws://${host}:${port}/ws`
 
   return {
@@ -745,8 +768,14 @@ export async function createAgentSocket(
     async close() {
       wsHub?.close()
       streamHub.close()
-      server.closeAllConnections?.()
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve())
+        server.closeAllConnections?.()
+        for (const sock of sockets) {
+          sock.destroy()
+        }
+        sockets.clear()
+      })
     },
   }
 }
